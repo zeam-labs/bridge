@@ -35,4 +35,5 @@ final class Reason
     const VERIFICATION_STATE_UNAVAILABLE = 'invalid_batch_settlement_evm_verification_state_unavailable';
     const CHARGE_EXCEEDS_SIGNED_CUMULATIVE = 'invalid_batch_settlement_evm_charge_exceeds_signed_cumulative';
     const MISSING_CHANNEL = 'invalid_batch_settlement_evm_missing_channel';
+    const REFUND_SETTLING = 'refund_settling';
 }

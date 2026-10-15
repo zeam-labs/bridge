@@ -9,6 +9,11 @@ function zeam_pass_notice_key()
     return 'zeam_pass_notice_' . get_current_user_id();
 }
 
+function zeam_pass_price_range()
+{
+    return 'From 0.000001 to ' . \ZeamPass\Pricing::MAX_USD . ', at most 6 decimals.';
+}
+
 function zeam_pass_parse_addresses($text)
 {
     $good = [];
@@ -66,8 +71,8 @@ function zeam_pass_save_settings(array $in)
     $mode = (string) ($in['mode'] ?? 'paywall');
     $values['mode'] = in_array($mode, ZEAM_PASS_MODES, true) ? $mode : 'paywall';
     $price = trim((string) ($in['price'] ?? ''));
-    if ($price !== '' && (!preg_match('/^\d+(\.\d{1,6})?$/D', $price) || (float) $price <= 0 || (float) $price > 1000)) {
-        $errors[] = 'A price is USD above 0, at most 1000, at most 6 decimals, like 0.002.';
+    if ($price !== '' && zeam_pass_usd_micro($price) < 1) {
+        $errors[] = 'A price is USD above 0, at most 6 decimals, like 0.02, and at most ' . \ZeamPass\Pricing::MAX_USD . ', the most a number counts exactly in micro-USD.';
     } else {
         $values['price'] = $price;
     }
@@ -81,8 +86,8 @@ function zeam_pass_save_settings(array $in)
     $free = [];
     foreach (ZEAM_PASS_BUILTIN_TOOLS as $tool) {
         $p = trim((string) (is_scalar($inPrices[$tool] ?? null) ? $inPrices[$tool] : ''));
-        if ($p !== '' && (!preg_match('/^\d+(\.\d{1,6})?$/D', $p) || (float) $p <= 0 || (float) $p > 1000)) {
-            $priceErrors[] = "The {$tool} price is USD above 0, at most 1000, at most 6 decimals, like 0.002.";
+        if ($p !== '' && zeam_pass_usd_micro($p) < 1) {
+            $priceErrors[] = 'The ' . $tool . ' price is USD above 0, at most 6 decimals, like 0.02, and at most ' . \ZeamPass\Pricing::MAX_USD . ', the most a number counts exactly in micro-USD.';
         } elseif ($p !== '') {
             $toolPrices[$tool] = $p;
         }
@@ -104,8 +109,8 @@ function zeam_pass_save_settings(array $in)
     }
     $block = trim((string) (is_scalar($in['time_block'] ?? null) ? $in['time_block'] : ''));
     $blockMs = trim((string) (is_scalar($in['time_block_ms'] ?? null) ? $in['time_block_ms'] : ''));
-    if ($block !== '' && (!preg_match('/^\d+(\.\d{1,6})?$/D', $block) || (float) $block <= 0 || (float) $block > 1000)) {
-        $errors[] = 'The line time price is USD above 0, at most 1000, at most 6 decimals, like 0.00025.';
+    if ($block !== '' && zeam_pass_usd_micro($block) < 1) {
+        $errors[] = 'The line time price is USD above 0, at most 6 decimals, like 0.00025, and at most ' . \ZeamPass\Pricing::MAX_USD . ', the most a number counts exactly in micro-USD.';
     } elseif ($blockMs !== '' && (!ctype_digit($blockMs) || (int) $blockMs < 1 || (int) $blockMs > 3600000)) {
         $errors[] = 'The line time amount is 1 to 3600000 ms, or empty for 250.';
     } elseif ($block !== '' && $values['mode'] === 'gate') {
@@ -128,6 +133,7 @@ function zeam_pass_save_settings(array $in)
     }
     $values['onEmpty'] = ($in['onEmpty'] ?? '') === 'allow' ? 'allow' : 'refuse';
     $values['hold'] = !empty($in['hold']);
+    $values['no_root_openapi'] = !empty($in['no_root_openapi']);
     foreach (['relay', 'credits', 'rpc'] as $k) {
         $url = zeam_pass_clean_url($in[$k] ?? '');
         if ($url === null) {
@@ -152,7 +158,7 @@ function zeam_pass_save_settings(array $in)
 
 add_action('admin_post_zeam_pass_save', function () {
     if (!current_user_can('manage_options')) {
-        wp_die(esc_html__('You are not allowed to change ZEAM Pass.', 'zeam-pass'), 403);
+        wp_die(esc_html__('You are not allowed to change ZEAM Bridge.', 'zeam-pass'), 403);
     }
     check_admin_referer('zeam_pass_save');
     $errors = zeam_pass_save_settings(wp_unslash($_POST));
@@ -189,7 +195,7 @@ add_action('wp_ajax_zeam_pass_payout', function () {
 });
 
 add_action('admin_menu', function () {
-    add_options_page('ZEAM Pass', 'ZEAM Pass', 'manage_options', 'zeam-pass', 'zeam_pass_admin_page');
+    add_options_page('ZEAM Bridge', 'ZEAM Bridge', 'manage_options', 'zeam-pass', 'zeam_pass_admin_page');
 });
 
 add_action('admin_notices', function () {
@@ -198,16 +204,16 @@ add_action('admin_notices', function () {
     }
     $missing = zeam_pass_missing_extensions();
     if ($missing !== []) {
-        echo '<div class="notice notice-error"><p><strong>ZEAM Pass cannot run on this server.</strong> ' . esc_html(ucfirst(implode('; ', $missing))) . '. Ask your host to enable PHP GMP or BCMath, and sodium. Tools answer not_ready and charge nothing until then.</p></div>';
+        echo '<div class="notice notice-error"><p><strong>ZEAM Bridge cannot run on this server.</strong> ' . esc_html(ucfirst(implode('; ', $missing))) . '. Ask your host to enable PHP GMP or BCMath, and sodium. Tools answer not_ready and charge nothing until then.</p></div>';
         return;
-    }
-    if (zeam_pass_secret_state('settle') === 'locked') {
-        echo '<div class="notice notice-error"><p><strong>ZEAM Pass cannot open its settle key.</strong> Restore the ZEAM_PASS_KEY and WordPress salts the key was made with in wp-config.php. Paid calls are off until then.</p></div>';
     }
     $screen = function_exists('get_current_screen') ? get_current_screen() : null;
     $ours = $screen && in_array($screen->id, ['settings_page_zeam-pass', 'plugins'], true);
-    if ($ours && !zeam_pass_has_dedicated_key()) {
-        echo '<div class="notice notice-warning"><p><strong>ZEAM Pass:</strong> your keys are encrypted with a key derived from the WordPress salts. Add ZEAM_PASS_KEY to wp-config.php, 32 or more random characters: <code>define(\'ZEAM_PASS_KEY\', \'' . esc_html(wp_generate_password(48, false, false)) . '\');</code> The keys are re-encrypted with it on next use. Without it the keys cannot be opened.</p></div>';
+    foreach (zeam_pass_key_notices(wp_generate_password(48, false, false)) as $n) {
+        if ($n['level'] === 'warning' && !$ours) {
+            continue;
+        }
+        echo '<div class="notice notice-' . $n['level'] . '"><p><strong>' . esc_html($n['lead']) . '</strong> ' . esc_html($n['text']) . ($n['define'] !== null ? ' <code>' . esc_html($n['define']) . '</code> ' . esc_html($n['after']) : '') . '</p></div>';
     }
 });
 
@@ -240,6 +246,7 @@ function zeam_pass_admin_page()
         'home' => home_url('/'),
         'onEmpty' => zeam_pass_on_empty(),
         'hold' => (bool) zeam_pass_opt('hold', false),
+        'no_root_openapi' => (bool) zeam_pass_opt('no_root_openapi', false),
         'relay' => (string) zeam_pass_opt('relay', ''),
         'credits' => (string) zeam_pass_opt('credits', ''),
         'rpc' => (string) zeam_pass_opt('rpc', ''),

@@ -5,8 +5,10 @@ namespace ZeamPass;
 final class Pricing
 {
     const HOUR_MS = 3600000;
-    const NO_PRICE = 'this tool has no price; set price, prices[tool] or free';
-    const BAD_UNITS = 'units is a whole number, 0 or more';
+    const MAX_MICRO = 9007199254740991;
+    const MAX_USD = '9007199254.740991';
+    const NO_PRICE = 'bridge: this tool has no price; set price, prices[tool] or free';
+    const BAD_UNITS = 'bridge: units is a whole number, 0 or more';
 
     private static function shown($value)
     {
@@ -44,22 +46,33 @@ final class Pricing
     {
         $s = self::text($price);
         if (!preg_match('/^(\d+)(?:\.(\d{1,6}))?$/D', $s, $m)) {
-            throw new \InvalidArgumentException(esc_html($what . ' is USD with up to six decimals, like "0.02"; got ' . self::shown($price)));
+            throw new \InvalidArgumentException(esc_html('bridge: ' . $what . ' is USD with up to six decimals, like "0.02"; got ' . self::shown($price)));
         }
         $whole = ltrim($m[1], '0');
         $frac = isset($m[2]) ? (int) str_pad($m[2], 6, '0') : 0;
-        if (strlen($whole) > 4) {
-            throw new \InvalidArgumentException(esc_html($what . ' is from $0.000001 to $1,000'));
-        }
-        $micro = (int) $whole * 1000000 + $frac;
-        if ($micro < 1 || $micro > 1000000000) {
-            throw new \InvalidArgumentException(esc_html($what . ' is from $0.000001 to $1,000'));
+        $micro = strlen($whole) > 10 ? 0 : (int) $whole * 1000000 + $frac;
+        if ($micro < 1 || $micro > self::MAX_MICRO) {
+            throw new \InvalidArgumentException(esc_html('bridge: ' . $what . ' is from $0.000001 to $' . self::MAX_USD . '; above that a number stops counting micro-USD exactly'));
         }
         return $micro;
     }
 
+    public static function mulDiv($a, $b, $c, $add = 0)
+    {
+        $top = (int) $a * (int) $b + (int) $add;
+        if (is_int($top)) {
+            return intdiv($top, (int) $c);
+        }
+        $q = Big::div(Big::add(Big::mul(Big::init((int) $a), Big::init((int) $b)), Big::init((int) $add)), Big::init((int) $c));
+        return Big::cmp($q, Big::init(PHP_INT_MAX)) > 0 ? PHP_INT_MAX : (int) Big::strval($q);
+    }
+
     public static function usd($micro)
     {
+        if (is_int($micro) && $micro >= 0) {
+            $d = str_pad((string) $micro, 7, '0', STR_PAD_LEFT);
+            return rtrim(rtrim(substr($d, 0, -6) . '.' . substr($d, -6), '0'), '.');
+        }
         $s = rtrim(rtrim(sprintf('%.6f', $micro / 1e6), '0'), '.');
         return $s === '' ? '0' : $s;
     }
@@ -95,7 +108,7 @@ final class Pricing
             }
             $unitMicro = self::microOf($unit, 'unit');
             if ($unitMicro > $micro) {
-                throw new \InvalidArgumentException('a unit costs at most the price the call reserves');
+                throw new \InvalidArgumentException('bridge: a unit costs at most the price the call reserves');
             }
             return ['micro' => (int) $micro, 'unitMicro' => $unitMicro];
         }

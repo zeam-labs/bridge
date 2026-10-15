@@ -100,7 +100,7 @@ function zeam_pass_update_item($manifest, $installed)
         'plugin' => zeam_pass_update_basename(),
         'version' => $manifest['version'],
         'new_version' => $manifest['version'],
-        'url' => is_string($manifest['homepage'] ?? null) ? $manifest['homepage'] : 'https://zeampass.com',
+        'url' => is_string($manifest['homepage'] ?? null) ? $manifest['homepage'] : 'https://zeambridge.com',
         'tested' => is_string($manifest['tested'] ?? null) ? $manifest['tested'] : '',
         'requires' => is_string($manifest['requires'] ?? null) ? $manifest['requires'] : '',
         'requires_php' => is_string($manifest['requires_php'] ?? null) ? $manifest['requires_php'] : '',
@@ -130,7 +130,7 @@ function zeam_pass_update_details($result, $action, $args)
     }
     $manifest = zeam_pass_update_manifest();
     if ($manifest === null) {
-        return new WP_Error('zeam_pass_update_unavailable', 'The ZEAM Pass release details are not available right now.');
+        return new WP_Error('zeam_pass_update_unavailable', 'The ZEAM Bridge release details are not available right now.');
     }
     $sections = [];
     foreach ($manifest['sections'] ?? [] as $name => $html) {
@@ -140,7 +140,7 @@ function zeam_pass_update_details($result, $action, $args)
     }
     $item = zeam_pass_update_item($manifest, '0');
     return (object) [
-        'name' => 'ZEAM Pass',
+        'name' => 'ZEAM Bridge',
         'slug' => ZEAM_PASS_UPDATE_SLUG,
         'version' => $manifest['version'],
         'author' => '<a href="https://www.zeamlabs.com">ZEAM Labs, LLC</a>',
@@ -161,10 +161,10 @@ function zeam_pass_update_download($reply, $package, $upgrader = null, $hook_ext
     }
     $manifest = zeam_pass_update_manifest();
     if ($manifest === null) {
-        return new WP_Error('zeam_pass_update_unverified', 'There is no signed ZEAM Pass release to check this download against. Nothing was installed.');
+        return new WP_Error('zeam_pass_update_unverified', 'There is no signed ZEAM Bridge release to check this download against. Nothing was installed.');
     }
     if ($package !== $manifest['package']) {
-        return new WP_Error('zeam_pass_update_package', 'This download is not the signed ZEAM Pass release. Nothing was installed.');
+        return new WP_Error('zeam_pass_update_package', 'This download is not the signed ZEAM Bridge release. Nothing was installed.');
     }
     $file = is_string($reply) && $reply !== '' && is_file($reply) ? $reply : download_url($package, 300);
     if (is_wp_error($file)) {
@@ -172,7 +172,7 @@ function zeam_pass_update_download($reply, $package, $upgrader = null, $hook_ext
     }
     if (!hash_equals($manifest['sha256'], (string) hash_file('sha256', $file))) {
         wp_delete_file($file);
-        return new WP_Error('zeam_pass_update_checksum', 'The download does not match the signed ZEAM Pass release. Nothing was installed.');
+        return new WP_Error('zeam_pass_update_checksum', 'The download does not match the signed ZEAM Bridge release. Nothing was installed.');
     }
     return $file;
 }

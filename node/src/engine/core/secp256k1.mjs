@@ -81,6 +81,10 @@ export const Secp256k1 = {
   isLowS(signature) {
     return BigInt('0x' + Secp256k1.parseSignature(signature).s) <= HALF_N
   },
+  isCanonical(signature) {
+    const bytes = Hex.toBytes(signature)
+    return bytes.length === 65 && (bytes[64] === 27 || bytes[64] === 28) && Secp256k1.isLowS(signature)
+  },
   async recoverHash(hash, signature) {
     const digest = Hex.lower(hash)
     if (digest.length !== 66) throw new InvalidArgument('a digest is 32 bytes')
@@ -104,7 +108,8 @@ export const Secp256k1 = {
   personalSign(key, message) {
     return Secp256k1.signHash(key, Secp256k1.hashMessage(message))
   },
-  recoverPersonal(message, signature) {
+  async recoverPersonal(message, signature) {
+    if (!Secp256k1.isLowS(signature)) throw new InvalidArgument('signature s is above half the curve order')
     return Secp256k1.recoverHash(Secp256k1.hashMessage(message), signature)
   },
   async verifyPersonal(address, message, signature) {

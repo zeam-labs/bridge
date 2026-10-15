@@ -1,15 +1,16 @@
+import { createHmac } from 'node:crypto'
 import { Address, Hex, big } from '../core/hex.mjs'
 import { Erc20 } from '../core/batch.mjs'
 import { Pass } from '../core/pass.mjs'
 import { Secp256k1 } from '../core/secp256k1.mjs'
 import { ArrayCache } from './json.mjs'
 
-const GAS = { deposit: 145000, claimBase: 35000, claimEntry: 45000, claimAlone: 80000, payout: 210000, createSplit: 280000, refund: 97000, refundClaim: 37000, paidClaim: 37700, gasPayment: 58600, paidL1: 13800, paidClaimL1: 4200 }
+const GAS = { deposit: 145000, claimBase: 35000, claimEntry: 45000, claimAlone: 80000, payout: 210000, charge: 80000, createSplit: 280000, refund: 97000, refundClaim: 37000, paidClaim: 37700, gasPayment: 58600, paidL1: 13800, paidClaimL1: 4200 }
 const GAS_MEASURED = { on: '2026-09-29', how: '35 paid relay refunds, Base blocks 51915440-51949669 (25 alone, 10 with a riding claim); gasUsed + L1 fee in gas', paidRefund: 155625, paidRefundWithClaim: 193332, paidL1: 13830, paidL1WithClaim: 18059 }
 const TUNABLE = [
   'withdrawDelay', 'maxTimeoutSeconds', 'depositFloorMicroUSD', 'wethUSD', 'gasPriceWei', 'feeShare', 'gasBuffer',
   'floorMargin', 'idleClaimSecs', 'maxClaimsPerBatch', 'payoutMinUnits', 'refundWindowSecs', 'refundUrl',
-  'receiptTimeoutSecs', 'receiptPollMs', 'stateCatchUpMs', 'drainTries', 'drainWaitMs', 'repairEveryMs', 'gasPaymentSecs',
+  'receiptTimeoutSecs', 'receiptPollMs', 'stateCatchUpMs', 'drainTries', 'drainWaitMs', 'repairEveryMs', 'gasPaymentSecs', 'refundJudgeWaitMs',
 ]
 const SECRET = Symbol('receiverAuthorizerKey')
 
@@ -19,6 +20,7 @@ export class Config {
   static SCHEME = 'batch-settlement'
   static WITHDRAW_DELAY = 86400
   static MAX_TIMEOUT_SECONDS = 240
+  static DRAIN_WAIT_MS = 2000
   static FEE_SHARE = 0.0999
   static GAS = GAS
   static GAS_MEASURED = GAS_MEASURED
@@ -63,9 +65,10 @@ export class Config {
     this.receiptPollMs = 1000
     this.stateCatchUpMs = 2000
     this.drainTries = 15
-    this.drainWaitMs = 2000
+    this.drainWaitMs = Config.DRAIN_WAIT_MS
     this.repairEveryMs = 60000
     this.gasPaymentSecs = 300
+    this.refundJudgeWaitMs = 5000
     for (const k of TUNABLE) if (Object.hasOwn(o, k) && o[k] !== undefined) this[k] = o[k]
     this.withdrawDelay = Math.trunc(Number(this.withdrawDelay))
     this.maxTimeoutSeconds = Math.trunc(Number(this.maxTimeoutSeconds))
@@ -101,7 +104,8 @@ export class Config {
   unitsOfMicroUSD(asset, microUSD) {
     if (asset.decimals === 6 && Number(asset.priceUSD) === 1) return String(Math.max(1, Math.trunc(Number(microUSD))))
     const units = Math.round((Number(microUSD) / 1e6 / Number(asset.priceUSD)) * 10 ** asset.decimals)
-    return Math.max(1, units).toFixed(0)
+    const whole = Math.max(1, units)
+    return Number.isFinite(whole) && whole >= 1e21 ? BigInt(whole).toString() : whole.toFixed(0)
   }
 
   microUSDOf(token, units) {
@@ -126,6 +130,10 @@ export class Config {
 
   signingKey() {
     return this[SECRET]
+  }
+
+  mppSecret() {
+    return createHmac('sha256', Hex.toBytes(this[SECRET])).update('zeam-pass/mpp-challenge-binding', 'utf8').digest()
   }
 
   nowMs() {

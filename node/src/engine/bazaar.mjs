@@ -71,10 +71,10 @@ export function bazaar(tool, via = 'http') {
 
 const bytes = (v) => Buffer.byteLength(Json.encode(v), 'utf8')
 
-export function forHeader(doc) {
+export function forHeader(doc, size = (d) => Json.base64(d).length) {
   const ext = isObject(doc?.extensions) ? doc.extensions : null
   if (!ext || !Object.hasOwn(ext, 'bazaar')) return doc
-  if (bytes(ext.bazaar) <= EXTENSION_LIMIT && Json.base64(doc).length <= HEADER_LIMIT) return doc
+  if (bytes(ext.bazaar) <= EXTENSION_LIMIT && size(doc) <= HEADER_LIMIT) return doc
   const { bazaar: _dropped, ...rest } = ext
   const out = { ...doc, extensions: rest }
   if (!Object.keys(rest).length) delete out.extensions

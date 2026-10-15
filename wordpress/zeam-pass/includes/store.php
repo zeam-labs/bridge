@@ -6,7 +6,7 @@ if (!defined('ABSPATH')) {
 
 // phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
 
-const ZEAM_PASS_DB_VERSION = '2';
+const ZEAM_PASS_DB_VERSION = '3';
 
 function zeam_pass_table($name)
 {
@@ -23,6 +23,7 @@ function zeam_pass_install_tables()
     $gate = zeam_pass_table('gate');
     $replay = zeam_pass_table('replay');
     $meter = zeam_pass_table('meter');
+    $held = zeam_pass_table('held');
     dbDelta("CREATE TABLE {$channels} (
   id char(66) NOT NULL,
   record longtext NOT NULL,
@@ -49,6 +50,12 @@ function zeam_pass_install_tables()
   record longtext NOT NULL,
   updated bigint(20) unsigned NOT NULL DEFAULT 0,
   PRIMARY KEY  (k)
+) {$charset};");
+    dbDelta("CREATE TABLE {$held} (
+  k char(40) NOT NULL,
+  expires bigint(20) unsigned NOT NULL DEFAULT 0,
+  PRIMARY KEY  (k),
+  KEY expires (expires)
 ) {$charset};");
     update_option('zeam_pass_db', ZEAM_PASS_DB_VERSION, true);
 }
@@ -82,7 +89,7 @@ final class ZeamPassLock
     public static function with($key, callable $fn, $wait = 10)
     {
         if (!self::acquire($key, $wait)) {
-            throw new RuntimeException(esc_html('ZEAM Pass could not lock ' . $key));
+            throw new RuntimeException(esc_html('ZEAM Bridge could not lock ' . $key));
         }
         try {
             return $fn();
@@ -109,7 +116,7 @@ final class ZeamPassChannelStore implements \ZeamPass\Settlement\Store
     private static function fail($what)
     {
         global $wpdb;
-        throw new RuntimeException(esc_html('ZEAM Pass could not ' . $what . ($wpdb->last_error ? ': ' . $wpdb->last_error : '')));
+        throw new RuntimeException(esc_html('ZEAM Bridge could not ' . $what . ($wpdb->last_error ? ': ' . $wpdb->last_error : '')));
     }
 
     private static function decode($raw)
@@ -184,7 +191,7 @@ final class ZeamPassMeterStore implements \ZeamPass\Settlement\Store
     private static function fail($what)
     {
         global $wpdb;
-        throw new RuntimeException(esc_html('ZEAM Pass could not ' . $what . ($wpdb->last_error ? ': ' . $wpdb->last_error : '')));
+        throw new RuntimeException(esc_html('ZEAM Bridge could not ' . $what . ($wpdb->last_error ? ': ' . $wpdb->last_error : '')));
     }
 
     private static function decode($raw)
@@ -246,7 +253,7 @@ final class ZeamPassGateStore implements \ZeamPass\Gate\Store
     private static function fail($what)
     {
         global $wpdb;
-        throw new RuntimeException(esc_html('ZEAM Pass could not ' . $what . ($wpdb->last_error ? ': ' . $wpdb->last_error : '')));
+        throw new RuntimeException(esc_html('ZEAM Bridge could not ' . $what . ($wpdb->last_error ? ': ' . $wpdb->last_error : '')));
     }
 
     private static function meterName($key)
@@ -352,5 +359,55 @@ final class ZeamPassCache implements \ZeamPass\Settlement\Cache
     public function set($key, $value, $ttlSeconds)
     {
         set_transient(self::key($key), ['v' => $value], max(1, (int) ceil((float) $ttlSeconds)));
+    }
+
+    public function add($key, $value, $ttlSeconds)
+    {
+        $name = 'cache:' . self::key($key);
+        if (!ZeamPassLock::acquire($name, 5)) {
+            return false;
+        }
+        try {
+            if ($this->get($key)) {
+                return false;
+            }
+            $this->set($key, $value, $ttlSeconds);
+            return true;
+        } finally {
+            ZeamPassLock::release($name);
+        }
+    }
+}
+
+final class ZeamPassHolds implements \ZeamPass\Settlement\Holds
+{
+    private static function k($key)
+    {
+        return sha1((string) $key);
+    }
+
+    public function claim($key, $untilMs, $nowMs)
+    {
+        global $wpdb;
+        $k = self::k($key);
+        $table = zeam_pass_table('held');
+        $got = ZeamPassLock::attempt('held:' . $k, function () use ($wpdb, $k, $table, $untilMs, $nowMs) {
+            $until = $wpdb->get_var($wpdb->prepare("SELECT expires FROM {$table} WHERE k = %s", $k));
+            if ($until !== null && (int) $until > (int) $nowMs) {
+                return false;
+            }
+            if ($wpdb->replace($table, ['k' => $k, 'expires' => (int) $untilMs], ['%s', '%d']) === false) {
+                throw new RuntimeException(esc_html('ZEAM Bridge could not hold an MPP charge' . ($wpdb->last_error ? ': ' . $wpdb->last_error : '')));
+            }
+            $wpdb->query($wpdb->prepare("DELETE FROM {$table} WHERE expires < %d", (int) $nowMs - 60000));
+            return true;
+        });
+        return $got === true;
+    }
+
+    public function release($key)
+    {
+        global $wpdb;
+        $wpdb->delete(zeam_pass_table('held'), ['k' => self::k($key)], ['%s']);
     }
 }

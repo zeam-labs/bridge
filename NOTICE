@@ -1,0 +1,18 @@
+ZEAM :: Bridge and ZEAM :: Pass
+Copyright 2026 ZEAM Labs, LLC
+
+This product includes software developed at ZEAM Labs, LLC (https://www.zeamlabs.com).
+
+Everything in this repository is licensed under the Apache License, Version 2.0 (see LICENSE),
+except the WordPress plugin in wordpress/zeam-pass/, which is licensed under the GNU General
+Public License, version 2 only (see wordpress/zeam-pass/LICENSE).
+
+Third-party material in this repository:
+
+wordpress/zeam-pass/lib/vendor/, inside the GPL-2.0-only WordPress plugin, holds
+kornrunner/keccak 1.1.0, simplito/bigint-wrapper-php 1.0.0, simplito/bn-php 1.1.4 and
+simplito/elliptic-php 1.0.12, each under the MIT License. Each library's license file is
+beside it, and wordpress/zeam-pass/lib/vendor/VERSIONS.txt records where each came from.
+
+audit/client/vendor/ holds a packed copy of @zeampass/client 4.0.0, by ZEAM Labs, LLC,
+under the Apache License, Version 2.0. Its LICENSE and NOTICE files are inside the archive.

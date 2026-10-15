@@ -1,6 +1,7 @@
 import { randomBytes } from 'node:crypto'
 import { Address, Hex, InvalidArgument, Num, isObject } from '../core/hex.mjs'
-import { BatchSettlement, Erc20 } from '../core/batch.mjs'
+import { Erc20 } from '../core/batch.mjs'
+import { Token } from '../core/evm.mjs'
 import { Pass } from '../core/pass.mjs'
 import { Secp256k1 } from '../core/secp256k1.mjs'
 
@@ -132,7 +133,7 @@ export const Exact = {
     return null
   },
   tokenDomain(requirement) {
-    return BatchSettlement.tokenDomain(requirement.asset, requirement.extra.name, requirement.extra.version, Exact.chainId(requirement.network))
+    return Token.domain(requirement.asset, requirement.extra.name, requirement.extra.version, Exact.chainId(requirement.network))
   },
   authorizationMessage(authorization) {
     const a = isObject(authorization) ? authorization : GateJson.toObject(authorization)
@@ -162,7 +163,7 @@ export const Exact = {
     if (message === null || sigBody.length !== 130 || !/^[0-9a-fA-F]+$/.test(sigBody)) return 'invalid_exact_evm_signature'
     let signer
     try {
-      signer = await Secp256k1.recoverTypedData(Exact.tokenDomain(requirement), BatchSettlement.TRANSFER_AUTHORIZATION_TYPES, 'TransferWithAuthorization', message, '0x' + sigBody)
+      signer = await Secp256k1.recoverTypedData(Exact.tokenDomain(requirement), Token.TRANSFER_TYPES, 'TransferWithAuthorization', message, '0x' + sigBody)
     } catch (err) {
       if (err instanceof InvalidArgument) return 'invalid_exact_evm_signature'
       throw err
@@ -186,7 +187,7 @@ export const Exact = {
       validBefore: String(Math.trunc(nowSeconds) + Math.trunc(Number(requirement.maxTimeoutSeconds))),
       nonce: String(nonce).toLowerCase(),
     }
-    const signature = await Secp256k1.signTypedData(key, Exact.tokenDomain(requirement), BatchSettlement.TRANSFER_AUTHORIZATION_TYPES, 'TransferWithAuthorization', Exact.authorizationMessage(authorization))
+    const signature = await Secp256k1.signTypedData(key, Exact.tokenDomain(requirement), Token.TRANSFER_TYPES, 'TransferWithAuthorization', Exact.authorizationMessage(authorization))
     return { authorization, signature }
   },
   paymentPayload(paymentRequired, requirement, inner) {
@@ -271,11 +272,12 @@ export class Admission {
       invalid = String(e?.message ?? e)
     }
     if (invalid !== null) return Admission.refuse('invalid_payment', invalid)
-    const window = t + requirement.maxTimeoutSeconds * 1000
+    const admitted = await this.grant(from, grantHeaderValue, toolName, admitList, t)
+    if (!admitted.ok) return admitted
     const validBeforeMs = Exact.bigint(auth.validBefore) * 1000n
-    const until = validBeforeMs < BigInt(window) ? Number(validBeforeMs) : window
+    const until = validBeforeMs < BigInt(Number.MAX_SAFE_INTEGER) ? Number(validBeforeMs) : Number.MAX_SAFE_INTEGER
     if (!(await this.claim(from, nonce, until, t))) return Admission.refuse('replayed', 'this authorization was already used')
-    return this.grant(from, grantHeaderValue, toolName, admitList, t)
+    return admitted
   }
 
   async grant(from, grantHeaderValue, toolName, admitList, t) {
@@ -448,7 +450,7 @@ export class Credits {
   }
 
   async addNote(note, issuer, sellerPayout, name) {
-    if (!issuer || !Address.isAddress(issuer)) return { ok: false, why: 'this Pass has no credit issuer set' }
+    if (!issuer || !Address.isAddress(issuer)) return { ok: false, why: 'this Bridge has no credit issuer set' }
     if (note === null || typeof note !== 'object') return { ok: false, why: 'not a credit note' }
     for (const f of ['id', 'seller', 'name', 'checks', 'issued', 'signature']) if (!Object.hasOwn(note, f) || !scalar(note[f])) return { ok: false, why: 'not a credit note' }
     if (!Address.equals(str(note.seller), String(sellerPayout)) || note.name !== name) return { ok: false, why: 'the note is for another seller' }
@@ -499,7 +501,7 @@ export class Credits {
   async buy(creditUrl, checks, creditKey, sellerPayout, name, chain = null) {
     const n = Math.trunc(Number(checks))
     if (!(n >= 1000) || n % 1000 !== 0) return Credits.fail('bad_checks', 'checks is a multiple of 1,000')
-    if (!Address.isAddress(sellerPayout) || !/^[a-z][a-z0-9-]{1,31}$/.test(String(name))) return Credits.fail('bad_seller', "seller is the seller's payout address and name its Pass name")
+    if (!Address.isAddress(sellerPayout) || !/^[a-z][a-z0-9-]{1,31}$/.test(String(name))) return Credits.fail('bad_seller', "seller is the seller's payout address and name its Bridge name")
     const url = Credits.creditRequestUrl(creditUrl, n, sellerPayout, name)
     let first
     try {
@@ -546,7 +548,7 @@ export class Credits {
       return Credits.fail('not_bought', `could not buy credit (${response.status} ${error}${reason})`, response.status)
     }
     if (note === null || typeof note !== 'object') return Credits.fail('not_bought', 'the credit service answered 200 without a note', 200)
-    const added = this.issuer ? await this.addNote(note, this.issuer, sellerPayout, name) : { ok: false, why: 'this Pass has no credit issuer set' }
+    const added = this.issuer ? await this.addNote(note, this.issuer, sellerPayout, name) : { ok: false, why: 'this Bridge has no credit issuer set' }
     return { ok: added.ok, note, added }
   }
 }

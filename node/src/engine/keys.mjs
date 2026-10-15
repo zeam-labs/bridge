@@ -2,6 +2,7 @@ import { chmodSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, re
 import { createCipheriv, createDecipheriv, randomBytes, scryptSync } from 'node:crypto'
 import { join } from 'node:path'
 import { Secp256k1 } from './core/secp256k1.mjs'
+import { setting } from './env.mjs'
 
 const FILE = 'keys.json'
 const SEAL = 'v1:'
@@ -76,7 +77,7 @@ function write(path, all) {
   chmodSync(path, 0o600)
 }
 
-export function loadKeys(dir, { need = ['settle'], secret = process.env.PASS_KEY_SECRET, provided = {} } = {}) {
+export function loadKeys(dir, { need = ['settle'], secret = setting('BRIDGE_KEY_SECRET'), provided = {} } = {}) {
   const out = {}
   for (const which of need) {
     if (typeof provided[which] === 'string' && provided[which] !== '') {
@@ -97,9 +98,9 @@ export function loadKeys(dir, { need = ['settle'], secret = process.env.PASS_KEY
       if (entry && (entry.sealed || entry.key)) {
         let key = entry.key ?? null
         if (entry.sealed) {
-          if (!secret) throw new KeyError(`the ${which} key in ${path} is sealed; set PASS_KEY_SECRET to the secret it was sealed with`)
+          if (!secret) throw new KeyError(`the ${which} key in ${path} is sealed; set BRIDGE_KEY_SECRET to the secret it was sealed with`)
           key = unseal(entry.sealed, secret)
-          if (key === null) throw new KeyError(`the ${which} key in ${path} cannot be decrypted: PASS_KEY_SECRET changed since it was made`)
+          if (key === null) throw new KeyError(`the ${which} key in ${path} cannot be decrypted: BRIDGE_KEY_SECRET is missing or changed since it was made`)
         } else if (secret) {
           all[which] = { sealed: seal(key, secret), address: entry.address, created: entry.created }
           changed = true

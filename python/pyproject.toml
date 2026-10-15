@@ -1,13 +1,13 @@
 [project]
-name = "zeam-pass"
-version = "1.0.7"
-license = "GPL-2.0-only"
-license-files = ["LICENSE"]
+name = "zeambridge"
+version = "2.0.0"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
 authors = [{name = "ZEAM Labs, LLC", email = "info@zeamlabs.com"}]
-description = "ZEAM :: Pass for your own server: a paywall (x402; you keep 90.01%), a key gate, or both, for your MCP and HTTP tools. Runs in your process with your keys."
+description = "ZEAM :: Bridge for your own server: a paywall (x402 and MPP; you keep 90.01%), a key gate, or both, for your MCP and HTTP tools. Runs in your process with your keys."
 readme = "README.md"
 requires-python = ">=3.9"
-keywords = ["x402", "mcp", "agents", "paywall", "gate", "batch-settlement", "usdc", "base"]
+keywords = ["x402", "mpp", "mcp", "agents", "paywall", "gate", "batch-settlement", "usdc", "base"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
@@ -27,12 +27,15 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://zeampass.com"
+Homepage = "https://zeambridge.com"
 Source = "https://github.com/zeam-labs/pass"
 
 [build-system]
 requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
+[tool.setuptools]
+py-modules = ["zeam_pass"]
+
 [tool.setuptools.packages.find]
-include = ["zeam_pass*"]
+include = ["zeam_bridge*", "zeam_pass"]

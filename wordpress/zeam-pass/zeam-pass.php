@@ -1,9 +1,9 @@
 <?php
 /**
- * Plugin Name: ZEAM Pass
- * Plugin URI: https://zeampass.com
- * Description: Put a gate, a paywall or both in front of your posts for AI agents, on your own site. Agents search and read over MCP and over x402 HTTP. No sign-up and no account: install, connect the wallet you are paid to, choose. Your earnings go to your own split, 90.01% to your wallet.
- * Version: 1.0.8
+ * Plugin Name: ZEAM Bridge
+ * Plugin URI: https://zeambridge.com
+ * Description: Put a gate, a paywall or both in front of your posts for AI agents, on your own site. Agents search and read over MCP and over HTTP; x402 and MPP clients both pay. No sign-up and no account: install, connect the wallet you are paid to, choose. Your earnings go to your own split, 90.01% to your wallet.
+ * Version: 2.0.0
  * Requires at least: 6.0
  * Requires PHP: 7.4
  * Author: ZEAM Labs, LLC
@@ -19,6 +19,7 @@ if (!defined('ABSPATH')) {
 }
 
 const ZEAM_PASS_NS = 'zeam-pass';
+const ZEAM_BRIDGE_NS = 'zeam-bridge';
 const ZEAM_PASS_META_PAYMENT = 'x402/payment';
 const ZEAM_PASS_META_RESPONSE = 'x402/payment-response';
 const ZEAM_PASS_META_GRANTED_BY = 'zeam-pass/granted-by';
@@ -29,7 +30,9 @@ const ZEAM_PASS_LINE_OPS = ['open', 'prove', 'on', 'off', 'status', 'close'];
 const ZEAM_PASS_TIME_TOOLS = ['buy_time', 'line'];
 const ZEAM_PASS_BUILTIN_TOOLS = ['search_posts', 'read_post'];
 const ZEAM_PASS_NO_UNITS = 'the tool reported no units. Nothing was charged.';
-const ZEAM_PASS_VERSION = '1.0.8';
+const ZEAM_PASS_VERSION = '2.0.0';
+const ZEAM_PASS_MCP_SESSION = '/^mcp\.[A-Za-z0-9_-]{16}$/D';
+const ZEAM_PASS_HANG_UP_TIME = ' A call you hang up on burns until it returns: to stop the burn, send notifications/cancelled over MCP with its requestId and the line.';
 const ZEAM_PASS_RESULT_NOT_JSON = 'the result is not valid JSON (a non-finite number or a non-JSON value); nothing was charged';
 
 require_once __DIR__ . '/lib/autoload.php';
@@ -50,6 +53,37 @@ function zeam_pass_set(array $values)
     update_option('zeam_pass', array_merge(is_array($all) ? $all : [], $values), false);
 }
 
+function zeam_pass_defined($name)
+{
+    foreach (['ZEAM_BRIDGE_', 'ZEAM_PASS_'] as $prefix) {
+        if (defined($prefix . $name)) {
+            return constant($prefix . $name);
+        }
+    }
+    return null;
+}
+
+function zeam_pass_prices_filtered()
+{
+    return has_filter('zeam_pass_prices') || has_filter('zeam_bridge_prices');
+}
+
+function zeam_pass_filtered_price($name, array $args)
+{
+    return apply_filters('zeam_bridge_prices', apply_filters('zeam_pass_prices', null, $name, $args), $name, $args);
+}
+
+function zeam_pass_route($request)
+{
+    $route = untrailingslashit((string) $request->get_route());
+    foreach ([ZEAM_PASS_NS, ZEAM_BRIDGE_NS] as $ns) {
+        if ($route === '/' . $ns || strpos($route, '/' . $ns . '/') === 0) {
+            return (string) substr($route, strlen($ns) + 1);
+        }
+    }
+    return null;
+}
+
 function zeam_pass_site_name()
 {
     return html_entity_decode(wp_strip_all_tags(get_bloginfo('name')), ENT_QUOTES);
@@ -60,11 +94,27 @@ final class ZeamPassMeter
     private $units = null;
     private $deadline;
     private $channelId;
+    private $call;
+    private $cut = null;
 
-    public function __construct($deadlineMs = null, $channelId = null)
+    public function __construct($deadlineMs = null, $channelId = null, $call = null)
     {
         $this->deadline = $deadlineMs === null ? null : (int) $deadlineMs;
         $this->channelId = $channelId === null ? null : strtolower((string) $channelId);
+        $this->call = $call;
+    }
+
+    public function stopped()
+    {
+        if ($this->cut === null) {
+            $this->cut = zeam_pass_call_cut($this->call);
+        }
+        return $this->cut !== null || ($this->deadline !== null && zeam_pass_now_ms() >= $this->deadline);
+    }
+
+    public function cutAt()
+    {
+        return $this->cut;
     }
 
     public function deadlineMs()
@@ -138,6 +188,12 @@ function zeam_pass_site_fallback()
 
 function zeam_pass_time()
 {
+    $time = zeam_pass_time_price();
+    return $time !== null && isset(zeam_pass_tools()['buy_time']) ? $time : null;
+}
+
+function zeam_pass_time_price()
+{
     if (zeam_pass_mode() === 'gate') {
         return null;
     }
@@ -187,7 +243,7 @@ function zeam_pass_time_tools(array $time)
 function zeam_pass_tools()
 {
     $tools = zeam_pass_builtin_tools();
-    $time = zeam_pass_time();
+    $time = zeam_pass_time_price();
     $prices = zeam_pass_opt('tool_prices', []);
     $free = zeam_pass_free_list();
     foreach ($tools as $name => $t) {
@@ -198,9 +254,11 @@ function zeam_pass_tools()
             $tools[$name]['free'] = true;
         }
     }
-    $added = apply_filters('zeam_pass_tools', $tools);
+    $legacy = apply_filters('zeam_pass_tools', $tools);
+    $legacy = is_array($legacy) ? $legacy : $tools;
+    $added = apply_filters('zeam_bridge_tools', $legacy);
     $out = [];
-    foreach (is_array($added) ? $added : $tools as $name => $t) {
+    foreach (is_array($added) ? $added : $legacy as $name => $t) {
         if (!is_string($name) || !preg_match('/^[a-z0-9_]{1,64}$/D', $name) || !is_array($t) || in_array($name, ZEAM_PASS_TIME_TOOLS, true)) {
             continue;
         }
@@ -226,7 +284,13 @@ function zeam_pass_tools()
         }
         $out[$name] = $t;
     }
-    return $time === null ? $out : $out + zeam_pass_time_tools($time);
+    $burns = false;
+    foreach ($out as $t) {
+        if (($t['meter'] ?? null) === 'time') {
+            $burns = true;
+        }
+    }
+    return $time === null || !$burns ? $out : $out + zeam_pass_time_tools($time);
 }
 
 function zeam_pass_price_for($name, array $t, array $args = [])
@@ -234,13 +298,13 @@ function zeam_pass_price_for($name, array $t, array $args = [])
     if (($t['builtin'] ?? null) === 'buy_time') {
         $time = zeam_pass_time();
         $ms = zeam_pass_bought_ms($args);
-        return ['micro' => intdiv($ms, $time['rateMs']) * $time['rateMicro'], 'unitMicro' => null, 'ms' => $ms];
+        return ['micro' => \ZeamPass\Meter\TimeMeter::micro($time, $ms), 'unitMicro' => null, 'ms' => $ms];
     }
     if (zeam_pass_own_price($t)) {
         return \ZeamPass\Pricing::priceOf(['price' => $t['price'] ?? null, 'unit' => $t['unit'] ?? null], zeam_pass_site_fallback());
     }
-    if (has_filter('zeam_pass_prices')) {
-        return \ZeamPass\Pricing::priceOf(apply_filters('zeam_pass_prices', null, $name, $args), zeam_pass_site_fallback());
+    if (zeam_pass_prices_filtered()) {
+        return \ZeamPass\Pricing::priceOf(zeam_pass_filtered_price($name, $args), zeam_pass_site_fallback());
     }
     return \ZeamPass\Pricing::priceOf(null, zeam_pass_site_fallback());
 }
@@ -254,13 +318,13 @@ function zeam_pass_price_tag($name, array $t)
     if (($t['builtin'] ?? null) === 'buy_time') {
         return ['usd' => \ZeamPass\Pricing::usd($time['rateMicro']), 'per' => 'ms', 'ms' => $time['rateMs']] + (empty($time['maxMs']) ? [] : ['maxMs' => $time['maxMs']]);
     }
-    if (($t['meter'] ?? null) === 'time' && $time !== null && !(has_filter('zeam_pass_prices') && !zeam_pass_own_price($t))) {
+    if (($t['meter'] ?? null) === 'time' && $time !== null && !(zeam_pass_prices_filtered() && !zeam_pass_own_price($t))) {
         try {
             $p = zeam_pass_price_for($name, $t);
         } catch (\InvalidArgumentException $e) {
             return null;
         }
-        return ['per' => 'time', 'usd' => \ZeamPass\Pricing::usd($time['rateMicro']), 'ms' => $time['rateMs'], 'callUSD' => \ZeamPass\Pricing::usd($p['micro']), 'callMs' => intdiv($p['micro'] * $time['rateMs'], $time['rateMicro'])];
+        return ['per' => 'time', 'usd' => \ZeamPass\Pricing::usd($time['rateMicro']), 'ms' => $time['rateMs'], 'callUSD' => \ZeamPass\Pricing::usd($p['micro']), 'callMs' => \ZeamPass\Meter\TimeMeter::callMsOf($time, $p['micro'])];
     }
     if (!empty($t['free'])) {
         return \ZeamPass\Pricing::describe(null, ['free' => true, 'perHour' => zeam_pass_free_limit()]);
@@ -268,7 +332,7 @@ function zeam_pass_price_tag($name, array $t)
     if (zeam_pass_mode() === 'gate') {
         return ['usd' => '0', 'per' => 'call'];
     }
-    if (!zeam_pass_own_price($t) && has_filter('zeam_pass_prices')) {
+    if (!zeam_pass_own_price($t) && zeam_pass_prices_filtered()) {
         return \ZeamPass\Pricing::describe(null, ['varies' => true]);
     }
     try {
@@ -291,7 +355,7 @@ function zeam_pass_listing()
         }
     }
     $time = zeam_pass_time();
-    return $time === null ? ['prices' => $prices] : ['prices' => $prices, 'time' => \ZeamPass\Meter\TimeMeter::text($time, untrailingslashit(rest_url(ZEAM_PASS_NS)))];
+    return $time === null ? ['prices' => $prices] : ['prices' => $prices, 'time' => \ZeamPass\Meter\TimeMeter::text($time, untrailingslashit(rest_url(ZEAM_PASS_NS))) . ZEAM_PASS_HANG_UP_TIME];
 }
 
 function zeam_pass_client_address()
@@ -372,6 +436,9 @@ function zeam_pass_validate($tool, $args)
         if (isset($prop['type']) && !zeam_pass_type_ok($prop['type'], $v)) {
             return $bad("argument {$key} must be {$prop['type']}");
         }
+        if (isset($prop['enum']) && is_array($prop['enum']) && !in_array(wp_json_encode($v), array_map('wp_json_encode', $prop['enum']), true)) {
+            return $bad("argument {$key} must be one of " . wp_json_encode(array_values($prop['enum']), JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE));
+        }
         if (isset($prop['minimum']) && (is_int($v) || is_float($v)) && $v < $prop['minimum']) {
             return $bad("argument {$key} must be at least {$prop['minimum']}");
         }
@@ -411,7 +478,7 @@ function zeam_pass_run($tool, array $args, ?ZeamPassMeter $meter = null)
         $ms = zeam_pass_bought_ms($args);
         $channelId = $meter ? $meter->channelId() : null;
         $st = zeam_pass_time_meter()->status($channelId);
-        return ['channelId' => $channelId, 'boughtMs' => $ms, 'msRemaining' => $st['msRemaining'] + $ms, 'paidUSD' => \ZeamPass\Pricing::usd(intdiv($ms, $time['rateMs']) * $time['rateMicro'])];
+        return ['channelId' => $channelId, 'boughtMs' => $ms, 'msRemaining' => $st['msRemaining'] + $ms, 'paidUSD' => \ZeamPass\Pricing::usd(\ZeamPass\Meter\TimeMeter::micro($time, $ms))];
     }
     if (isset($tools[$tool]['run']) && is_callable($tools[$tool]['run'])) {
         return call_user_func($tools[$tool]['run'], $args, $meter ?: new ZeamPassMeter());
@@ -476,16 +543,21 @@ function zeam_pass_serve($tool, $path, $resource, $args, array $payment_headers,
     $t = zeam_pass_tools()[$tool];
     $line = zeam_pass_first_header($payment_headers, ['x-line']);
     $payment = zeam_pass_first_header($payment_headers, ['payment-signature', 'x-payment']);
+    $offered = zeam_pass_first_header($payment_headers, ['payment-authorization', 'authorization']);
+    $credential = $payment === '' && \ZeamPass\Settlement\Mpp::credentialIs($offered) ? $offered : '';
     $bad = zeam_pass_validate($tool, $args);
     if (!$bad) {
         $bad = zeam_pass_precheck($tool, $args);
     }
-    $probe = $bad && zeam_pass_probe($t, $args, $payment, $line);
+    $probe = $bad && zeam_pass_probe($t, $args, $payment !== '' ? $payment : ($credential !== '' ? 'paid' : ''), $line);
+    if ($bad) {
+        $bad = ['status' => $bad['status'], 'body' => ['error' => $bad['error'], 'tool' => $tool] + array_diff_key($bad, ['status' => true])];
+    }
     if ($bad && !$probe) {
-        return zeam_pass_refusal($bad['status'], $bad) + ['arguments' => true];
+        return zeam_pass_refusal($bad['status'], $bad['body']) + ['arguments' => true];
     }
     if (!zeam_pass_ready()) {
-        return zeam_pass_refusal(503, ['error' => 'not_ready', 'message' => 'this site has not finished setting up ZEAM Pass']);
+        return zeam_pass_refusal(503, ['error' => 'not_ready', 'message' => 'this site has not finished setting up ZEAM Bridge']);
     }
     if (($t['builtin'] ?? null) === 'line') {
         return zeam_pass_serve_line_op($args, $line, strpos((string) $path, 'mcp:') === 0);
@@ -506,9 +578,9 @@ function zeam_pass_serve($tool, $path, $resource, $args, array $payment_headers,
         try {
             $price = zeam_pass_price_for($tool, $t, $args);
         } catch (Throwable $e) {
-            return $probe ? zeam_pass_refusal($bad['status'], $bad) + ['arguments' => true] : zeam_pass_refusal(500, ['error' => 'price_invalid', 'tool' => $tool, 'message' => \ZeamPass\message($e)]);
+            return $probe ? zeam_pass_refusal($bad['status'], $bad['body']) + ['arguments' => true] : zeam_pass_refusal(500, ['error' => 'price_invalid', 'tool' => $tool, 'message' => \ZeamPass\message($e)]);
         }
-        return zeam_pass_serve_paid($tool, $res, $args, $payment, $grant, zeam_pass_mode() === 'both', $price, $timed ? zeam_pass_time_meter()->callMs($price['micro']) : null, \ZeamPass\Bazaar::extension(['name' => $tool] + $t, strpos((string) $path, 'mcp:') === 0 ? 'mcp' : 'http'));
+        return zeam_pass_serve_paid($tool, $res, $args, $payment, $grant, zeam_pass_mode() === 'both', $price, $timed ? zeam_pass_time_meter()->callMs($price['micro']) : null, \ZeamPass\Bazaar::extension(['name' => $tool] + $t, strpos((string) $path, 'mcp:') === 0 ? 'mcp' : 'http'), $credential);
     } catch (Throwable $e) {
         return zeam_pass_refusal(503, ['error' => 'payment_unavailable', 'message' => 'the payment check failed; nothing was charged. Retry.']);
     }
@@ -524,8 +596,12 @@ function zeam_pass_http(WP_REST_Request $request)
 {
     $tool = (string) $request['tool'];
     $tools = zeam_pass_tools();
+    if (!isset($tools[$tool]) && $tool === 'line') {
+        $l = zeam_pass_line_op(null);
+        return new WP_REST_Response($l['body'], $l['status']);
+    }
     if (!isset($tools[$tool])) {
-        return new WP_REST_Response(['error' => 'unknown_tool', 'tool' => $tool, 'tools' => array_keys($tools)], 404);
+        return new WP_REST_Response(['error' => 'unknown_tool', 'message' => 'no tool named ' . $tool . ' here; tools lists the ones there are', 'tool' => $tool, 'tools' => array_keys($tools)], 404);
     }
     $raw = trim((string) $request->get_body());
     $args = $raw === '' ? [] : json_decode($raw, true);
@@ -537,17 +613,32 @@ function zeam_pass_http(WP_REST_Request $request)
         'x-payment' => $request->get_header('x_payment'),
         'x-grant' => $request->get_header('x_grant'),
         'x-line' => $request->get_header('x_line'),
+        'authorization' => $request->get_header('authorization'),
+        'payment-authorization' => $request->get_header('payment_authorization'),
     ], zeam_pass_client_address());
     $response = new WP_REST_Response($s['body'], $s['status']);
     foreach ($s['headers'] as $k => $v) {
         $response->header($k, $v);
     }
+    if (is_array($s['body']) && is_string($s['body']['type'] ?? null) && strpos($s['body']['type'], \ZeamPass\Settlement\Mpp::PROBLEM) === 0) {
+        $response->header('Content-Type', 'application/problem+json');
+    }
     return $response;
+}
+
+function zeam_pass_mpp_meta(array $s)
+{
+    try {
+        $required = \ZeamPass\Settlement\Mpp::mcpRequired($s['headers']['WWW-Authenticate'] ?? null, $s['body'] ?? null);
+    } catch (\ZeamPass\Settlement\MppException $e) {
+        $required = null;
+    }
+    return $required === null ? [] : ['_meta' => [\ZeamPass\Settlement\Mpp::REQUIRED => $required]];
 }
 
 function zeam_pass_mcp_error(array $body)
 {
-    $out = ['isError' => true, 'content' => [['type' => 'text', 'text' => wp_json_encode($body)]]];
+    $out = ['isError' => true, 'content' => [['type' => 'text', 'text' => wp_json_encode($body, \ZeamPass\Settlement\Json::WIRE)]]];
     if (zeam_pass_is_object($body) && $body !== []) {
         $out['structuredContent'] = $body;
     }
@@ -559,30 +650,33 @@ function zeam_pass_mcp_call(array $params)
     $tool = (string) $params['name'];
     $tools = zeam_pass_tools();
     if (!isset($tools[$tool])) {
-        return zeam_pass_mcp_error(['error' => 'unknown_tool', 'tool' => $tool, 'tools' => array_keys($tools)]);
+        return zeam_pass_mcp_error(['error' => 'unknown_tool', 'message' => 'no tool named ' . $tool . ' here; tools lists the ones there are', 'tool' => $tool, 'tools' => array_keys($tools)]);
     }
     $args = $params['arguments'] ?? [];
     $payment = $params['_meta'][ZEAM_PASS_META_PAYMENT] ?? null;
+    $paying = $payment !== null && $payment !== false && $payment !== 0 && $payment !== 0.0 && $payment !== '';
     $line = isset($params['_meta'][ZEAM_PASS_META_LINE]) && is_string($params['_meta'][ZEAM_PASS_META_LINE]) && trim($params['_meta'][ZEAM_PASS_META_LINE]) !== '' ? $params['_meta'][ZEAM_PASS_META_LINE] : zeam_pass_request_line();
-    $s = zeam_pass_serve($tool, 'mcp:' . $tool, rest_url(ZEAM_PASS_NS . '/mcp'), $args, ['payment-signature' => $payment ? base64_encode(wp_json_encode($payment)) : null, 'x-grant' => zeam_pass_request_grant(), 'x-line' => $line], zeam_pass_client_address());
+    $s = zeam_pass_serve($tool, 'mcp:' . $tool, rest_url(ZEAM_PASS_NS . '/mcp'), $args, ['payment-signature' => $paying ? base64_encode(wp_json_encode($payment)) : null, 'x-grant' => zeam_pass_request_grant(), 'x-line' => $line, 'authorization' => $paying ? null : \ZeamPass\Settlement\Mpp::mcpHeader($params['_meta'] ?? null)], zeam_pass_client_address());
+    $read = isset($s['meter']) ? ['_meta' => [ZEAM_PASS_META_METER => $s['meter']]] : [];
     if (isset($s['mcpBody'])) {
-        return ['isError' => true, 'structuredContent' => $s['mcpBody'], 'content' => [['type' => 'text', 'text' => wp_json_encode($s['mcpBody'])]]];
+        return ['isError' => true, 'structuredContent' => $s['mcpBody'], 'content' => [['type' => 'text', 'text' => wp_json_encode($s['mcpBody'], \ZeamPass\Settlement\Json::WIRE)]]] + $read;
     }
     if (!$s['delivered']) {
+        $mpp = array_merge_recursive(zeam_pass_mpp_meta($s), $read);
         $required = zeam_pass_decode_header($s['headers']['PAYMENT-REQUIRED'] ?? '') ?: (isset($s['body']['accepts']) ? $s['body'] : null);
         if (!$required && $s['status'] === 402) {
             $required = array_merge(['x402Version' => 2, 'accepts' => []], $s['body']);
         }
         if ($required) {
             $required = array_merge(['x402Version' => 2], $s['body'], $required);
-            return ['isError' => true, 'structuredContent' => $required, 'content' => [['type' => 'text', 'text' => wp_json_encode($required)]]];
+            return ['isError' => true, 'structuredContent' => $required, 'content' => [['type' => 'text', 'text' => wp_json_encode($required, \ZeamPass\Settlement\Json::WIRE)]]] + $mpp;
         }
         if (!empty($s['arguments']) || !zeam_pass_is_object($s['body']) || $s['body'] === []) {
-            return zeam_pass_mcp_error($s['body']);
+            return zeam_pass_mcp_error($s['body']) + $mpp;
         }
-        return ['isError' => true, 'structuredContent' => $s['body'], 'content' => [['type' => 'text', 'text' => wp_json_encode($s['body'])]]];
+        return ['isError' => true, 'structuredContent' => $s['body'], 'content' => [['type' => 'text', 'text' => wp_json_encode($s['body'], \ZeamPass\Settlement\Json::WIRE)]]] + $mpp;
     }
-    $result = ['content' => [['type' => 'text', 'text' => wp_json_encode($s['body'])]], 'structuredContent' => $s['body']];
+    $result = ['content' => [['type' => 'text', 'text' => wp_json_encode($s['body'], \ZeamPass\Settlement\Json::WIRE)]], 'structuredContent' => $s['body']];
     $meta = [];
     $settled = zeam_pass_decode_header($s['headers']['PAYMENT-RESPONSE'] ?? '');
     if ($settled) {
@@ -593,6 +687,13 @@ function zeam_pass_mcp_call(array $params)
     }
     if (isset($s['meter'])) {
         $meta[ZEAM_PASS_META_METER] = $s['meter'];
+    }
+    if (isset($s['headers']['Payment-Receipt']) && is_string($s['headers']['Payment-Receipt'])) {
+        try {
+            $meta[\ZeamPass\Settlement\Mpp::RECEIPT] = \ZeamPass\Settlement\Mpp::receiptParse($s['headers']['Payment-Receipt']);
+        } catch (\ZeamPass\Settlement\MppException $e) {
+            unset($meta[\ZeamPass\Settlement\Mpp::RECEIPT]);
+        }
     }
     if ($meta) {
         $result['_meta'] = $meta;
@@ -618,10 +719,69 @@ function zeam_pass_bad_params($msg)
     if (array_key_exists('_meta', $params) && !zeam_pass_is_object($params['_meta'])) {
         return 'params._meta must be an object';
     }
-    if (isset($params['_meta'][ZEAM_PASS_META_PAYMENT]) && !zeam_pass_is_object($params['_meta'][ZEAM_PASS_META_PAYMENT])) {
-        return 'params._meta["x402/payment"] must be an object';
-    }
     return null;
+}
+
+function zeam_pass_takes_mpp()
+{
+    if (zeam_pass_mode() === 'gate') {
+        return false;
+    }
+    try {
+        return zeam_pass_engine()['server']->mppAsset() !== null;
+    } catch (\Throwable $e) {
+        return false;
+    }
+}
+
+function zeam_pass_mcp_declares($params)
+{
+    return zeam_pass_is_object($params) && \ZeamPass\Settlement\Mpp::mcpDeclares($params['capabilities'] ?? null) && zeam_pass_takes_mpp();
+}
+
+function zeam_pass_mcp_session($body)
+{
+    if (!zeam_pass_is_object($body) || $body === [] || ($body['method'] ?? null) !== 'initialize' || !array_key_exists('id', $body)) {
+        return null;
+    }
+    return zeam_pass_mcp_declares($body['params'] ?? null) ? \ZeamPass\Settlement\Mpp::mcpSession() : 'mcp.' . rtrim(strtr(base64_encode(random_bytes(12)), '+/', '-_'), '=');
+}
+
+function zeam_pass_mcp_opens($request)
+{
+    if (!($request instanceof WP_REST_Request) || $request->get_method() !== 'POST' || zeam_pass_route($request) !== '/mcp') {
+        return false;
+    }
+    $body = json_decode($request->get_body(), true);
+    return zeam_pass_is_object($body) && $body !== [] && ($body['method'] ?? null) === 'initialize' && array_key_exists('id', $body);
+}
+
+function zeam_pass_mcp_canceled(array $msg)
+{
+    $params = $msg['params'] ?? null;
+    if ($msg['method'] !== 'notifications/cancelled' || !zeam_pass_is_object($params)) {
+        return;
+    }
+    $key = zeam_pass_call_key($params['requestId'] ?? null);
+    $meta = $params['_meta'] ?? null;
+    $by = zeam_pass_callers(is_array($meta) ? ($meta[ZEAM_PASS_META_LINE] ?? null) : null);
+    if ($key === null || $by === []) {
+        return;
+    }
+    try {
+        zeam_pass_call_cancel($key, $by);
+    } catch (Throwable $e) {
+        return;
+    }
+}
+
+function zeam_pass_request_payment($set = null)
+{
+    static $payment = false;
+    if ($set !== null) {
+        $payment = (bool) $set;
+    }
+    return $payment;
 }
 
 function zeam_pass_mcp_one($msg)
@@ -630,6 +790,7 @@ function zeam_pass_mcp_one($msg)
         return ['jsonrpc' => '2.0', 'id' => null, 'error' => ['code' => -32600, 'message' => 'invalid request']];
     }
     if (!array_key_exists('id', $msg)) {
+        zeam_pass_mcp_canceled($msg);
         return null;
     }
     $id = is_string($msg['id']) || is_int($msg['id']) || is_float($msg['id']) ? $msg['id'] : null;
@@ -645,7 +806,7 @@ function zeam_pass_mcp_one($msg)
             case 'initialize':
                 $asked = $params['protocolVersion'] ?? '';
                 $known = ['2025-11-25', '2025-06-18', '2025-03-26', '2024-11-05'];
-                return $reply(['protocolVersion' => in_array($asked, $known, true) ? $asked : $known[0], 'capabilities' => ['tools' => (object) []], 'serverInfo' => ['name' => zeam_pass_site_name(), 'version' => ZEAM_PASS_VERSION]]);
+                return $reply(['protocolVersion' => in_array($asked, $known, true) ? $asked : $known[0], 'capabilities' => ['tools' => (object) []] + (zeam_pass_mcp_declares($params) && zeam_pass_sells_by_charge() ? ['experimental' => ['payment' => \ZeamPass\Settlement\Mpp::mcpCapability()]] : []), 'serverInfo' => ['name' => zeam_pass_site_name(), 'version' => ZEAM_PASS_VERSION]]);
             case 'ping':
                 return $reply((object) []);
             case 'tools/list':
@@ -660,7 +821,15 @@ function zeam_pass_mcp_one($msg)
                 }
                 return $reply(['tools' => $list]);
             case 'tools/call':
-                return $reply(zeam_pass_mcp_call($params));
+                $asked = \ZeamPass\Settlement\Mpp::mcpParams($msg);
+                zeam_pass_request_call(['key' => zeam_pass_call_key($msg['id']), 'by' => zeam_pass_callers($asked['_meta'][ZEAM_PASS_META_LINE] ?? null)]);
+                try {
+                    $out = zeam_pass_mcp_call($asked);
+                } finally {
+                    zeam_pass_request_call(null);
+                }
+                $unpaid = zeam_pass_request_payment() ? \ZeamPass\Settlement\Mpp::mcpError($out['_meta'][\ZeamPass\Settlement\Mpp::REQUIRED] ?? null, $out['structuredContent'] ?? null) : null;
+                return $unpaid === null ? $reply($out) : ['jsonrpc' => '2.0', 'id' => $id, 'error' => $unpaid];
             default:
                 return $fail(-32601, 'method not found');
         }
@@ -687,10 +856,30 @@ function zeam_pass_request_line($set = null)
     return $line;
 }
 
+function zeam_pass_request_session($set = null)
+{
+    static $session = '';
+    if ($set !== null) {
+        $session = (string) $set;
+    }
+    return $session;
+}
+
+function zeam_pass_request_call(...$set)
+{
+    static $call = null;
+    if ($set) {
+        $call = $set[0];
+    }
+    return $call;
+}
+
 function zeam_pass_mcp(WP_REST_Request $request)
 {
     zeam_pass_request_grant((string) $request->get_header('x_grant'));
     zeam_pass_request_line((string) $request->get_header('x_line'));
+    zeam_pass_request_session((string) $request->get_header('mcp_session_id'));
+    zeam_pass_request_payment(\ZeamPass\Settlement\Mpp::mcpInSession((string) $request->get_header('mcp_session_id')) && zeam_pass_takes_mpp());
     $body = json_decode($request->get_body(), true);
     if (json_last_error() !== JSON_ERROR_NONE) {
         return new WP_REST_Response(['jsonrpc' => '2.0', 'id' => null, 'error' => ['code' => -32700, 'message' => 'parse error']], 400);
@@ -703,7 +892,12 @@ function zeam_pass_mcp(WP_REST_Request $request)
     if (!$answers) {
         return new WP_REST_Response(null, 202);
     }
-    return new WP_REST_Response($batch ? $answers : $answers[0], 200);
+    $response = new WP_REST_Response($batch ? $answers : $answers[0], 200);
+    $session = $batch ? null : zeam_pass_mcp_session($body);
+    if ($session !== null) {
+        $response->header('Mcp-Session-Id', $session);
+    }
+    return $response;
 }
 
 function zeam_pass_mcp_get()
@@ -714,13 +908,13 @@ function zeam_pass_mcp_get()
 }
 
 add_filter('rest_pre_dispatch', function ($result, $server, $request) {
-    return $result === null && $request->get_method() === 'GET' && untrailingslashit($request->get_route()) === '/' . ZEAM_PASS_NS . '/mcp' ? zeam_pass_mcp_get() : $result;
+    return $result === null && $request->get_method() === 'GET' && zeam_pass_route($request) === '/mcp' ? zeam_pass_mcp_get() : $result;
 }, 10, 3);
 
 function zeam_pass_reads_its_own_body($request)
 {
-    $route = untrailingslashit($request->get_route());
-    return $route === '/' . ZEAM_PASS_NS . '/mcp' || $route === '/' . ZEAM_PASS_NS . '/refund' || $route === '/' . ZEAM_PASS_NS . '/line' || preg_match('#^/' . preg_quote(ZEAM_PASS_NS, '#') . '/v1/[a-z0-9_]+$#D', $route) === 1;
+    $route = zeam_pass_route($request);
+    return $route !== null && (in_array($route, ['/mcp', '/refund', '/line'], true) || preg_match('#^/v1/[a-z0-9_]+$#D', $route) === 1);
 }
 
 add_filter('rest_request_before_callbacks', function ($response, $handler, $request) {
@@ -744,13 +938,17 @@ function zeam_pass_refund_route(WP_REST_Request $request)
     try {
         $r = zeam_pass_refund($body);
     } catch (Throwable $e) {
-        $r = ['status' => 503, 'body' => ['op' => 'refund_failed', 'code' => 'refund_unavailable', 'why' => 'the refund could not be handled right now']];
+        $r = ['status' => 503, 'body' => ['op' => 'refund_failed', 'code' => 'refund_unavailable', 'why' => 'the refund could not be handled right now', 'retry_after_seconds' => 5]];
     }
     return new WP_REST_Response($r['body'], $r['status']);
 }
 
 function zeam_pass_line_route(WP_REST_Request $request)
 {
+    if (zeam_pass_time() === null) {
+        $l = zeam_pass_line_op(null);
+        return new WP_REST_Response($l['body'], $l['status']);
+    }
     $body = json_decode((string) $request->get_body(), true);
     if (json_last_error() !== JSON_ERROR_NONE) {
         return new WP_REST_Response(['op' => 'line_failed', 'code' => 'bad_request', 'why' => 'the body is not JSON'], 400);
@@ -765,46 +963,141 @@ function zeam_pass_line_route(WP_REST_Request $request)
 
 function zeam_pass_own_route($request)
 {
-    return !($request instanceof WP_REST_Request) || strpos($request->get_route(), '/' . ZEAM_PASS_NS . '/') === 0;
+    return !($request instanceof WP_REST_Request) || zeam_pass_route($request) !== null;
 }
 
 add_filter('rest_allowed_cors_headers', function ($headers, $request = null) {
-    return zeam_pass_own_route($request) ? array_values(array_unique(array_merge($headers, ['payment-signature', 'x-payment', 'x-grant', 'x-line', 'mcp-protocol-version', 'mcp-session-id']))) : $headers;
+    return zeam_pass_own_route($request) ? array_values(array_unique(array_merge($headers, ['payment-signature', 'x-payment', 'authorization', 'payment-authorization', 'x-grant', 'x-line', 'mcp-protocol-version', 'mcp-session-id']))) : $headers;
 }, 10, 2);
 
 add_filter('rest_exposed_cors_headers', function ($headers, $request = null) {
-    return zeam_pass_own_route($request) ? array_values(array_unique(array_merge($headers, ['PAYMENT-REQUIRED', 'PAYMENT-RESPONSE', 'X-Pass-Granted-By', 'X-Pass-Ms-Remaining', 'X-Pass-Ms-Elapsed']))) : $headers;
+    return zeam_pass_own_route($request) ? array_values(array_unique(array_merge($headers, ['PAYMENT-REQUIRED', 'PAYMENT-RESPONSE', 'WWW-Authenticate', 'Payment-Receipt', 'X-Pass-Granted-By', 'X-Pass-Ms-Remaining', 'X-Pass-Ms-Elapsed'], zeam_pass_mcp_opens($request) ? ['Mcp-Session-Id'] : []))) : $headers;
 }, 10, 2);
 
+function zeam_pass_sells_by_charge()
+{
+    if (zeam_pass_mpp_offers() !== []) {
+        return true;
+    }
+    if (!zeam_pass_prices_filtered()) {
+        return false;
+    }
+    foreach (zeam_pass_tools() as $t) {
+        if (empty($t['free']) && empty($t['builtin']) && !zeam_pass_own_price($t)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+function zeam_pass_mpp_offers()
+{
+    if (zeam_pass_mode() === 'gate') {
+        return [];
+    }
+    try {
+        $server = zeam_pass_engine()['server'];
+    } catch (\Throwable $e) {
+        return [];
+    }
+    $offers = [];
+    foreach (zeam_pass_tools() as $name => $t) {
+        if (!empty($t['free']) || (!zeam_pass_own_price($t) && zeam_pass_prices_filtered())) {
+            continue;
+        }
+        try {
+            $offer = $server->mppOffer(zeam_pass_price_for($name, $t), $t['description'] ?? null);
+        } catch (\Throwable $e) {
+            $offer = null;
+        }
+        if ($offer !== null) {
+            $offers[$name] = $offer;
+        }
+    }
+    return $offers;
+}
+
+function zeam_pass_openapi($mount = null)
+{
+    $paths = [];
+    $limit = zeam_pass_free_limit();
+    $unready = "this site's setup is incomplete (error not_ready)";
+    $unavailable = (zeam_pass_mode() === 'gate' ? 'the check failed (error payment_unavailable), this gate has no checks left this month (error gate_credit_exhausted)' : 'the payment check or settlement failed (error payment_unavailable)') . ", or {$unready}; nothing is charged. Retry later";
+    foreach (zeam_pass_tools() as $name => $t) {
+        $timed = ($t['meter'] ?? null) === 'time';
+        $missing = $name === 'read_post' ? ['404' => ['description' => 'no published post with that id' . (empty($t['free']) ? '; nothing is charged' : '')]] : [];
+        $responses = !empty($t['free'])
+            ? ['200' => ['description' => 'the result'], '400' => ['description' => 'invalid arguments'], '500' => ['description' => 'the tool failed']] + $missing + ($limit && empty($t['builtin']) ? ['429' => ['description' => "over {$limit} free calls an hour per address"]] : []) + ['503' => ['description' => "{$unready}. Retry later"]]
+            : ['200' => ['description' => 'the result'], '400' => ['description' => zeam_pass_mode() === 'gate' ? 'invalid arguments; nothing is charged' : 'invalid arguments (error invalid_arguments), or a payment that does not decode (error bad_payment_header) or is neither a voucher nor a deposit (error bad_payment_type); nothing is charged']] + $missing + ['402' => ['description' => zeam_pass_mode() === 'gate' ? 'a zero-value x402 signature is required; nothing is paid' : ((($t['builtin'] ?? null) === 'buy_time' || ((zeam_pass_price_tag($name, $t) ?? [])['per'] ?? null) === 'unit' ? 'x402 payment required' : 'payment required: x402, or MPP when the 402 carries a Payment challenge') . ($timed ? '; on a line, the meter is off or the line is out of time' : '') . '; a refund settling on the channel answers refund_settling')], '403' => ['description' => 'key not admitted' . ($timed ? '; on a line, no line with that credential' : '')], '500' => ['description' => 'the tool failed; nothing is charged per call' . ($timed ? ', and on a line the call has used the time it ran' : '')], '503' => ['description' => $unavailable]] + ($timed ? ['429' => ['description' => 'too many calls are live on the line (error too_many_calls)']] : []);
+        if ($name === 'line') {
+            $responses = ['200' => $responses['200'], '400' => ['description' => 'invalid arguments (error invalid_arguments), or a step refused (op line_failed, with code and why)'], '402' => ['description' => 'a refund settling on the channel answers refund_settling; "on" while a refund asked for on the channel is being worked out answers refund_pending'], '403' => ['description' => "no line with that credential, or the proof is not the payer's"], '404' => ['description' => 'no channel with that id here, or this seller sells no line time'], '409' => ['description' => 'the channel is leaving; code and why say so'], '500' => $responses['500'], '503' => ['description' => "the line could not be read right now (code line_unavailable; nothing changed, send it again), or {$unready}"]];
+        }
+        $op = ['operationId' => $name, 'summary' => $t['description']];
+        $tag = zeam_pass_price_tag($name, $t);
+        if ($tag !== null) {
+            $op['x-price'] = $tag;
+        }
+        $paths['/v1/' . $name] = ['post' => $op + ['requestBody' => ['required' => true, 'content' => ['application/json' => ['schema' => $t['inputSchema']]]], 'responses' => $responses]];
+    }
+    $how = ['paywall' => 'Paid per call with x402 or MPP', 'gate' => 'Admitted keys only, proven by a zero-value x402 signature; nothing is paid', 'both' => 'Admitted keys only, paid per call with x402 or MPP'][zeam_pass_mode()];
+    $contact = zeam_pass_contact();
+    $reach = stripos($contact, 'mailto:') === 0 ? ['email' => substr($contact, 7)] : ['url' => $contact];
+    $doc = ['openapi' => '3.0.3', 'info' => ['title' => zeam_pass_site_name(), 'version' => ZEAM_PASS_VERSION, 'description' => $how . '. MCP: ' . rest_url(ZEAM_PASS_NS . '/mcp'), 'contact' => $reach], 'servers' => [['url' => untrailingslashit(rest_url(ZEAM_PASS_NS))]], 'paths' => $paths];
+    $home = untrailingslashit(home_url());
+    return $mount === null ? \ZeamPass\Discovery::document($doc, zeam_pass_mpp_offers(), $home) : \ZeamPass\Discovery::document($doc, zeam_pass_mpp_offers(), $home, $home, $mount);
+}
+
+function zeam_pass_openapi_route()
+{
+    return zeam_pass_openapi();
+}
+
+function zeam_pass_root_mount()
+{
+    $home = wp_parse_url(home_url('/'));
+    $rest = wp_parse_url(untrailingslashit(rest_url(ZEAM_PASS_NS)));
+    if (!is_array($home) || !is_array($rest) || !empty($rest['query']) || empty($rest['path']) || trim($home['path'] ?? '', '/') !== '') {
+        return null;
+    }
+    return $rest['path'];
+}
+
+add_filter('rest_json_encode_options', function ($options, $request = null) {
+    return $request instanceof WP_REST_Request && zeam_pass_route($request) !== null ? ((int) $options) | \ZeamPass\Settlement\Json::WIRE : $options;
+}, 10, 2);
+
+add_filter('rest_post_dispatch', function ($response, $server = null, $request = null) {
+    if ($request instanceof WP_REST_Request && $response instanceof WP_REST_Response && in_array($request->get_route(), ['/' . ZEAM_PASS_NS . '/openapi.json', '/' . ZEAM_BRIDGE_NS . '/openapi.json'], true)) {
+        $response->header('Cache-Control', \ZeamPass\Discovery::CACHE_CONTROL);
+    }
+    return $response;
+}, 10, 3);
+
+add_action('parse_request', function () {
+    $method = isset($_SERVER['REQUEST_METHOD']) ? sanitize_text_field(wp_unslash($_SERVER['REQUEST_METHOD'])) : '';
+    $path = isset($_SERVER['REQUEST_URI']) ? wp_parse_url(sanitize_text_field(wp_unslash($_SERVER['REQUEST_URI'])), PHP_URL_PATH) : null;
+    if ($method !== 'GET' || $path !== '/openapi.json' || zeam_pass_opt('no_root_openapi') || zeam_pass_payout() === '' || !(zeam_pass_mode() === 'gate' || zeam_pass_price_micro() > 0)) {
+        return;
+    }
+    $mount = zeam_pass_root_mount();
+    if ($mount === null) {
+        return;
+    }
+    if (!headers_sent()) {
+        header('Cache-Control: ' . \ZeamPass\Discovery::CACHE_CONTROL);
+        header('Access-Control-Allow-Origin: *');
+    }
+    wp_send_json(zeam_pass_openapi($mount), 200, JSON_UNESCAPED_SLASHES);
+}, 0);
+
 add_action('rest_api_init', function () {
-    register_rest_route(ZEAM_PASS_NS, '/mcp', ['methods' => 'POST', 'permission_callback' => '__return_true', 'callback' => 'zeam_pass_mcp']);
-    register_rest_route(ZEAM_PASS_NS, '/refund', ['methods' => 'POST', 'permission_callback' => '__return_true', 'callback' => 'zeam_pass_refund_route']);
-    register_rest_route(ZEAM_PASS_NS, '/line', ['methods' => 'POST', 'permission_callback' => '__return_true', 'callback' => 'zeam_pass_line_route']);
-    register_rest_route(ZEAM_PASS_NS, '/v1/(?P<tool>[a-z0-9_]+)', ['methods' => 'POST', 'permission_callback' => '__return_true', 'callback' => 'zeam_pass_http']);
-    register_rest_route(ZEAM_PASS_NS, '/openapi.json', [
-        'methods' => 'GET',
-        'permission_callback' => '__return_true',
-        'callback' => function () {
-            $paths = [];
-            $limit = zeam_pass_free_limit();
-            foreach (zeam_pass_tools() as $name => $t) {
-                $missing = $name === 'read_post' ? ['404' => ['description' => 'no published post with that id' . (empty($t['free']) ? '; nothing is charged' : '')]] : [];
-                $responses = !empty($t['free'])
-                    ? ['200' => ['description' => 'the result'], '400' => ['description' => 'invalid arguments']] + $missing + ($limit && empty($t['builtin']) ? ['429' => ['description' => "over {$limit} free calls an hour per address"]] : [])
-                    : ['200' => ['description' => 'the result'], '400' => ['description' => 'invalid arguments; nothing is charged']] + $missing + ['402' => ['description' => 'x402 payment required'], '403' => ['description' => 'key not admitted']];
-                $op = ['operationId' => $name, 'summary' => $t['description']];
-                $tag = zeam_pass_price_tag($name, $t);
-                if ($tag !== null) {
-                    $op['x-price'] = $tag;
-                }
-                $paths['/v1/' . $name] = ['post' => $op + ['requestBody' => ['required' => true, 'content' => ['application/json' => ['schema' => $t['inputSchema']]]], 'responses' => $responses]];
-            }
-            $how = ['paywall' => 'Paid per call with x402', 'gate' => 'Admitted keys only, proven by a zero-value x402 signature. Nothing is paid.', 'both' => 'Admitted keys only, paid per call with x402'][zeam_pass_mode()];
-            $contact = zeam_pass_contact();
-            $reach = stripos($contact, 'mailto:') === 0 ? ['email' => substr($contact, 7)] : ['url' => $contact];
-            return ['openapi' => '3.0.3', 'info' => ['title' => zeam_pass_site_name(), 'version' => ZEAM_PASS_VERSION, 'description' => $how . '. MCP: ' . rest_url(ZEAM_PASS_NS . '/mcp'), 'contact' => $reach], 'servers' => [['url' => untrailingslashit(rest_url(ZEAM_PASS_NS))]], 'paths' => $paths];
-        },
-    ]);
+    foreach ([ZEAM_PASS_NS, ZEAM_BRIDGE_NS] as $ns) {
+        register_rest_route($ns, '/mcp', ['methods' => 'POST', 'permission_callback' => '__return_true', 'callback' => 'zeam_pass_mcp']);
+        register_rest_route($ns, '/refund', ['methods' => 'POST', 'permission_callback' => '__return_true', 'callback' => 'zeam_pass_refund_route']);
+        register_rest_route($ns, '/line', ['methods' => 'POST', 'permission_callback' => '__return_true', 'callback' => 'zeam_pass_line_route']);
+        register_rest_route($ns, '/v1/(?P<tool>[a-z0-9_]+)', ['methods' => 'POST', 'permission_callback' => '__return_true', 'callback' => 'zeam_pass_http']);
+        register_rest_route($ns, '/openapi.json', ['methods' => 'GET', 'permission_callback' => '__return_true', 'callback' => 'zeam_pass_openapi_route']);
+    }
 });
 
 function zeam_pass_holding()
@@ -853,7 +1146,7 @@ add_filter('option_rss_use_excerpt', function ($value) {
 
 add_action('wp_head', function () {
     if (zeam_pass_payout() !== '' && (zeam_pass_mode() === 'gate' || zeam_pass_price_micro() > 0)) {
-        echo '<link rel="alternate" type="application/json" title="Tools for AI agents (MCP and x402)" href="' . esc_url(rest_url(ZEAM_PASS_NS . '/openapi.json')) . '">' . "\n";
+        echo '<link rel="alternate" type="application/json" title="Tools for AI agents (' . (zeam_pass_mode() === 'gate' ? 'MCP and x402' : 'MCP, x402 and MPP') . ')" href="' . esc_url(rest_url(ZEAM_PASS_NS . '/openapi.json')) . '">' . "\n";
     }
 });
 
@@ -877,7 +1170,7 @@ function zeam_pass_deactivate()
 }
 
 add_filter('cron_schedules', function ($schedules) {
-    $schedules['zeam_pass_minute'] = ['interval' => 60, 'display' => 'Every minute (ZEAM Pass)'];
+    $schedules['zeam_pass_minute'] = ['interval' => 60, 'display' => 'Every minute (ZEAM Bridge)'];
     return $schedules;
 });
 

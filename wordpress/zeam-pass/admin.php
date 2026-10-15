@@ -3,13 +3,13 @@ if (!defined('ABSPATH')) {
     exit;
 }
 $zeam_pass_modes = [
-    'paywall' => ['Paywall', 'Agents pay per call in USDC. A failed call costs nothing.'],
-    'gate' => ['Gate', 'Admitted keys only. Calls are free to them. 10,000 checks a month are free to you, then $0.50 per 1,000 from your credit wallet.'],
+    'paywall' => ['Paywall', 'Agents pay per call in USDC. A failed call is not charged; on a line, a call uses the time it runs.'],
+    'gate' => ['Gate', 'Admitted keys only. Calls are free to them. 10,000 checks a month are free to you, then $0.50 per 1,000 from your credit wallet, bought 2,000 at a time for $1.'],
     'both' => ['Both', 'Admitted keys only, paid per call. Paid calls are not gate checks.'],
 ];
 ?>
 <div class="wrap" id="zeam-pass">
-<h1>ZEAM Pass</h1>
+<h1>ZEAM Bridge</h1>
 <p>A gate, a paywall or both in front of your posts for AI agents. No sign-up, no account. Connect your payout wallet and choose a mode. This WordPress makes and keeps the keys. ZEAM holds no money, no keys and no admission decisions.</p>
 
 <?php if ($view['notice']) : ?>
@@ -46,14 +46,14 @@ $zeam_pass_modes = [
 <label><input type="radio" name="mode" value="<?php echo esc_attr($zeam_pass_key); ?>" <?php checked($view['mode'], $zeam_pass_key); ?>> <strong><?php echo esc_html($zeam_pass_mode[0]); ?></strong>: <?php echo esc_html($zeam_pass_mode[1]); ?></label><br>
 <?php endforeach; ?>
 </fieldset></td></tr>
-<tr class="zp-paid"><th scope="row"><label for="zp-price">Price per call (USD)</label></th><td><input id="zp-price" name="price" class="small-text" value="<?php echo esc_attr($view['price']); ?>" placeholder="0.002"><p class="description">Per search, or per post read. A post that does not exist costs nothing.</p></td></tr>
+<tr class="zp-paid"><th scope="row"><label for="zp-price">Price per call (USD)</label></th><td><input id="zp-price" name="price" class="small-text" value="<?php echo esc_attr($view['price']); ?>" placeholder="0.02"><p class="description">Per search, or per post read. A post that does not exist costs nothing. <?php echo esc_html(zeam_pass_price_range()); ?></p></td></tr>
 <tr><th scope="row">Per tool</th><td><fieldset>
 <?php foreach (ZEAM_PASS_BUILTIN_TOOLS as $zeam_pass_tool) : ?>
-<label><code><?php echo esc_html($zeam_pass_tool); ?></code></label> <input name="tool_price[<?php echo esc_attr($zeam_pass_tool); ?>]" class="small-text zp-paid" aria-label="<?php echo esc_attr($zeam_pass_tool); ?> price (USD)" value="<?php echo esc_attr($view['toolPrices'][$zeam_pass_tool] ?? ''); ?>" placeholder="<?php echo esc_attr($view['price'] !== '' ? $view['price'] : '0.002'); ?>"> <label><input type="checkbox" name="tool_free[<?php echo esc_attr($zeam_pass_tool); ?>]" value="1" <?php checked(in_array($zeam_pass_tool, $view['free'], true)); ?>> Free</label><br>
+<label><code><?php echo esc_html($zeam_pass_tool); ?></code></label> <input name="tool_price[<?php echo esc_attr($zeam_pass_tool); ?>]" class="small-text zp-paid" aria-label="<?php echo esc_attr($zeam_pass_tool); ?> price (USD)" value="<?php echo esc_attr($view['toolPrices'][$zeam_pass_tool] ?? ''); ?>" placeholder="<?php echo esc_attr($view['price'] !== '' ? $view['price'] : '0.02'); ?>"> <label><input type="checkbox" name="tool_free[<?php echo esc_attr($zeam_pass_tool); ?>]" value="1" <?php checked(in_array($zeam_pass_tool, $view['free'], true)); ?>> Free</label><br>
 <?php endforeach; ?>
-</fieldset><p class="description">Price empty: the price per call. Free: no payment, no key.</p></td></tr>
+</fieldset><p class="description">Price empty: the price per call. Free: no payment, no key. <?php echo esc_html(zeam_pass_price_range()); ?></p></td></tr>
 <tr><th scope="row"><label for="zp-free-limit">Free calls an hour per address</label></th><td><input id="zp-free-limit" name="free_limit" type="number" min="1" step="1" class="small-text" value="<?php echo esc_attr($view['freeLimit']); ?>"><p class="description">Per free tool. Empty: no limit. Over it: 429.</p></td></tr>
-<tr class="zp-paid"><th scope="row"><label for="zp-time-block">Line time (USD)</label></th><td><input id="zp-time-block" name="time_block" class="small-text" value="<?php echo esc_attr($view['timeBlock']); ?>" placeholder="0.00025"> buys <input id="zp-time-block-ms" name="time_block_ms" type="number" min="1" max="3600000" step="1" class="small-text" aria-label="Milliseconds that price buys" value="<?php echo esc_attr($view['timeBlockMs']); ?>" placeholder="250"> ms<p class="description">Empty: off. Agents buy milliseconds with <code>buy_time</code> and call time tools on a line with no payment per call. Unburned time goes back with their refund. Time tools come from the <code>zeam_pass_tools</code> filter with <code>'meter' =&gt; 'time'</code>.</p></td></tr>
+<tr class="zp-paid"><th scope="row"><label for="zp-time-block">Line time (USD)</label></th><td><input id="zp-time-block" name="time_block" class="small-text" value="<?php echo esc_attr($view['timeBlock']); ?>" placeholder="0.00025"> buys <input id="zp-time-block-ms" name="time_block_ms" type="number" min="1" max="3600000" step="1" class="small-text" aria-label="Milliseconds that price buys" value="<?php echo esc_attr($view['timeBlockMs']); ?>" placeholder="250"> ms<p class="description">Empty: off. <?php echo esc_html(zeam_pass_price_range()); ?> Agents buy milliseconds with <code>buy_time</code> and call time tools on a line with no payment per call. Unburned time goes back with their refund. Time tools come from the <code>zeam_bridge_tools</code> filter with <code>'meter' =&gt; 'time'</code>.</p></td></tr>
 <tr class="zp-gated"><th scope="row"><label for="zp-admit">Admitted keys</label></th><td><textarea id="zp-admit" name="admit" rows="4" class="large-text code" placeholder="0x… one per line"><?php echo esc_textarea($view['admit']); ?></textarea><p class="description">One address per line. An agent signs each call with its key as a zero-value x402 payment. Nothing is paid. The key needs no funds. A key on this list can sign grants (below).</p></td></tr>
 <tr><th scope="row"><label for="zp-contact">Contact for access</label></th><td><input id="zp-contact" name="contact" class="regular-text" value="<?php echo esc_attr($view['contact']); ?>" placeholder="<?php echo esc_attr($view['home']); ?>"><p class="description">A web address or a mailto: address. Agents see it in every 402 and every refusal. Empty: your site's address. Your admin email is not shown.</p></td></tr>
 <tr class="zp-gate-only"><th scope="row"><label for="zp-onempty">When gate credit runs out</label></th><td><select id="zp-onempty" name="onEmpty">
@@ -61,16 +61,17 @@ $zeam_pass_modes = [
 <option value="allow" <?php selected($view['onEmpty'], 'allow'); ?>>Admit agents and warn me here</option>
 </select></td></tr>
 <tr><th scope="row">Free API</th><td><label><input type="checkbox" name="hold" value="1" <?php checked($view['hold']); ?>> Hold the full text back from the WordPress API and feeds</label><p class="description">Anonymous readers of <code>/wp-json/wp/v2/posts</code> and the RSS and Atom feeds get the excerpt and a link to the tools. Pages and logged-in editors get the full text.</p></td></tr>
+<tr><th scope="row">Directories</th><td><label><input type="checkbox" name="no_root_openapi" value="1" <?php checked($view['no_root_openapi']); ?>> Do not answer <code>/openapi.json</code> at the site root</label><p class="description">Directories of paid tools read <code>/openapi.json</code> at the root of a domain. Unchecked, the plugin answers it with your tools and prices when the site is at the root of its domain, permalinks are not Plain and no file of that name exists. The same document stays at <code>/wp-json/zeam-pass/openapi.json</code> either way.</p></td></tr>
 </table>
 
 <details<?php echo ($view['relay'] || $view['credits'] || $view['rpc']) ? ' open' : ''; ?>>
 <summary><strong>Advanced</strong></summary>
 <table class="form-table" role="presentation">
-<tr><th scope="row"><label for="zp-name">Name</label></th><td><input id="zp-name" name="name" class="regular-text" value="<?php echo esc_attr($view['name']); ?>" placeholder="<?php echo esc_attr($view['effectiveName']); ?>"><p class="description">Name and wallet set your split address. A change moves new earnings to a new split. Pay out first.</p></td></tr>
-<tr><th scope="row"><label for="zp-relay">Relay</label></th><td><input id="zp-relay" name="relay" class="regular-text code" value="<?php echo esc_attr($view['relay']); ?>" placeholder="<?php echo esc_attr(ZEAM_PASS_DEFAULT_RELAY); ?>"><p class="description">Sends the transactions this site signs and pays their gas when the 9.99% fee share covers it. It sends only what this site signs.</p></td></tr>
+<tr><th scope="row"><label for="zp-name">Name</label></th><td><input id="zp-name" name="name" class="regular-text" value="<?php echo esc_attr($view['name']); ?>" placeholder="<?php echo esc_attr($view['effectiveName']); ?>"><p class="description">Name and wallet set your split address and hold your gate credit. A change moves new earnings to a new split and leaves credit bought before it behind. Pay out first.</p></td></tr>
+<tr><th scope="row"><label for="zp-relay">Relay</label></th><td><input id="zp-relay" name="relay" class="regular-text code" value="<?php echo esc_attr($view['relay']); ?>" placeholder="<?php echo esc_attr(ZEAM_PASS_DEFAULT_RELAY); ?>"><p class="description">Sends the transactions this site signs, and agents' deposits and MPP charges. It pays the gas of every deposit, of a claim, payout or MPP charge when the 9.99% fee share covers it, and of a refund when the fee on what the channel spent covers the gas of its deposit, its refund and any calls not yet settled, and of every further deposit and every earlier refund ZEAM paid for on that channel, plus 15%.</p></td></tr>
 <tr><th scope="row"><label for="zp-credits">Credits</label></th><td><input id="zp-credits" name="credits" class="regular-text code" value="<?php echo esc_attr($view['credits']); ?>" placeholder="<?php echo esc_attr(ZEAM_PASS_DEFAULT_CREDITS); ?>"><p class="description">Where the gate buys checks.</p></td></tr>
 <tr><th scope="row"><label for="zp-rpc">Base RPC</label></th><td><input id="zp-rpc" name="rpc" class="regular-text code" value="<?php echo esc_attr($view['rpc']); ?>" placeholder="<?php echo esc_attr(ZEAM_PASS_DEFAULT_RPC); ?>"><p class="description">The default endpoint is rate-limited. For a site with traffic, set your own Base node or a provider.</p></td></tr>
-<tr><th scope="row">Constants</th><td><p class="description">Fee address <code><?php echo esc_html($view['feeRecipient']); ?></code><?php echo $view['feeOverridden'] ? ' (set by ZEAM_PASS_FEE_RECIPIENT)' : ''; ?>. Credit issuer <code><?php echo esc_html($view['creditIssuer']); ?></code><?php echo $view['issuerOverridden'] ? ' (set by ZEAM_PASS_CREDIT_ISSUER)' : ''; ?>. Overrides in wp-config.php are for development.</p></td></tr>
+<tr><th scope="row">Constants</th><td><p class="description">Fee address <code><?php echo esc_html($view['feeRecipient']); ?></code><?php echo $view['feeOverridden'] ? ' (set in wp-config.php)' : ''; ?>. Credit issuer <code><?php echo esc_html($view['creditIssuer']); ?></code><?php echo $view['issuerOverridden'] ? ' (set in wp-config.php)' : ''; ?>. Overrides in wp-config.php are for development.</p></td></tr>
 </table>
 </details>
 
@@ -97,7 +98,7 @@ $zeam_pass_modes = [
 <table class="form-table" role="presentation">
 <tr class="zp-paid"><th scope="row">Your split</th><td><code><?php echo esc_html($view['split'] ?: 'connect a wallet first'); ?></code><p class="description">Pays 90.01% to your wallet and 9.99% to ZEAM. It has no owner. Nobody can change it. Your first payout creates it.</p></td></tr>
 <tr class="zp-paid"><th scope="row">Settle key</th><td><code><?php echo esc_html($view['settleAddress'] ?: 'not generated'); ?></code><p class="description">Made by this site, encrypted in its database. It signs claims and refunds. It holds no money.</p></td></tr>
-<tr class="zp-gate-only"><th scope="row">Credit wallet</th><td><code><?php echo esc_html($view['creditAddress'] ?: 'made when you choose a gate'); ?></code> <span id="zp-credit-balance"></span><p class="description">Made by this site. Fund it with USDC on Base. It buys gate checks when the free ones run low.</p></td></tr>
+<tr class="zp-gate-only"><th scope="row">Credit wallet</th><td><code><?php echo esc_html($view['creditAddress'] ?: 'made the first time the plugin runs in gate or both mode'); ?></code> <span id="zp-credit-balance"></span><p class="description">Made by this site. Keep $1 USDC on Base in it; it needs no ETH. It buys gate checks 2,000 at a time for $1 once the month's free ones are used up, and again below 200 remaining.</p></td></tr>
 </table>
 
 <h2>Earnings and usage</h2>
@@ -106,7 +107,7 @@ $zeam_pass_modes = [
 <tr class="zp-paid"><th scope="row">Claimed, unpaid</th><td id="zp-claimed">…</td></tr>
 <tr class="zp-paid"><th scope="row">Last payout</th><td id="zp-last">…</td></tr>
 <tr class="zp-gate-only"><th scope="row">Gate this month</th><td id="zp-gate">…</td></tr>
-<tr><th scope="row">Background work</th><td><span id="zp-tick">…</span><p class="description">Every minute this site claims what agents paid, pays out when a payout covers its gas, and buys gate credit. WordPress runs it on a visit. Add a cron job that requests <code><?php echo esc_html($view['cron']); ?></code> every minute<?php echo $view['cronDisabled'] ? ' (DISABLE_WP_CRON is set: required)' : ' and set DISABLE_WP_CRON in wp-config.php'; ?>.</p></td></tr>
+<tr><th scope="row">Background work</th><td><span id="zp-tick">…</span><p class="description">Every minute this site claims what agents paid, pays out once ZEAM's 9.99% fee on a payout covers its gas, stamps withdrawing channels and buys gate credit. WordPress runs it on a visit. Add a cron job that requests <code><?php echo esc_html($view['cron']); ?></code> every minute<?php echo $view['cronDisabled'] ? ' (DISABLE_WP_CRON is set: required)' : ' and set DISABLE_WP_CRON in wp-config.php'; ?>.</p></td></tr>
 </table>
 <p>
 <button type="button" class="button" id="zp-refresh">Refresh</button>
@@ -235,7 +236,7 @@ $zeam_pass_modes = [
     } else if (b.paidBy === 'you' && b.transaction) {
       state.tx = b.transaction;
       text('zp-payout-note', b.note || '');
-      text('zp-payout-gas', 'Value $' + b.valueUSD + '. Gas about ' + (b.gasUSD == null ? 'unknown' : '$' + b.gasUSD) + ' in ETH on Base, from your wallet. Calls: ' + (b.calls || []).join(', ') + '.');
+      text('zp-payout-gas', 'Value $' + b.valueUSD + '. Gas about ' + (b.gasUSD == null ? 'unknown' : '$' + b.gasUSD) + ' in ETH on Base, from your own wallet. Calls: ' + (b.calls || []).join(', ') + '.');
       $('zp-send').hidden = false;
       say('Below break-even.');
     } else {

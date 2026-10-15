@@ -10,6 +10,7 @@ final class Admission
 {
     const NOTE = 'Sign this zero-value payment with your key. Nothing is paid. The key needs no funds and must be admitted here.';
     const SEEN_KEY = 'x402-seen';
+    const MAX_SAFE_INTEGER = 9007199254740991;
 
     private $payTo;
     private $store;
@@ -118,13 +119,16 @@ final class Admission
         if ($invalid !== null) {
             return self::refuse('invalid_payment', $invalid);
         }
-        $window = $t + $requirement->maxTimeoutSeconds * 1000;
+        $admitted = $this->grant($from, $grantHeaderValue, $toolName, $admitList, $t);
+        if (!$admitted['ok']) {
+            return $admitted;
+        }
         $validBeforeMs = Big::mul(Exact::bigint($auth->validBefore), 1000);
-        $until = Big::cmp($validBeforeMs, $window) < 0 ? (int) Big::strval($validBeforeMs) : $window;
+        $until = Big::cmp($validBeforeMs, self::MAX_SAFE_INTEGER) < 0 ? (int) Big::strval($validBeforeMs) : self::MAX_SAFE_INTEGER;
         if (!$this->claim($from, $nonce, $until, $t)) {
             return self::refuse('replayed', 'this authorization was already used');
         }
-        return $this->grant($from, $grantHeaderValue, $toolName, $admitList, $t);
+        return $admitted;
     }
 
     public function grant($from, $grantHeaderValue, $toolName, array $admitList, $t)

@@ -1,11 +1,12 @@
 import os
+import socket
 from socketserver import ThreadingMixIn
 from wsgiref.simple_server import WSGIRequestHandler, WSGIServer, make_server
 
-from zeam_pass import Pass
+from zeam_bridge import Bridge, setting
 
-agents = Pass(name=os.environ["PASS_NAME"], payout=os.environ["PASS_PAYOUT"], price=os.environ.get("PASS_PRICE", "0.001"),
-              site=os.environ.get("PASS_SITE"), state_dir=os.environ.get("PASS_STATE_DIR"), server_name="Py Acme")
+agents = Bridge(name=setting("BRIDGE_NAME"), payout=setting("BRIDGE_PAYOUT"), price=setting("BRIDGE_PRICE") or "0.001",
+              site=setting("BRIDGE_SITE"), state_dir=setting("BRIDGE_STATE_DIR"), server_name="Py Acme")
 
 
 @agents.tool(description="Multiplies two numbers.", input_schema={"type": "object", "properties": {"a": {"type": "number"}, "b": {"type": "number"}}, "required": ["a", "b"]})
@@ -36,6 +37,7 @@ class Quiet(WSGIRequestHandler):
 
 class Threaded(ThreadingMixIn, WSGIServer):
     daemon_threads = True
+    request_queue_size = socket.SOMAXCONN
 
 
 make_server("127.0.0.1", int(os.environ.get("PORT", "18630")), app, server_class=Threaded, handler_class=Quiet).serve_forever()

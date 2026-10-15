@@ -5,6 +5,7 @@ namespace ZeamPass\Settlement;
 final class Json
 {
     const FLAGS = JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE;
+    const WIRE = JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_LINE_TERMINATORS;
 
     public static function encode($value)
     {

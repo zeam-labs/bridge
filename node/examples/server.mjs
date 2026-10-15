@@ -1,7 +1,7 @@
 import http from 'node:http'
-import { pass } from '@zeam-labs/pass'
+import { bridge, setting } from '@zeambridge/bridge'
 
-const agents = pass({ name: process.env.PASS_NAME, payout: process.env.PASS_PAYOUT, price: process.env.PASS_PRICE, site: process.env.PASS_SITE, serverName: 'Acme' })
+const agents = bridge({ name: setting('BRIDGE_NAME'), payout: setting('BRIDGE_PAYOUT'), price: setting('BRIDGE_PRICE'), site: setting('BRIDGE_SITE'), serverName: 'Acme' })
 agents.tool({
   name: 'add', description: 'Adds two numbers.',
   inputSchema: { type: 'object', properties: { a: { type: 'number' }, b: { type: 'number' } }, required: ['a', 'b'] },

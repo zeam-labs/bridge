@@ -10,7 +10,6 @@ final class TimeMeter
 {
     const NONCE_SECS = 300;
     const KEEP_NONCES = 8;
-    const KEEP_LINES = 8;
     const DEFAULT_MS = 250;
 
     public $t;
@@ -79,17 +78,21 @@ final class TimeMeter
             return null;
         }
         if (!is_array($o)) {
-            throw new \InvalidArgumentException('pass: time is { usd: "0.00025", ms: 250 }: that many dollars buys that many milliseconds');
+            throw new \InvalidArgumentException('bridge: time is { usd: "0.00025", ms: 250 }: that many dollars buys that many milliseconds');
         }
         $micro = Pricing::microOf(self::first($o, ['usd', 'block']), 'time.usd');
         $given = self::first($o, ['ms', 'blockMs']);
         $ms = $given !== null ? self::whole($given) : self::DEFAULT_MS;
         $idleMs = array_key_exists('idleMs', $o) && $o['idleMs'] !== null ? self::whole($o['idleMs']) : 0;
+        $maxCalls = array_key_exists('maxCalls', $o) && $o['maxCalls'] !== null ? self::whole($o['maxCalls']) : Clock::MAX_LIVE_CALLS;
         if (!($ms !== null && $ms >= 1 && $ms <= 3600000)) {
-            throw new \InvalidArgumentException('pass: time.ms is 1 to 3600000');
+            throw new \InvalidArgumentException('bridge: time.ms is 1 to 3600000');
         }
         if (!($idleMs !== null && $idleMs >= 0 && $idleMs <= 3600000)) {
-            throw new \InvalidArgumentException('pass: time.idleMs is 0 to 3600000');
+            throw new \InvalidArgumentException('bridge: time.idleMs is 0 to 3600000');
+        }
+        if (!($maxCalls !== null && $maxCalls >= 1 && $maxCalls <= 1000)) {
+            throw new \InvalidArgumentException('bridge: time.maxCalls is 1 to 1000');
         }
         $maxMs = null;
         $capped = false;
@@ -104,9 +107,9 @@ final class TimeMeter
         $rateMicro = intdiv($micro, $g);
         $rateMs = intdiv($ms, $g);
         if ($capped && !($maxMs !== null && $maxMs >= $rateMs && $maxMs % $rateMs === 0)) {
-            throw new \InvalidArgumentException('pass: time.maxMs is a multiple of ' . $rateMs . ' ms, the smallest amount this price sells; leave it out for no maximum');
+            throw new \InvalidArgumentException('bridge: time.maxMs is a multiple of ' . $rateMs . ' ms, the smallest amount this price sells; leave it out for no maximum');
         }
-        return ['rateMicro' => $rateMicro, 'rateMs' => $rateMs, 'unitMs' => $ms, 'idleMs' => $idleMs, 'maxMs' => $maxMs];
+        return ['rateMicro' => $rateMicro, 'rateMs' => $rateMs, 'unitMs' => $ms, 'idleMs' => $idleMs, 'maxMs' => $maxMs, 'maxCalls' => $maxCalls];
     }
 
     public static function rate(array $t)
@@ -133,7 +136,7 @@ final class TimeMeter
         $idle = $t['idleMs'] > 0 ? ' and ' . $t['idleMs'] . ' ms after each' : '';
         $step = $t['rateMs'] > 1 ? ' in steps of ' . $t['rateMs'] . ' ms' : '';
         $most = empty($t['maxMs']) ? '' : ' (up to ' . $t['maxMs'] . ' ms a purchase)';
-        return 'Line time: ' . self::rate($t) . '. buy_time {ms}' . $step . $most . '; buying again adds time; the time is credited to the paying channel once the payment settles. Open a line: POST ' . $base . '/line {"op":"open","channelId"}, sign the message it returns with the payer key, POST {"op":"prove","channelId","nonce","signature"}. Send the credential as x-line (MCP: _meta["zeam-pass/line"]). Time burns while a call runs on the line' . $idle . '; a call stops when the time runs out. {"op":"off"}: no new calls on the line; a running call burns to its end. Unburned time comes back with a refund.';
+        return 'Line time: ' . self::rate($t) . '. buy_time {"ms": N}' . $step . $most . '; buying again adds time; the time is credited to the paying channel once the payment settles. Open a line: POST ' . $base . '/line {"op":"open","channelId":"0x…"}, sign the message it returns with the payer key, POST {"op":"prove","channelId":"0x…","nonce":"…","signature":"0x…"}. Send the credential as x-line (MCP: _meta["zeam-pass/line"]). Time burns while a call runs on the line' . $idle . '; a call stops when the time runs out. {"op":"off"}: no new calls on the line; a running call burns to its end. Unburned time comes back with a refund.';
     }
 
     public static function hash($credential)
@@ -146,9 +149,23 @@ final class TimeMeter
         return (int) call_user_func($this->now);
     }
 
+    public static function callMsOf(array $t, $priceMicro)
+    {
+        return min(Pricing::mulDiv($priceMicro, $t['rateMs'], $t['rateMicro']), 9007199254740991);
+    }
+
+    public static function micro(array $t, $ms)
+    {
+        $micro = intdiv($ms, $t['rateMs']) * $t['rateMicro'];
+        if (!is_int($micro) || $micro > Pricing::MAX_MICRO) {
+            throw new \InvalidArgumentException('bridge: that much line time costs more than $' . Pricing::MAX_USD . '; above that a number stops counting micro-USD exactly. Buy less at a time');
+        }
+        return $micro;
+    }
+
     public function callMs($priceMicro)
     {
-        return intdiv((int) $priceMicro * $this->t['rateMs'], $this->t['rateMicro']);
+        return self::callMsOf($this->t, $priceMicro);
     }
 
     public function change($channelId, callable $fn)
@@ -225,10 +242,20 @@ final class TimeMeter
     {
         $now = $this->nowMs();
         $idle = $this->t['idleMs'];
-        $b = $this->change($channelId, function (array &$rec) use ($id, $now, $idle) {
-            return Clock::begin($rec, $id, $now, $idle);
+        $cap = array_key_exists('maxCalls', $this->t) ? $this->t['maxCalls'] : Clock::MAX_LIVE_CALLS;
+        $b = $this->change($channelId, function (array &$rec) use ($id, $now, $idle, $cap) {
+            return Clock::begin($rec, $id, $now, $idle, $cap);
         });
         return $b['ok'] ? $b + ['started' => $this->nowMs()] : $b;
+    }
+
+    public function renew($channelId, $id, $started = null, $last = null)
+    {
+        $now = $this->nowMs();
+        $idle = $this->t['idleMs'];
+        return $this->change($channelId, function (array &$rec) use ($id, $now, $idle, $started, $last) {
+            return Clock::renew($rec, $id, $now, $idle, $started, $last);
+        });
     }
 
     public function end($channelId, $id, $started = null, $stopped = null)
@@ -309,6 +336,12 @@ final class TimeMeter
 
     public function prove(array $channel, $nonce, $signature)
     {
+        if ($nonce === null || $nonce === '') {
+            return ['ok' => false, 'status' => 400, 'code' => 'bad_request', 'why' => 'nonce is missing: send the nonce the open answer gave, with your signature of its message'];
+        }
+        if (!is_string($signature) || $signature === '') {
+            return ['ok' => false, 'status' => 400, 'code' => 'bad_request', 'why' => 'signature is missing or is not a string: sign the message the open answer gave and send it with the nonce'];
+        }
         $channelId = strtolower((string) $channel['channelId']);
         $now = $this->nowMs();
         $n = is_scalar($nonce) ? (string) $nonce : '';
@@ -318,7 +351,7 @@ final class TimeMeter
             return $until !== null && $until > $now;
         });
         if (!$live) {
-            return ['ok' => false, 'status' => 400, 'code' => 'no_challenge', 'why' => 'no live challenge with that nonce. Send {"op":"open"} again.'];
+            return ['ok' => false, 'status' => 400, 'code' => 'no_challenge', 'why' => 'no live challenge with that nonce. Send {"op":"open","channelId":"0x…"} again and sign what it returns.'];
         }
         try {
             $who = strtolower(Secp256k1::recoverPersonal(Clock::lineMessage($channelId, $n), is_scalar($signature) ? (string) $signature : ''));
@@ -335,18 +368,12 @@ final class TimeMeter
         $this->lines->update($h, function () use ($channelId, $now) {
             return ['channelId' => $channelId, 'at' => $now];
         });
-        $dropped = [];
         $idle = $this->t['idleMs'];
-        $msRemaining = $this->change($channelId, function (array &$rec) use ($h, $now, $idle, &$dropped) {
-            $all = array_merge($rec['lines'], [$h]);
-            $dropped = array_slice($all, 0, max(0, count($all) - self::KEEP_LINES));
-            $rec['lines'] = array_values(array_slice($all, -self::KEEP_LINES));
+        $msRemaining = $this->change($channelId, function (array &$rec) use ($h, $now, $idle) {
+            $rec['lines'] = array_merge($rec['lines'], [$h]);
             Clock::switch($rec, true, $now, $idle);
             return Clock::left($rec, $now, $idle);
         });
-        foreach ($dropped as $x) {
-            $this->drop($x);
-        }
         return ['ok' => true, 'credential' => $credential, 'channelId' => $channelId, 'msRemaining' => $msRemaining];
     }
 

@@ -8,6 +8,7 @@ final class Clock
 
     const HOLD_MS = 2000;
     const KEEP_DONE = 512;
+    const MAX_LIVE_CALLS = 1000;
 
     public static function fresh($channelId)
     {
@@ -137,7 +138,7 @@ final class Clock
         return $rec;
     }
 
-    public static function begin(array &$rec, $id, $now, $idleMs = 0)
+    public static function begin(array &$rec, $id, $now, $idleMs = 0, $cap = null)
     {
         self::settle($rec, $now, $idleMs);
         if (!$rec['on']) {
@@ -146,6 +147,9 @@ final class Clock
         $left = self::left($rec, $now, $idleMs);
         if ($left <= 0) {
             return ['ok' => false, 'code' => 'out_of_time'];
+        }
+        if ($cap !== null && count($rec['calls']) >= $cap) {
+            return ['ok' => false, 'code' => 'too_many_calls'];
         }
         self::active($rec, $now, $idleMs);
         $deadline = $now + $left;
@@ -170,6 +174,33 @@ final class Clock
         self::active($rec, $ran, $idleMs);
         self::settle($rec, $now, $idleMs);
         return ['elapsedMs' => $c === null ? 0 : $ran - $from, 'over' => $c === null || $ran > $c['deadline']];
+    }
+
+    public static function renew(array &$rec, $id, $now, $idleMs = 0, $start = null, $last = null)
+    {
+        $rec['done'] = isset($rec['done']) ? $rec['done'] : [];
+        $id = (string) $id;
+        $c = isset($rec['calls'][$id]) ? $rec['calls'][$id] : null;
+        $due = $c === null ? $last : $c['deadline'];
+        if ($c !== null) {
+            $rec['done'][] = [$start !== null && $start > $c['start'] ? $start : $c['start'], min($now, $c['deadline'])];
+        }
+        unset($rec['calls'][$id]);
+        $covers = $now;
+        if ($due !== null && $due < $now && $rec['since'] !== null) {
+            $covers = min($now, $due + max(0, self::left($rec, $now, $idleMs)));
+        }
+        if ($due !== null && $covers > $due) {
+            $rec['done'][] = [$due, $covers];
+        }
+        self::settle($rec, $now, $idleMs);
+        $left = self::left($rec, $now, $idleMs);
+        if ($covers < $now || $left <= 0) {
+            return ['ok' => false, 'code' => 'out_of_time'];
+        }
+        $deadline = $now + $left;
+        $rec['calls'][$id] = ['start' => $now, 'deadline' => $deadline];
+        return ['ok' => true, 'deadline' => $deadline];
     }
 
     public static function buy(array &$rec, $ms, $key, $now, $idleMs = 0)
@@ -203,7 +234,7 @@ final class Clock
     public static function unburnedMicro(array $rec, $now, $idleMs, $rateMicro, $rateMs)
     {
         $left = self::remaining($rec, $now, $idleMs);
-        return intdiv($left * (int) $rateMicro + (int) $rateMs - 1, (int) $rateMs);
+        return \ZeamPass\Pricing::mulDiv($left, $rateMicro, $rateMs, (int) $rateMs - 1);
     }
 
     public static function forget(array &$rec, $now, $idleMs = 0)

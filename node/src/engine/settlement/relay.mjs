@@ -1,7 +1,8 @@
 import { Address, Hex, big, isNumeric } from '../core/hex.mjs'
-import { BatchSettlement } from '../core/batch.mjs'
 import { Splits } from '../core/pass.mjs'
 import { Json } from './json.mjs'
+import { ESCROWS } from './x402.mjs'
+import { mulDiv } from '../pricing.mjs'
 
 export function httpTransport(fetchFn = globalThis.fetch) {
   return async (method, url, body, timeout) => {
@@ -20,7 +21,7 @@ export class Relay {
     this.timeout = Number(timeout)
   }
 
-  async send(calls, split) {
+  async send(calls, split, outcome = false) {
     const body = { calls: calls.map((c) => ({ to: Address.checksum(c.to), data: Hex.lower(c.data) })), split }
     let r
     try {
@@ -42,15 +43,35 @@ export class Relay {
       if (one && Hex.isHex(one.hash, 32)) return { hash: one.hash.toLowerCase() }
       const out = { error: one && one.error !== undefined && one.error !== null ? String(one.error) : fallback }
       if (one && typeof one.code === 'string') out.code = one.code
+      if (outcome && one && one.reverted === true) out.reverted = true
+      else if (outcome && status >= 400 && status < 500) out.refused = true
+      else if (outcome && status === 0) out.unheard = true
       if (one && isNumeric(one.gasMicroUSD) && Number(one.gasMicroUSD) > 0) out.gasMicroUSD = Math.ceil(Number(one.gasMicroUSD))
       return out
     })
   }
 
-  async quote(call, payment = true) {
+  async sendQuote(calls, split) {
     let r
     try {
-      r = await this.transport('POST', `${this.url}/quote`, Json.encode({ call: { to: Address.checksum(call.to), data: Hex.lower(call.data) }, payment: !!payment }), 10)
+      r = await this.transport('POST', `${this.url}/quote`, Json.encode({ calls: calls.map((c) => ({ to: Address.checksum(c.to), data: Hex.lower(c.data) })), split }), 10)
+    } catch {
+      return null
+    }
+    if (!r || Number(r.status) !== 200) return null
+    let d = null
+    try {
+      d = typeof r.body === 'string' ? JSON.parse(r.body) : null
+    } catch {
+      return null
+    }
+    return d !== null && typeof d === 'object' && d.op === 'send_quote' && typeof d.covered === 'boolean' ? d : null
+  }
+
+  async quote(call, payment = true, split = null) {
+    let r
+    try {
+      r = await this.transport('POST', `${this.url}/quote`, Json.encode({ call: { to: Address.checksum(call.to), data: Hex.lower(call.data) }, payment: !!payment, ...(split === null ? {} : { split }) }), 10)
     } catch {
       return null
     }
@@ -81,7 +102,30 @@ export class Relay {
     if (Number(d.quoteMicroUSD) < Number(d.costMicroUSD)) return null
     const units = Math.trunc(Number(d.gasUnits))
     const margin = Number(d.marginPercent)
-    return { microUSD: Math.ceil(Number(d.quoteMicroUSD)), costMicroUSD: Math.ceil(Number(d.costMicroUSD)), gasUnits: units, gasUnitsWithMargin: Math.ceil(units * (1 + margin / 100)), gasPriceWei: String(d.gasPriceWei), ethUSD: Number(d.ethUSD), marginPercent: margin, l1FeeWei: String(d.l1FeeWei), quotedBy: 'relay' }
+    return { microUSD: Math.ceil(Number(d.quoteMicroUSD)), costMicroUSD: Math.ceil(Number(d.costMicroUSD)), gasUnits: units, gasUnitsWithMargin: Math.ceil(units * (1 + margin / 100)), gasPriceWei: String(d.gasPriceWei), ethUSD: Number(d.ethUSD), marginPercent: margin, l1FeeWei: String(d.l1FeeWei), quotedBy: 'relay', ...(typeof d.covered === 'boolean' ? { covered: d.covered } : {}) }
+  }
+
+  async paid(channelId) {
+    let r
+    try {
+      r = await this.transport('GET', `${this.url}/paid?channel=${String(channelId).toLowerCase()}`, null, 5)
+    } catch {
+      return null
+    }
+    return Relay.paidOf(r, channelId)
+  }
+
+  static paidOf(r, channelId) {
+    if (!r || Number(r.status) !== 200) return null
+    let d
+    try {
+      d = JSON.parse(String(r.body))
+    } catch {
+      return null
+    }
+    if (d === null || typeof d !== 'object' || Array.isArray(d) || d.op !== 'gas_paid') return null
+    if (typeof d.channelId !== 'string' || d.channelId.toLowerCase() !== String(channelId).toLowerCase()) return null
+    return Number.isSafeInteger(d.gasUnits) && d.gasUnits >= 0 ? d.gasUnits : null
   }
 
   async health() {
@@ -187,16 +231,20 @@ export class GasQuote {
     return this.priced(units, wei, eth)
   }
 
-  async refund(claimRides, fresh = true) {
+  async refund(claimRides, fresh = true, alreadyPaid = 0) {
     const g = this.cfg.gas
     const wei = await this.weiPerGas(fresh)
     const eth = wei === null ? null : await this.ethUSD()
     if (wei === null || eth === null || big(wei) <= 0n) return null
-    return { cover: this.priced(g.deposit + g.refund + (claimRides ? g.refundClaim : 0), wei, eth), pay: this.priced(g.refund + (claimRides ? g.paidClaim : 0) + g.gasPayment, wei, eth, g.paidL1 + (claimRides ? g.paidClaimL1 : 0)) }
+    return { cover: this.priced(g.deposit + g.refund + (claimRides ? g.refundClaim : 0) + alreadyPaid, wei, eth), pay: this.priced(g.refund + (claimRides ? g.paidClaim : 0) + g.gasPayment, wei, eth, g.paidL1 + (claimRides ? g.paidClaimL1 : 0)) }
   }
 
   async relayQuote(call) {
     return this.relay && call ? this.relay.quote(call, true) : null
+  }
+
+  async relayPaid(channelId) {
+    return this.relay ? this.relay.paid(channelId) : null
   }
 
   async relayRefundQuote() {
@@ -212,7 +260,7 @@ export class GasQuote {
   }
 
   static feeMicroUSD(earnedMicroUSD, feeShare) {
-    return Math.floor((Math.trunc(Number(earnedMicroUSD)) * Math.round(feeShare * 1e6)) / 1e6)
+    return mulDiv(Math.trunc(Number(earnedMicroUSD)), Math.round(feeShare * 1e6), 1000000)
   }
 
   async atMargin(usd, units) {
@@ -232,16 +280,17 @@ export class GasQuote {
     const home = back === null ? 0 : Math.ceil(back.pay.microUSD * this.cfg.floorMargin)
     const floor = Math.max(Math.ceil((gas * this.cfg.floorMargin) / this.cfg.feeShare), home)
     this.cfg.cache.set(key, floor, GasQuote.FLOOR_TTL)
-    return price >= floor ? price : Math.max(floor, price + home)
+    return Math.max(price, floor)
   }
 }
 
 export class Payout {
   static DUST = 100
 
-  constructor(cfg, chain) {
+  constructor(cfg, chain, escrow = ESCROWS.default) {
     this.cfg = cfg
     this.chain = chain
+    this.escrow = escrow
   }
 
   async calls(token, claimsRiding = false) {
@@ -249,11 +298,11 @@ export class Payout {
     const min = big(String(this.cfg.payoutMinUnits))
     const calls = []
     let incoming = 0n
-    const r = await this.chain.receivers(receiver, token)
+    const r = await this.chain.receivers(receiver, token, this.escrow)
     const owed = big(r.totalClaimed) - big(r.totalSettled)
     if (claimsRiding || owed >= min) {
       incoming = claimsRiding && owed < min ? min + 1n : owed
-      calls.push({ what: claimsRiding ? 'settle what the claims riding with it bring' : `settle ${incoming}`, to: BatchSettlement.ESCROW, data: BatchSettlement.encodeSettle(receiver, token) })
+      calls.push({ what: claimsRiding ? 'settle what the claims riding with it bring' : `settle ${incoming}`, ...this.escrow.collectCall(receiver, token) })
     }
     const deployed = await this.chain.hasCode(receiver)
     const held = big(deployed ? await this.chain.splitBalance(receiver, token) : await this.chain.balanceOf(token, receiver))

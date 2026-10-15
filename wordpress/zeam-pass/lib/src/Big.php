@@ -144,6 +144,11 @@ final class Big
         return self::gmp() ? gmp_mul($a, $b) : self::norm(bcmul(self::bc($a), self::bc($b), 0));
     }
 
+    public static function div($a, $b)
+    {
+        return self::gmp() ? gmp_div_q($a, $b) : self::norm(bcdiv(self::bc($a), self::bc($b), 0));
+    }
+
     public static function pow($a, $exp)
     {
         return self::gmp() ? gmp_pow($a, $exp) : self::norm(bcpow(self::bc($a), (string) (int) $exp, 0));

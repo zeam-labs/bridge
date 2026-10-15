@@ -1,25 +1,9 @@
-import { Address, Hex, InvalidArgument, big, empty, has, isObject } from '../core/hex.mjs'
-import { BatchSettlement } from '../core/batch.mjs'
-import { Secp256k1, TypedData } from '../core/secp256k1.mjs'
+import { Address, InvalidArgument, big, empty, has, isObject } from '../core/hex.mjs'
+import { Erc6492 } from '../core/evm.mjs'
+import { Secp256k1 } from '../core/secp256k1.mjs'
 import { Chain, RpcError } from './chain.mjs'
-import { Config } from './config.mjs'
-import { Reason } from './json.mjs'
-
-const ZERO = '0x0000000000000000000000000000000000000000'
-const PERMIT2_WITNESS_TYPES = {
-  PermitWitnessTransferFrom: [
-    { name: 'permitted', type: 'TokenPermissions' },
-    { name: 'spender', type: 'address' },
-    { name: 'nonce', type: 'uint256' },
-    { name: 'deadline', type: 'uint256' },
-    { name: 'witness', type: 'DepositWitness' },
-  ],
-  TokenPermissions: [
-    { name: 'token', type: 'address' },
-    { name: 'amount', type: 'uint256' },
-  ],
-  DepositWitness: [{ name: 'channelId', type: 'bytes32' }],
-}
+import { uint } from './escrow.mjs'
+import { ESCROWS, PERMIT2_WITNESS_TYPES, ZERO } from './x402.mjs'
 
 const arr = (v) => v !== null && typeof v === 'object'
 
@@ -27,9 +11,10 @@ export class Verify {
   static ZERO = ZERO
   static PERMIT2_WITNESS_TYPES = PERMIT2_WITNESS_TYPES
 
-  constructor(cfg, chain) {
+  constructor(cfg, chain, escrow = ESCROWS.default) {
     this.cfg = cfg
     this.chain = chain
+    this.escrow = escrow
   }
 
   static isVoucherFields(v) {
@@ -58,44 +43,48 @@ export class Verify {
     return typeof id === 'string' && /^0x[0-9a-fA-F]{64}$/.test(id)
   }
 
-  static strictConfig(config) {
-    if (!arr(config) || Array.isArray(config)) throw new InvalidArgument('channelConfig is not an object')
-    for (const k of ['payer', 'payerAuthorizer', 'receiver', 'receiverAuthorizer', 'token']) {
-      const a = config[k] ?? null
-      if (!Address.isAddress(a)) throw new InvalidArgument(`channelConfig.${k} is not an address`)
-      const body = a.slice(2)
-      if (body !== body.toLowerCase() && body !== body.toUpperCase() && !Address.isChecksummed(a)) throw new InvalidArgument(`channelConfig.${k} has a bad checksum`)
-    }
-    if (!Number.isInteger(config.withdrawDelay)) throw new InvalidArgument('channelConfig.withdrawDelay is not a number')
-    if (!Hex.isHex(config.salt, 32)) throw new InvalidArgument('channelConfig.salt is not 32 bytes')
-    return config
+  static strictConfig(config, escrow = ESCROWS.default) {
+    return escrow.strictConfig(config)
   }
 
-  static computeChannelId(config, network) {
-    return BatchSettlement.channelId(Verify.strictConfig(config), Verify.chainIdOf(network))
+  static computeChannelId(config, network, escrow = ESCROWS.default) {
+    return escrow.channelId(escrow.strictConfig(config), Verify.chainIdOf(network))
   }
 
-  static bindingError(config, channelId, network) {
-    if (!Verify.isCanonicalChannelId(channelId)) return Reason.CHANNEL_ID_INVALID
-    if (Verify.computeChannelId(config, network).toLowerCase() !== channelId.toLowerCase()) return Reason.CHANNEL_ID_MISMATCH
+  static bindingError(config, channelId, network, escrow = ESCROWS.default) {
+    if (!Verify.isCanonicalChannelId(channelId)) return escrow.reasons.CHANNEL_ID_INVALID
+    if (Verify.computeChannelId(config, network, escrow).toLowerCase() !== channelId.toLowerCase()) return escrow.reasons.CHANNEL_ID_MISMATCH
     return null
   }
 
   static uint(value) {
-    if (typeof value === 'number' && Number.isInteger(value) && value >= 0) return BigInt(value)
-    if (typeof value === 'bigint' && value >= 0n) return value
-    if (typeof value === 'string') {
-      const v = value.trim()
-      if (/^[0-9]+$/.test(v)) return BigInt(v)
-      if (/^0x[0-9a-fA-F]+$/.test(v)) return BigInt(v)
+    return uint(value)
+  }
+
+  static amount(value) {
+    if (typeof value === 'number') {
+      if (Number.isSafeInteger(value) && value >= 0) return BigInt(value)
+      throw new InvalidArgument(`not an unsigned integer a JSON number can carry exactly: ${String(value)}`)
     }
-    throw new InvalidArgument('not an unsigned integer: ' + (['string', 'number', 'boolean', 'bigint'].includes(typeof value) ? String(value) : typeof value))
+    if (typeof value === 'string') return uint(value)
+    throw new InvalidArgument(`not an unsigned integer: ${['boolean', 'bigint'].includes(typeof value) ? String(value) : value === null ? 'null' : typeof value}`)
+  }
+
+  static AMOUNT_FORM = 'voucher.maxClaimableAmount is not an unsigned integer: send it as a base-10 or 0x string, or as a whole JSON number up to 9007199254740991'
+
+  static normalize(raw) {
+    if (!isObject(raw?.voucher) || !has(raw.voucher, 'maxClaimableAmount')) return true
+    try {
+      raw.voucher.maxClaimableAmount = Verify.amount(raw.voucher.maxClaimableAmount).toString()
+      return true
+    } catch {
+      return false
+    }
   }
 
   configError(config, channelId, req) {
-    Verify.strictConfig(config)
-    const extra = isObject(req.extra) ? req.extra : {}
-    return BatchSettlement.validateChannelConfig(config, channelId, Verify.chainIdOf(req.network), req.payTo, extra.receiverAuthorizer ?? null, req.asset, has(extra, 'withdrawDelay') ? Math.trunc(Number(extra.withdrawDelay)) : null)
+    this.escrow.strictConfig(config)
+    return this.escrow.termsError(config, channelId, Verify.chainIdOf(req.network), req)
   }
 
   async hashSignatureOk(address, digest, signature) {
@@ -114,7 +103,7 @@ export class Verify {
 
   static async recovers(address, digest, signature) {
     try {
-      return Address.equals(await Secp256k1.recoverHash(digest, signature), address)
+      return Secp256k1.isCanonical(signature) && Address.equals(await Secp256k1.recoverHash(digest, signature), address)
     } catch {
       return false
     }
@@ -123,12 +112,12 @@ export class Verify {
   async voucherSignatureOk(config, channelId, max, signature, chainId) {
     let digest
     try {
-      digest = BatchSettlement.voucherDigest(channelId, Verify.uint(max).toString(), chainId)
+      digest = this.escrow.voucherDigest(channelId, Verify.uint(max).toString(), chainId)
     } catch {
       return false
     }
-    if (config.payerAuthorizer !== ZERO) return Verify.recovers(config.payerAuthorizer, digest, signature)
-    return this.hashSignatureOk(config.payer, digest, signature)
+    const signer = this.escrow.signer(config)
+    return signer.wallet ? this.hashSignatureOk(signer.address, digest, signature) : Verify.recovers(signer.address, digest, signature)
   }
 
   static invalid(reason, payer = null, message = null) {
@@ -141,36 +130,36 @@ export class Verify {
   async facilitator(payload, req) {
     const raw = payload.payload ?? null
     const accepted = arr(payload.accepted) ? payload.accepted : {}
-    if ((accepted.scheme ?? null) !== Config.SCHEME || req.scheme !== Config.SCHEME) return Verify.invalid(Reason.INVALID_SCHEME)
-    if ((accepted.network ?? null) !== req.network) return Verify.invalid(Reason.NETWORK_MISMATCH)
+    if ((accepted.scheme ?? null) !== this.escrow.scheme || req.scheme !== this.escrow.scheme) return Verify.invalid(this.escrow.reasons.INVALID_SCHEME)
+    if ((accepted.network ?? null) !== req.network) return Verify.invalid(this.escrow.reasons.NETWORK_MISMATCH)
     try {
       if (Verify.isDepositPayload(raw)) return await this.deposit(raw, req)
       if (Verify.isVoucherPayload(raw)) return await this.voucher(raw, req)
     } catch (e) {
-      if (e instanceof RpcError) return Verify.invalid(Reason.RPC_READ_FAILED, null, e.message)
+      if (e instanceof RpcError) return Verify.invalid(this.escrow.reasons.RPC_READ_FAILED, null, e.message)
       return Verify.invalid(e?.message ?? String(e))
     }
-    return Verify.invalid(Reason.PAYLOAD_TYPE)
+    return Verify.invalid(this.escrow.reasons.PAYLOAD_TYPE)
   }
 
   async voucher(raw, req) {
     const config = raw.channelConfig
-    const payer = config.payer
+    const payer = this.escrow.payer(config)
     const channelId = raw.voucher.channelId
     const err = this.configError(config, channelId, req)
     if (err) return Verify.invalid(err, payer)
-    if (!(await this.voucherSignatureOk(config, channelId, raw.voucher.maxClaimableAmount, raw.voucher.signature, Verify.chainIdOf(req.network)))) return Verify.invalid(Reason.VOUCHER_SIGNATURE, payer)
+    if (!(await this.voucherSignatureOk(config, channelId, raw.voucher.maxClaimableAmount, raw.voucher.signature, Verify.chainIdOf(req.network)))) return Verify.invalid(this.escrow.reasons.VOUCHER_SIGNATURE, payer)
     let state
     try {
-      state = await this.chain.state(channelId)
+      state = await this.chain.state(channelId, this.escrow)
     } catch (e) {
-      return Verify.invalid(Reason.RPC_READ_FAILED, payer, e?.message ?? String(e))
+      return Verify.invalid(this.escrow.reasons.RPC_READ_FAILED, payer, e?.message ?? String(e))
     }
     const balance = big(state.balance)
-    if (balance === 0n) return Verify.invalid(Reason.CHANNEL_NOT_FOUND, payer)
+    if (balance === 0n) return Verify.invalid(this.escrow.reasons.CHANNEL_NOT_FOUND, payer)
     const max = Verify.uint(raw.voucher.maxClaimableAmount)
-    if (max > balance) return Verify.invalid(Reason.EXCEEDS_BALANCE, payer)
-    if (max <= big(state.totalClaimed)) return Verify.invalid(Reason.BELOW_CLAIMED, payer)
+    if (max > balance) return Verify.invalid(this.escrow.reasons.EXCEEDS_BALANCE, payer)
+    if (max <= big(state.totalClaimed)) return Verify.invalid(this.escrow.reasons.BELOW_CLAIMED, payer)
     return { isValid: true, payer, extra: { channelId, balance: state.balance, totalClaimed: state.totalClaimed, withdrawRequestedAt: state.withdrawRequestedAt, refundNonce: state.refundNonce } }
   }
 
@@ -181,11 +170,11 @@ export class Verify {
 
   async deposit(raw, req) {
     const config = raw.channelConfig
-    const payer = config.payer
+    const payer = this.escrow.payer(config)
     const err = this.configError(config, raw.voucher.channelId, req)
     if (err) return Verify.invalid(err, payer)
     const method = Verify.transferMethod(raw, req)
-    if (method === 'permit2' && empty(raw.deposit.authorization.permit2Authorization)) return Verify.invalid(Reason.PAYLOAD_TYPE, payer)
+    if (method === 'permit2' && empty(raw.deposit.authorization.permit2Authorization)) return Verify.invalid(this.escrow.reasons.PAYLOAD_TYPE, payer)
     const fail = method === 'permit2' ? await this.permit2(raw, req) : await this.erc3009(raw, req)
     if (fail) return fail
     const shared = await this.sharedDepositState(raw, req)
@@ -193,9 +182,10 @@ export class Verify {
     const execution = await this.execution(raw, req)
     if (has(execution, 'isValid')) return execution
     try {
-      await this.chain.call(BatchSettlement.ESCROW, BatchSettlement.encodeDeposit(config, Verify.uint(raw.deposit.amount).toString(), execution.collector, execution.collectorData))
+      const call = this.escrow.depositCall(config, Verify.uint(raw.deposit.amount).toString(), execution)
+      await this.chain.call(call.to, call.data)
     } catch (e) {
-      return Verify.invalid(Reason.DEPOSIT_SIMULATION_FAILED, payer, e?.message ?? String(e))
+      return Verify.invalid(this.escrow.reasons.DEPOSIT_SIMULATION_FAILED, payer, e?.message ?? String(e))
     }
     return {
       isValid: true,
@@ -207,27 +197,25 @@ export class Verify {
 
   async execution(raw, req) {
     if (Verify.transferMethod(raw, req) === 'eip3009') {
-      return { collector: BatchSettlement.ERC3009_DEPOSIT_COLLECTOR, collectorData: BatchSettlement.erc3009DepositCollectorData(raw.deposit.authorization.erc3009Authorization) }
+      return this.escrow.funding('eip3009', raw.deposit.authorization.erc3009Authorization)
     }
     const fail = await this.permit2Allowance(raw, req)
     if (fail) return fail
-    const auth = raw.deposit.authorization.permit2Authorization
-    const inner = BatchSettlement.parseErc6492Signature(auth.signature)
-    return { collector: BatchSettlement.PERMIT2_DEPOSIT_COLLECTOR, collectorData: BatchSettlement.permit2CollectorData(Verify.uint(auth.nonce).toString(), Verify.uint(auth.deadline).toString(), inner.signature, '0x') }
+    return this.escrow.funding('permit2', raw.deposit.authorization.permit2Authorization)
   }
 
   async erc3009(raw, req) {
-    const payer = raw.channelConfig.payer
+    const payer = this.escrow.payer(raw.channelConfig)
     const auth = raw.deposit.authorization.erc3009Authorization ?? null
-    if (!arr(auth) || empty(auth)) return Verify.invalid(Reason.ERC3009_AUTHORIZATION_REQUIRED, payer)
+    if (!arr(auth) || empty(auth)) return Verify.invalid(this.escrow.reasons.ERC3009_AUTHORIZATION_REQUIRED, payer)
     const extra = req.extra ?? {}
-    if (empty(extra.name) || empty(extra.version)) return Verify.invalid(Reason.MISSING_EIP712_DOMAIN, payer)
+    if (empty(extra.name) || empty(extra.version)) return Verify.invalid(this.escrow.reasons.MISSING_EIP712_DOMAIN, payer)
     const validAfter = Verify.uint(auth.validAfter)
     const validBefore = Verify.uint(auth.validBefore)
     const now = Math.floor(this.cfg.nowMs() / 1000)
-    if (validBefore < BigInt(now + 6)) return Verify.invalid(Reason.VALID_BEFORE, payer)
-    if (validAfter > BigInt(now)) return Verify.invalid(Reason.VALID_AFTER, payer)
-    const parsed = BatchSettlement.parseErc6492Signature(auth.signature)
+    if (validBefore < BigInt(now + 6)) return Verify.invalid(this.escrow.reasons.VALID_BEFORE, payer)
+    if (validAfter > BigInt(now)) return Verify.invalid(this.escrow.reasons.VALID_AFTER, payer)
+    const parsed = Erc6492.parse(auth.signature)
     if (parsed.address !== null && parsed.data !== null && !Address.equals(parsed.address, ZERO)) {
       let deployed
       try {
@@ -235,83 +223,76 @@ export class Verify {
       } catch {
         deployed = false
       }
-      if (!deployed) return Verify.invalid(Reason.FACTORY_NOT_ALLOWED, payer)
+      if (!deployed) return Verify.invalid(this.escrow.reasons.FACTORY_NOT_ALLOWED, payer)
     }
     const chainId = Verify.chainIdOf(req.network)
-    const nonce = BatchSettlement.erc3009DepositNonce(raw.voucher.channelId, auth.salt)
-    const digest = BatchSettlement.receiveAuthorizationDigest(
-      BatchSettlement.tokenDomain(req.asset, extra.name, extra.version, chainId),
-      BatchSettlement.receiveAuthorization(payer, Verify.uint(raw.deposit.amount).toString(), validAfter.toString(), validBefore.toString(), nonce),
-    )
-    if (!(await this.hashSignatureOk(payer, digest, parsed.signature))) return Verify.invalid(Reason.RECEIVE_AUTHORIZATION_SIGNATURE, payer)
+    const digest = this.escrow.fundingDigest('eip3009', { channelId: raw.voucher.channelId, salt: auth.salt, token: req.asset, name: extra.name, version: extra.version, chainId, payer, amount: raw.deposit.amount, validAfter: validAfter.toString(), validBefore: validBefore.toString() })
+    if (!(await this.hashSignatureOk(payer, digest, parsed.signature))) return Verify.invalid(this.escrow.reasons.RECEIVE_AUTHORIZATION_SIGNATURE, payer)
     return null
   }
 
   async permit2(raw, req) {
-    const payer = raw.channelConfig.payer
+    const payer = this.escrow.payer(raw.channelConfig)
     const auth = raw.deposit.authorization.permit2Authorization
-    if (!arr(auth)) return Verify.invalid(Reason.PERMIT2_AUTHORIZATION_REQUIRED, payer)
-    if (!Address.equals(Address.checksum(auth.from), payer)) return Verify.invalid(Reason.PERMIT2_INVALID_SIGNATURE, payer)
-    if (!Address.equals(Address.checksum(auth.spender), BatchSettlement.PERMIT2_DEPOSIT_COLLECTOR)) return Verify.invalid(Reason.PERMIT2_INVALID_SPENDER, payer)
-    if (!Address.equals(Address.checksum(auth.permitted.token), req.asset)) return Verify.invalid(Reason.TOKEN_MISMATCH, payer)
-    if (Verify.uint(auth.permitted.amount) !== Verify.uint(raw.deposit.amount)) return Verify.invalid(Reason.PERMIT2_AMOUNT_MISMATCH, payer)
-    if (auth.witness?.channelId === undefined || auth.witness.channelId !== raw.voucher.channelId) return Verify.invalid(Reason.CHANNEL_ID_MISMATCH, payer)
+    if (!arr(auth)) return Verify.invalid(this.escrow.reasons.PERMIT2_AUTHORIZATION_REQUIRED, payer)
+    if (!Address.equals(Address.checksum(auth.from), payer)) return Verify.invalid(this.escrow.reasons.PERMIT2_INVALID_SIGNATURE, payer)
+    if (!Address.equals(Address.checksum(auth.spender), this.escrow.transferTarget('permit2'))) return Verify.invalid(this.escrow.reasons.PERMIT2_INVALID_SPENDER, payer)
+    if (!Address.equals(Address.checksum(auth.permitted.token), req.asset)) return Verify.invalid(this.escrow.reasons.TOKEN_MISMATCH, payer)
+    if (Verify.uint(auth.permitted.amount) !== Verify.uint(raw.deposit.amount)) return Verify.invalid(this.escrow.reasons.PERMIT2_AMOUNT_MISMATCH, payer)
+    if (auth.witness?.channelId === undefined || auth.witness.channelId !== raw.voucher.channelId) return Verify.invalid(this.escrow.reasons.CHANNEL_ID_MISMATCH, payer)
     const now = Math.floor(this.cfg.nowMs() / 1000)
-    if (Verify.uint(auth.deadline) < BigInt(now + 6)) return Verify.invalid(Reason.PERMIT2_DEADLINE_EXPIRED, payer)
+    if (Verify.uint(auth.deadline) < BigInt(now + 6)) return Verify.invalid(this.escrow.reasons.PERMIT2_DEADLINE_EXPIRED, payer)
     let digest
     try {
-      digest = TypedData.hash(
-        { name: 'Permit2', chainId: Verify.chainIdOf(req.network), verifyingContract: Chain.PERMIT2 },
-        PERMIT2_WITNESS_TYPES,
-        'PermitWitnessTransferFrom',
-        {
-          permitted: { token: Address.checksum(auth.permitted.token), amount: Verify.uint(auth.permitted.amount).toString() },
-          spender: Address.checksum(auth.spender),
-          nonce: Verify.uint(auth.nonce).toString(),
-          deadline: Verify.uint(auth.deadline).toString(),
-          witness: { channelId: auth.witness.channelId },
-        },
-      )
+      digest = this.escrow.fundingDigest('permit2', {
+        chainId: Verify.chainIdOf(req.network),
+        token: Address.checksum(auth.permitted.token),
+        amount: Verify.uint(auth.permitted.amount).toString(),
+        spender: Address.checksum(auth.spender),
+        nonce: Verify.uint(auth.nonce).toString(),
+        deadline: Verify.uint(auth.deadline).toString(),
+        channelId: auth.witness.channelId,
+      })
     } catch {
-      return Verify.invalid(Reason.PERMIT2_INVALID_SIGNATURE, payer)
+      return Verify.invalid(this.escrow.reasons.PERMIT2_INVALID_SIGNATURE, payer)
     }
-    if (!(await this.hashSignatureOk(Address.checksum(auth.from), digest, auth.signature))) return Verify.invalid(Reason.PERMIT2_INVALID_SIGNATURE, payer)
+    if (!(await this.hashSignatureOk(Address.checksum(auth.from), digest, auth.signature))) return Verify.invalid(this.escrow.reasons.PERMIT2_INVALID_SIGNATURE, payer)
     return this.permit2Allowance(raw, req)
   }
 
   async permit2Allowance(raw, req) {
-    const payer = raw.channelConfig.payer
+    const payer = this.escrow.payer(raw.channelConfig)
     let allowance
     try {
       allowance = await this.chain.allowance(req.asset, payer, Chain.PERMIT2)
     } catch {
-      return Verify.invalid(Reason.PERMIT2_ALLOWANCE_REQUIRED, payer)
+      return Verify.invalid(this.escrow.reasons.PERMIT2_ALLOWANCE_REQUIRED, payer)
     }
-    if (big(allowance) < Verify.uint(raw.deposit.amount)) return Verify.invalid(Reason.PERMIT2_ALLOWANCE_REQUIRED, payer)
+    if (big(allowance) < Verify.uint(raw.deposit.amount)) return Verify.invalid(this.escrow.reasons.PERMIT2_ALLOWANCE_REQUIRED, payer)
     return null
   }
 
   async sharedDepositState(raw, req) {
     const config = raw.channelConfig
-    const payer = config.payer
+    const payer = this.escrow.payer(config)
     const channelId = raw.voucher.channelId
     const err = this.configError(config, channelId, req)
     if (err) return { ok: false, response: Verify.invalid(err, payer) }
-    if (!(await this.voucherSignatureOk(config, channelId, raw.voucher.maxClaimableAmount, raw.voucher.signature, Verify.chainIdOf(req.network)))) return { ok: false, response: Verify.invalid(Reason.VOUCHER_SIGNATURE, payer) }
+    if (!(await this.voucherSignatureOk(config, channelId, raw.voucher.maxClaimableAmount, raw.voucher.signature, Verify.chainIdOf(req.network)))) return { ok: false, response: Verify.invalid(this.escrow.reasons.VOUCHER_SIGNATURE, payer) }
     let ch, payerBalance, wd, nonce
     try {
-      ch = await this.chain.channel(channelId)
+      ch = await this.chain.channel(channelId, this.escrow)
       payerBalance = await this.chain.balanceOf(req.asset, payer)
-      wd = await this.chain.pendingWithdrawal(channelId)
-      nonce = await this.chain.refundNonce(channelId)
+      wd = await this.chain.pendingWithdrawal(channelId, this.escrow)
+      nonce = await this.chain.refundNonce(channelId, this.escrow)
     } catch (e) {
-      return { ok: false, response: Verify.invalid(Reason.RPC_READ_FAILED, payer, e?.message ?? String(e)) }
+      return { ok: false, response: Verify.invalid(this.escrow.reasons.RPC_READ_FAILED, payer, e?.message ?? String(e)) }
     }
     const amount = Verify.uint(raw.deposit.amount)
-    if (big(payerBalance) < amount) return { ok: false, response: Verify.invalid(Reason.INSUFFICIENT_BALANCE, payer) }
+    if (big(payerBalance) < amount) return { ok: false, response: Verify.invalid(this.escrow.reasons.INSUFFICIENT_BALANCE, payer) }
     const max = Verify.uint(raw.voucher.maxClaimableAmount)
-    if (max > big(ch.balance) + amount) return { ok: false, response: Verify.invalid(Reason.EXCEEDS_BALANCE, payer) }
-    if (max <= big(ch.totalClaimed)) return { ok: false, response: Verify.invalid(Reason.BELOW_CLAIMED, payer) }
+    if (max > big(ch.balance) + amount) return { ok: false, response: Verify.invalid(this.escrow.reasons.EXCEEDS_BALANCE, payer) }
+    if (max <= big(ch.totalClaimed)) return { ok: false, response: Verify.invalid(this.escrow.reasons.BELOW_CLAIMED, payer) }
     return { ok: true, balance: ch.balance, totalClaimed: ch.totalClaimed, withdrawRequestedAt: wd.initiatedAt, refundNonce: nonce }
   }
 
@@ -319,17 +300,18 @@ export class Verify {
     const ttl = Math.min(300000, Math.max(30000, Math.floor((Math.max(0, this.cfg.withdrawDelay) * 1000) / 3)))
     if (channel === null || channel.onchainSyncedAt === undefined || channel.onchainSyncedAt === null || now - Math.trunc(Number(channel.onchainSyncedAt)) > ttl) return null
     const config = raw.channelConfig
-    if (config.payerAuthorizer === ZERO) return null
-    const payer = config.payer
+    const signer = this.escrow.signer(config)
+    if (signer.wallet) return null
+    const payer = this.escrow.payer(config)
     const channelId = raw.voucher.channelId
     const err = this.configError(config, channelId, req)
     if (err) return Verify.invalid(err, payer)
-    if (Verify.computeChannelId(config, req.network).toLowerCase() !== String(channel.channelId).toLowerCase()) return Verify.invalid(Reason.CHANNEL_ID_MISMATCH, payer)
-    const digest = BatchSettlement.voucherDigest(channelId, Verify.uint(raw.voucher.maxClaimableAmount).toString(), Verify.chainIdOf(req.network))
-    if (!(await Verify.recovers(Address.checksum(config.payerAuthorizer), digest, raw.voucher.signature))) return Verify.invalid(Reason.VOUCHER_SIGNATURE, payer)
+    if (Verify.computeChannelId(config, req.network, this.escrow).toLowerCase() !== String(channel.channelId).toLowerCase()) return Verify.invalid(this.escrow.reasons.CHANNEL_ID_MISMATCH, payer)
+    const digest = this.escrow.voucherDigest(channelId, Verify.uint(raw.voucher.maxClaimableAmount).toString(), Verify.chainIdOf(req.network))
+    if (!(await Verify.recovers(Address.checksum(signer.address), digest, raw.voucher.signature))) return Verify.invalid(this.escrow.reasons.VOUCHER_SIGNATURE, payer)
     const max = Verify.uint(raw.voucher.maxClaimableAmount)
-    if (max > big(String(channel.balance))) return Verify.invalid(Reason.EXCEEDS_BALANCE, payer)
-    if (max <= big(String(channel.totalClaimed))) return Verify.invalid(Reason.BELOW_CLAIMED, payer)
+    if (max > big(String(channel.balance))) return null
+    if (max <= big(String(channel.totalClaimed))) return Verify.invalid(this.escrow.reasons.BELOW_CLAIMED, payer)
     return { isValid: true, payer, extra: { channelId, balance: String(channel.balance), totalClaimed: String(channel.totalClaimed), withdrawRequestedAt: Math.trunc(Number(channel.withdrawRequestedAt)), refundNonce: String(channel.refundNonce) } }
   }
 }

@@ -59,6 +59,26 @@ final class Relay
         return $out;
     }
 
+    public function sendQuote(array $calls, array $split)
+    {
+        $body = ['calls' => array_map(function ($c) {
+            return ['to' => Address::checksum($c['to']), 'data' => Hex::lower($c['data'])];
+        }, $calls), 'split' => $split];
+        try {
+            $r = call_user_func($this->transport, 'POST', $this->url . '/quote', Json::encode($body), 10);
+        } catch (\Throwable $e) {
+            return null;
+        }
+        if (!is_array($r) || (int) (isset($r['status']) ? $r['status'] : 0) !== 200 || !isset($r['body']) || !is_string($r['body'])) {
+            return null;
+        }
+        $d = json_decode($r['body'], true);
+        if (is_array($d) && isset($d['op'], $d['covered']) && $d['op'] === 'send_quote' && is_bool($d['covered'])) {
+            return $d;
+        }
+        return null;
+    }
+
     public function quote(array $call, $payment = true)
     {
         try {
@@ -77,6 +97,35 @@ final class Relay
             return null;
         }
         return self::quoted($r);
+    }
+
+    public function paid($channelId)
+    {
+        try {
+            $r = call_user_func($this->transport, 'GET', $this->url . '/paid?channel=' . strtolower((string) $channelId), null, 5);
+        } catch (\Throwable $e) {
+            return null;
+        }
+        return self::paidOf($r, $channelId);
+    }
+
+    public static function paidOf($r, $channelId)
+    {
+        if (!is_array($r) || !isset($r['status']) || (int) $r['status'] !== 200) {
+            return null;
+        }
+        $d = json_decode((string) (isset($r['body']) ? $r['body'] : ''), true);
+        if (!is_array($d) || !isset($d['op']) || $d['op'] !== 'gas_paid') {
+            return null;
+        }
+        if (!isset($d['channelId']) || !is_string($d['channelId']) || strtolower($d['channelId']) !== strtolower((string) $channelId)) {
+            return null;
+        }
+        $units = isset($d['gasUnits']) ? $d['gasUnits'] : null;
+        if (!(is_int($units) || (is_float($units) && is_finite($units) && floor($units) === $units))) {
+            return null;
+        }
+        return $units >= 0 && $units <= 9007199254740991 ? (int) $units : null;
     }
 
     private static function quoted($r)

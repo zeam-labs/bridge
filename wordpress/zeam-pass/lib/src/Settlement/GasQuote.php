@@ -140,14 +140,14 @@ final class GasQuote
         return $at === null ? null : $this->priced($units, $at[0], $at[1]);
     }
 
-    public function refund($claimRides, $fresh = true)
+    public function refund($claimRides, $fresh = true, $alreadyPaid = 0)
     {
         $g = $this->cfg->gas;
         $at = $this->snapshot($fresh);
         if ($at === null) {
             return null;
         }
-        $cover = $g['deposit'] + $g['refund'] + ($claimRides ? $g['refundClaim'] : 0);
+        $cover = $g['deposit'] + $g['refund'] + ($claimRides ? $g['refundClaim'] : 0) + $alreadyPaid;
         $pay = $g['refund'] + ($claimRides ? $g['paidClaim'] : 0) + $g['gasPayment'];
         $l1 = $g['paidL1'] + ($claimRides ? $g['paidClaimL1'] : 0);
         return ['cover' => $this->priced($cover, $at[0], $at[1]), 'pay' => $this->priced($pay, $at[0], $at[1], $l1)];
@@ -156,6 +156,11 @@ final class GasQuote
     public function relayQuote($call)
     {
         return $this->relay && $call ? $this->relay->quote($call, true) : null;
+    }
+
+    public function relayPaid($channelId)
+    {
+        return $this->relay ? $this->relay->paid($channelId) : null;
     }
 
     public function relayRefundQuote()
@@ -186,7 +191,7 @@ final class GasQuote
 
     public static function feeMicroUSD($earnedMicroUSD, $feeShare)
     {
-        return intdiv((int) $earnedMicroUSD * (int) round($feeShare * 1e6), 1000000);
+        return \ZeamPass\Pricing::mulDiv($earnedMicroUSD, (int) round($feeShare * 1e6), 1000000);
     }
 
     public function atMargin($usd, $units)
@@ -209,6 +214,6 @@ final class GasQuote
         $home = $back === null ? 0 : (int) ceil($back['pay']['microUSD'] * $this->cfg->floorMargin);
         $floor = max((int) ceil(($gas * $this->cfg->floorMargin) / $this->cfg->feeShare), $home);
         $this->cfg->cache->set($key, $floor, self::FLOOR_TTL);
-        return $price >= $floor ? $price : max($floor, $price + $home);
+        return max($price, $floor);
     }
 }

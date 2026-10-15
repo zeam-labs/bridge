@@ -113,6 +113,12 @@ final class Secp256k1
         return Big::cmp(Big::init($p['s'], 16), Big::init(self::HALF_N, 16)) <= 0;
     }
 
+    public static function isCanonical($signature)
+    {
+        $bin = Hex::toBin($signature);
+        return strlen($bin) === 65 && in_array(ord($bin[64]), [27, 28], true) && self::isLowS($signature);
+    }
+
     public static function recoverHash($hash, $signature)
     {
         $digest = Hex::toBin($hash);
@@ -159,6 +165,9 @@ final class Secp256k1
 
     public static function recoverPersonal($message, $signature)
     {
+        if (!self::isLowS($signature)) {
+            throw new \InvalidArgumentException('signature s is above half the curve order');
+        }
         return self::recoverHash(self::hashMessage($message), $signature);
     }
 

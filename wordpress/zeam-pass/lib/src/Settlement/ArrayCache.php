@@ -34,4 +34,13 @@ final class ArrayCache implements Cache
     {
         $this->items[$key] = [$value, $this->now() + 1000 * (float) $ttlSeconds];
     }
+
+    public function add($key, $value, $ttlSeconds)
+    {
+        if ($this->get($key)) {
+            return false;
+        }
+        $this->set($key, $value, $ttlSeconds);
+        return true;
+    }
 }

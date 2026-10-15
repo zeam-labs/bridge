@@ -2,10 +2,11 @@ import { existsSync, readFileSync, readdirSync } from 'node:fs'
 import { join, resolve } from 'node:path'
 import { Abi } from './core/abi.mjs'
 import { Address, big } from './core/hex.mjs'
-import { BatchSettlement, Erc20 } from './core/batch.mjs'
+import { Erc20 } from './core/batch.mjs'
 import { writeAtomic, withLock } from './files.mjs'
 import { loadKeys } from './keys.mjs'
-import { ChannelFileStore, GateFileStore, StateFile } from './stores.mjs'
+import { setting } from './env.mjs'
+import { ChannelFileStore, GateFileStore, MppHeldFiles, SentFileStore, StateFile } from './stores.mjs'
 import { Admission, Credits, Exact, Meter, gateHttp } from './gate/index.mjs'
 import { Chain } from './settlement/chain.mjs'
 import { Channels } from './settlement/channels.mjs'
@@ -14,6 +15,10 @@ import { Json } from './settlement/json.mjs'
 import { Claims, Refunds, Withdrawals } from './settlement/periodic.mjs'
 import { GasQuote, Payout, Relay, httpTransport } from './settlement/relay.mjs'
 import { Server } from './settlement/server.mjs'
+import { ESCROWS, X402BatchSettlement } from './settlement/x402.mjs'
+import { Escrows } from './settlement/escrow.mjs'
+import { sessionEscrow } from './settlement/session.mjs'
+import { Sessions } from './settlement/sessions.mjs'
 import { charge as chargeFor, microOf } from './pricing.mjs'
 import { TimeMeter, timeOptions } from './meter.mjs'
 
@@ -26,6 +31,12 @@ export const DEFAULTS = {
   multicall3: '0xcA11bde05977b3631167028862bE2a173976CA11',
   tickSeconds: 60,
 }
+export const CONTRACTS = Object.freeze({
+  escrow: ESCROWS.default.contracts.escrow,
+  collectors: ESCROWS.default.contracts.collectors,
+  permit2: Chain.PERMIT2,
+})
+export const feeRecipient = () => setting('BRIDGE_FEE_RECIPIENT') ?? DEFAULTS.feeRecipient
 const MODES = ['paywall', 'gate', 'both']
 const GATE_HOW = 'Sign the zero-amount requirement with any x402 client and your own key. Nothing is paid. The key must be admitted here, or send an x-grant from an admitted key.'
 const ADMISSION = 'Only admitted keys pay here, or keys with an x-grant from an admitted key.'
@@ -34,7 +45,7 @@ const BAD_GRANT_HOW = 'Send a new x-grant: signed by an admitted key, delegate =
 const CONTACT = /^(?:https?:\/\/[^\s/?#]+\S*|mailto:[^\s@]+@[^\s@]+)$/i
 export const refusedHow = (contact = null) => `Ask this seller to admit your key${contact ? ` (${contact})` : ''}, or send an x-grant signed by an admitted key. ZEAM Pass agent guide, section 3.`
 export const GRANTED_BY = 'X-Pass-Granted-By'
-const TUNABLE = ['withdrawDelay', 'maxTimeoutSeconds', 'depositFloorMicroUSD', 'wethUSD', 'gasPriceWei', 'feeShare', 'gasBuffer', 'floorMargin', 'idleClaimSecs', 'maxClaimsPerBatch', 'payoutMinUnits', 'refundWindowSecs', 'receiptTimeoutSecs', 'receiptPollMs', 'stateCatchUpMs', 'drainTries', 'drainWaitMs', 'repairEveryMs', 'gas', 'assets']
+const TUNABLE = ['withdrawDelay', 'maxTimeoutSeconds', 'depositFloorMicroUSD', 'wethUSD', 'gasPriceWei', 'feeShare', 'gasBuffer', 'floorMargin', 'idleClaimSecs', 'maxClaimsPerBatch', 'payoutMinUnits', 'refundWindowSecs', 'receiptTimeoutSecs', 'receiptPollMs', 'stateCatchUpMs', 'drainTries', 'drainWaitMs', 'repairEveryMs', 'refundJudgeWaitMs', 'gas', 'assets']
 const message = (e) => String(e?.message ?? e)
 const cut = (s, n) => String(s).slice(0, n)
 
@@ -45,32 +56,38 @@ export function priceMicroUSD(price) {
 
 export function loadConfig(options = {}) {
   let file = {}
-  const from = options.config ?? (options.name === undefined && existsSync(resolve('pass.json')) ? 'pass.json' : null)
+  const from = options.config ?? (options.name === undefined ? ['bridge.json', 'pass.json'].find((f) => existsSync(resolve(f))) ?? null : null)
   if (typeof from === 'string') file = JSON.parse(readFileSync(resolve(from), 'utf8'))
   else if (from && typeof from === 'object') file = from
   const o = { ...file, ...Object.fromEntries(Object.entries(options).filter(([, v]) => v !== undefined)) }
-  const env = process.env
   const name = String(o.name ?? '')
-  if (!/^[a-z][a-z0-9-]{1,31}$/.test(name)) throw new TypeError('pass: name is 2 to 32 of a-z, 0-9 and -, starting with a letter')
+  if (!/^[a-z][a-z0-9-]{1,31}$/.test(name)) throw new TypeError('bridge: name is 2 to 32 of a-z, 0-9 and -, starting with a letter')
   const mode = o.mode ?? 'paywall'
-  if (!MODES.includes(mode)) throw new TypeError('pass: mode is "paywall", "gate" or "both"')
-  if (!Address.isAddress(o.payout)) throw new TypeError('pass: payout is the wallet address earnings go to')
-  const feeRecipient = o.feeRecipient ?? env.PASS_FEE_RECIPIENT ?? DEFAULTS.feeRecipient
+  if (!MODES.includes(mode)) throw new TypeError('bridge: mode is "paywall", "gate" or "both"')
+  if (!Address.isAddress(o.payout)) throw new TypeError('bridge: payout is the wallet address earnings go to')
+  const feeTo = o.feeRecipient ?? feeRecipient()
   const payoutIsFeeRecipient = o.payoutIsFeeRecipient === true
-  if (Address.isAddress(feeRecipient) && Address.equals(o.payout, feeRecipient) !== payoutIsFeeRecipient) throw new TypeError(payoutIsFeeRecipient ? 'pass: payoutIsFeeRecipient needs payout to be the fee recipient' : 'pass: payout is the fee recipient; set payoutIsFeeRecipient: true to pay it 100%')
+  if (Address.isAddress(feeTo) && Address.equals(o.payout, feeTo) !== payoutIsFeeRecipient) throw new TypeError(payoutIsFeeRecipient ? 'bridge: payoutIsFeeRecipient needs payout to be the fee recipient' : 'bridge: payout is the fee recipient; set payoutIsFeeRecipient: true to pay it 100%')
   const micro = o.priceMicroUSD !== undefined ? Math.trunc(Number(o.priceMicroUSD)) : priceMicroUSD(o.price)
   const prices = typeof o.prices === 'function' || (o.prices !== null && typeof o.prices === 'object' && !Array.isArray(o.prices)) ? o.prices : null
-  if (mode !== 'gate' && !(micro >= 1) && prices === null) throw new TypeError('pass: a paywall needs a price per call, like price: "0.02", or prices per tool')
+  if (mode !== 'gate' && !(micro >= 1) && prices === null) throw new TypeError('bridge: a paywall needs a price per call, like price: "0.02", or prices per tool')
   const free = [...new Set((Array.isArray(o.free) ? o.free : []).filter((t) => typeof t === 'string'))]
   const perHour = o.freeLimit === undefined || o.freeLimit === null ? null : Math.trunc(Number(typeof o.freeLimit === 'object' ? o.freeLimit.perHour : o.freeLimit))
-  if (perHour !== null && !(perHour >= 1)) throw new TypeError('pass: freeLimit is free calls an hour per address, 1 or more')
+  if (perHour !== null && !(perHour >= 1)) throw new TypeError('bridge: freeLimit is free calls an hour per address, 1 or more')
   const time = timeOptions(o.time)
-  if (time && mode === 'gate') throw new TypeError('pass: time metering needs mode paywall or both')
+  if (time && mode === 'gate') throw new TypeError('bridge: time metering needs mode paywall or both')
   const contact = typeof o.contact === 'string' ? o.contact.trim() : o.contact === undefined || o.contact === null ? '' : null
-  if (contact === null || (contact !== '' && !CONTACT.test(contact))) throw new TypeError('pass: contact is an http(s) URL or a mailto: address')
+  if (contact === null || (contact !== '' && !CONTACT.test(contact))) throw new TypeError('bridge: contact is an http(s) URL or a mailto: address')
   const admit = [...new Set((Array.isArray(o.admit) ? o.admit : []).filter((a) => Address.isAddress(a)).map((a) => a.toLowerCase()))]
   const url = (v, d) => (typeof v === 'string' && /^https?:\/\//i.test(v.trim()) ? v.trim().replace(/\/+$/, '') : d)
+  let sessions = null
+  if (o.sessions !== undefined && o.sessions !== null && o.sessions !== false) {
+    if (typeof o.sessions !== 'object' || !Address.isAddress(o.sessions.escrow) || !Address.isAddress(o.sessions.factory)) throw new TypeError('bridge: sessions is { escrow, factory }: the addresses of the session escrow and of its payee factory')
+    if (mode === 'gate') throw new TypeError('bridge: sessions need mode paywall or both')
+    sessions = { escrow: Address.checksum(o.sessions.escrow), factory: Address.checksum(o.sessions.factory), gas: o.sessions.gas !== null && typeof o.sessions.gas === 'object' ? { ...o.sessions.gas } : null }
+  }
   return {
+    sessions,
     name,
     site: typeof o.site === 'string' && o.site !== '' ? o.site.replace(/\/+$/, '') : null,
     mode,
@@ -86,18 +103,19 @@ export function loadConfig(options = {}) {
     relay: url(o.relay, DEFAULTS.relay),
     credits: url(o.credits, DEFAULTS.credits),
     rpc: o.rpc !== null && typeof o.rpc === 'object' ? o.rpc : url(o.rpc, DEFAULTS.rpc),
-    stateDir: resolve(o.stateDir ?? env.PASS_STATE_DIR ?? '.pass'),
-    feeRecipient,
+    stateDir: resolve(o.stateDir ?? setting('BRIDGE_STATE_DIR') ?? '.pass'),
+    feeRecipient: feeTo,
     payoutIsFeeRecipient,
-    creditIssuer: o.creditIssuer ?? env.PASS_CREDIT_ISSUER ?? DEFAULTS.creditIssuer,
+    creditIssuer: o.creditIssuer ?? setting('BRIDGE_CREDIT_ISSUER') ?? DEFAULTS.creditIssuer,
     refundUrl: typeof o.refundUrl === 'string' ? o.refundUrl : null,
     tick: o.tick === false || o.tick === 0 ? 0 : Number(o.tick ?? DEFAULTS.tickSeconds),
     keys: o.keys && typeof o.keys === 'object' ? o.keys : {},
-    keySecret: o.keySecret ?? env.PASS_KEY_SECRET,
+    keySecret: o.keySecret ?? setting('BRIDGE_KEY_SECRET'),
     stores: o.stores && typeof o.stores === 'object' ? o.stores : {},
     fetch: typeof o.fetch === 'function' ? o.fetch : typeof o.fetchImpl === 'function' ? o.fetchImpl : globalThis.fetch,
     timeouts: { rpc: 10000, relay: 120000, credits: 20000, ...(o.timeouts ?? {}) },
     clock: typeof o.clock === 'function' ? o.clock : null,
+    onError: typeof o.onError === 'function' ? o.onError : null,
     sleep: typeof o.sleep === 'function' ? o.sleep : null,
     tuning: Object.fromEntries(TUNABLE.filter((k) => o[k] !== undefined || o.tuning?.[k] !== undefined).map((k) => [k, o.tuning?.[k] ?? o[k]])),
   }
@@ -140,7 +158,22 @@ export function payerOf(payload) {
   const auth = typeof cfg.payerAuthorizer === 'string' ? cfg.payerAuthorizer : ''
   if (/^0x[0-9a-fA-F]{40}$/.test(auth) && !/^0x0{40}$/.test(auth)) return auth.toLowerCase()
   const payer = typeof cfg.payer === 'string' ? cfg.payer : ''
-  return /^0x[0-9a-fA-F]{40}$/.test(payer) ? payer.toLowerCase() : null
+  if (/^0x[0-9a-fA-F]{40}$/.test(payer)) return payer.toLowerCase()
+  const from = payload?.payload?.authorization?.from
+  return typeof from === 'string' && /^0x[0-9a-fA-F]{40}$/.test(from) ? from.toLowerCase() : null
+}
+
+function sentStore(dir, report) {
+  try {
+    return new SentFileStore(dir)
+  } catch (e) {
+    if (report !== null) {
+      try {
+        report(new Error(`the records of sent session authorizations cannot be kept in ${dir}, and are held in memory until this process stops: ${e?.message ?? e}`), { at: 'session-sent', file: dir })
+      } catch {}
+    }
+    return null
+  }
 }
 
 export function createEngine(options) {
@@ -156,6 +189,7 @@ export function createEngine(options) {
   const chain = new Chain(c.rpc, { timeout: c.timeouts.rpc / 1000, fetchFn: c.fetch })
   const relay = new Relay(c.relay, httpTransport(c.fetch), c.timeouts.relay / 1000)
   const state = (name) => new StateFile(c.stateDir, name)
+  let escrows = ESCROWS
   let cfg = null
   let store = null
   let server = null
@@ -178,7 +212,10 @@ export function createEngine(options) {
     })
     store = c.stores.channels ?? new ChannelFileStore(join(c.stateDir, 'channels'))
     if (c.time) Object.defineProperty(cfg, 'meter', { value: new TimeMeter(join(c.stateDir, 'meter'), c.time, { now }), enumerable: false })
-    server = new Server(cfg, store, chain, relay)
+    if (c.sessions !== null) escrows = new Escrows([X402BatchSettlement, sessionEscrow({ address: c.sessions.escrow, factory: c.sessions.factory, signer: cfg.receiverAuthorizer, split: cfg.receiver, chainId: cfg.chainId, gas: c.sessions.gas })])
+    server = new Server(cfg, store, chain, relay, escrows)
+    server.mppHeld = c.stores.mppHeld ?? new MppHeldFiles(join(c.stateDir, 'mpp-held'))
+    if (c.sessions !== null) server.sessions = new Sessions(server, escrows.list[1], { sent: c.stores.sent ?? sentStore(join(c.stateDir, 'session-sent'), c.onError), report: c.onError })
   }
   let gate = null
   if (gated) {
@@ -215,9 +252,13 @@ export function createEngine(options) {
     return creditRun
   }
 
-  async function check({ tool, resource, payment, grant, refundUrl = null, price = null, listing = {}, extensions = null }) {
+  async function check({ tool, resource, payment, grant, credential = '', refundUrl = null, price = null, listing = {}, extensions = null, shared = null, paymentOnly = false }) {
     const res = { url: String(resource ?? ''), description: typeof tool?.description === 'string' ? tool.description : '', mimeType: 'application/json' }
     const toolName = tool?.name ?? ''
+    const badGrant = async (why) => {
+      const q = await server.paymentRequired(res, extensions, refundUrl, { admission: ADMISSION, ...reach, ...listing, error: 'bad_grant' }, price)
+      return refusal(402, { ...q.body, message: why, how: BAD_GRANT_HOW }, q.headers)
+    }
     try {
       if (c.mode === 'gate') {
         if (!payment) {
@@ -236,8 +277,35 @@ export function createEngine(options) {
         if (m.unpaid) await state('unpaid.json').set({ at: new Date(now()).toISOString() })
         return { ok: true, ticket: { kind: 'gate', headers: a.root !== a.signer ? { [GRANTED_BY]: a.root } : {} } }
       }
+      if (!payment && credential && server.sessions !== null && Server.mppOffered(price) && Sessions.peek(credential) !== null) {
+        const held = await server.sessions.hold(credential, res, price?.micro ?? null, { paymentOnly: Sessions.paymentOnly(credential, paymentOnly === true), admit: c.mode === 'both' ? (who) => admitsPayer(who, grant, toolName) : null })
+        if (held.unadmitted) {
+          if (held.unadmitted.code === 'bad_grant') return await badGrant(held.unadmitted.why)
+          return refusal(403, { error: 'refused', message: held.unadmitted.why, how: REFUSED_HOW, ...reach })
+        }
+        if (!held.ok) return refusal(held.status, held.body, held.headers)
+        if (held.managed) return refusal(held.managed.status, held.managed.body, held.managed.headers)
+        const grantedBy = held.admitted && held.admitted.root !== held.hold.payer ? held.admitted.root : null
+        return { ok: true, ticket: { kind: 'paid', hold: held.hold, grantedBy, price } }
+      }
+      if (!payment && credential && Server.mppOffered(price)) {
+        const held = await server.mppHold(credential, res, price?.micro ?? null)
+        if (!held.ok) return refusal(held.status, held.body, held.headers)
+        let grantedBy = null
+        if (c.mode === 'both') {
+          const who = held.hold.verified.payer.toLowerCase()
+          const a = await admitsPayer(who, grant, toolName)
+          if (!a.ok) {
+            await server.mppRelease(held.hold)
+            if (a.code === 'bad_grant') return await badGrant(a.why)
+            return refusal(403, { error: 'refused', message: a.why, how: REFUSED_HOW, ...reach })
+          }
+          if (a.root !== who) grantedBy = a.root
+        }
+        return { ok: true, ticket: { kind: 'paid', hold: held.hold, grantedBy, price } }
+      }
       if (!payment) {
-        const q = await server.paymentRequired(res, extensions, refundUrl, c.mode === 'both' ? { admission: ADMISSION, ...reach, ...listing } : { ...reach, ...listing }, price)
+        const q = await server.paymentRequired(res, extensions, refundUrl, c.mode === 'both' ? { admission: ADMISSION, ...reach, ...listing } : { ...reach, ...listing }, price, shared)
         return refusal(q.status, q.body, q.headers)
       }
       let grantedBy = null
@@ -245,16 +313,15 @@ export function createEngine(options) {
         const payload = Json.decodeHeader(payment)
         if (payload !== null) {
           const who = payerOf(payload)
+          const bad = who === null ? server.malformed(payment, refundUrl) : null
+          if (bad !== null) return refusal(bad.status, bad.body, bad.headers)
           const a = await admitsPayer(who, grant, toolName)
-          if (!a.ok && a.code === 'bad_grant') {
-            const q = await server.paymentRequired(res, extensions, refundUrl, { admission: ADMISSION, ...reach, ...listing, error: 'bad_grant' }, price)
-            return refusal(402, { ...q.body, message: a.why, how: BAD_GRANT_HOW }, q.headers)
-          }
+          if (!a.ok && a.code === 'bad_grant') return await badGrant(a.why)
           if (!a.ok) return refusal(403, { error: 'refused', message: a.why, how: REFUSED_HOW, ...reach })
           if (a.root !== who) grantedBy = a.root
         }
       }
-      const held = await server.verifyAndHold(payment, res, price?.micro ?? null)
+      const held = await server.verifyAndHold(payment, res, price?.micro ?? null, refundUrl)
       if (!held.ok) return refusal(held.status, held.body, held.headers)
       return { ok: true, ticket: { kind: 'paid', hold: held.hold, grantedBy, price } }
     } catch {
@@ -270,6 +337,24 @@ export function createEngine(options) {
         await server.release(ticket.hold)
         return { ok: false, status: 500, headers: {}, body: { error: 'tool_failed', message: 'the tool reported no units. Nothing was charged.' } }
       }
+      if (ticket.hold.kind === 'session') {
+        if (!ok) {
+          await server.sessions.release(ticket.hold)
+          return { ok: true, status: 200, headers: {}, body: { released: true } }
+        }
+        const s = await server.sessions.settle(ticket.hold)
+        if (s.ok) return { ok: true, status: 200, headers: ticket.grantedBy ? { ...s.headers, [GRANTED_BY]: ticket.grantedBy } : s.headers, body: s.response }
+        return { ok: false, status: s.status, headers: s.headers, body: s.body }
+      }
+      if (ticket.hold.kind === 'mpp') {
+        if (!ok) {
+          await server.mppRelease(ticket.hold)
+          return { ok: true, status: 200, headers: {}, body: { released: true } }
+        }
+        const s = await server.mppSettle(ticket.hold)
+        if (s.ok) return { ok: true, status: 200, headers: ticket.grantedBy ? { ...s.headers, [GRANTED_BY]: ticket.grantedBy } : s.headers, body: s.response }
+        return { ok: false, status: s.status, headers: s.headers, body: s.body }
+      }
       if (!ok) {
         await server.release(ticket.hold)
         return { ok: true, status: 200, headers: {}, body: { released: true } }
@@ -279,7 +364,9 @@ export function createEngine(options) {
       if (s.ok) return { ok: true, status: 200, headers: ticket.grantedBy ? { ...s.headers, [GRANTED_BY]: ticket.grantedBy } : s.headers, body: s.response }
       return { ok: false, status: s.status, headers: s.headers, body: s.body }
     } catch {
-      await server.release(ticket.hold).catch(() => {})
+      if (ticket.hold.kind === 'mpp') await server.mppRelease(ticket.hold).catch(() => {})
+      else if (ticket.hold.kind === 'session') await server.sessions.release(ticket.hold).catch(() => {})
+      else await server.release(ticket.hold).catch(() => {})
       return { ok: false, status: 503, headers: {}, body: { error: 'payment_unavailable', message: 'settlement failed; nothing was charged. Retry.' } }
     }
   }
@@ -287,7 +374,7 @@ export function createEngine(options) {
   async function refund(body) {
     if (!settles) return { status: 404, body: { op: 'refund_failed', code: 'not_a_paywall', why: 'this site has no paid calls' } }
     const scalar = (k) => (body && ['string', 'number', 'boolean'].includes(typeof body[k]) ? String(body[k]) : null)
-    return new Refunds(cfg, store, chain, relay).handle(scalar('channelId'), scalar('issued'), scalar('signature'), Refunds.ask(body))
+    return new Refunds(cfg, store, chain, relay, escrows).handle(scalar('channelId'), scalar('issued'), scalar('signature'), Refunds.ask(body))
   }
 
   async function syncClaimed(limit = 50) {
@@ -297,9 +384,11 @@ export function createEngine(options) {
       const charged = Channels.n(ch.chargedCumulativeAmount ?? '0')
       const claimed = Channels.n(ch.totalClaimed ?? '0')
       if (charged <= claimed) continue
+      const escrow = escrows.find(ch)
+      if (escrow === null) continue
       let st
       try {
-        st = await chain.channel(ch.channelId)
+        st = await chain.channel(ch.channelId, escrow)
       } catch {
         continue
       }
@@ -361,8 +450,8 @@ export function createEngine(options) {
       const report = { at: new Date(now()).toISOString(), mode: c.mode }
       if (settles) {
         try {
-          report.withdrawals = await new Withdrawals(cfg, store, chain).run()
-          const claims = await new Claims(cfg, store, chain, relay).run()
+          report.withdrawals = await new Withdrawals(cfg, store, chain, escrows).run()
+          const claims = await new Claims(cfg, store, chain, relay, escrows).run()
           report.claims = claims
           report.synced = (await syncClaimed()).length
           for (const asset of Object.values(claims)) await recordPayout(asset.calls.filter((x) => !String(x.what).startsWith('claim ')), asset.valueUSD, 'relay')
@@ -388,15 +477,17 @@ export function createEngine(options) {
     let calls = []
     let usd = 0
     let gasUnits = 0
-    for (const asset of cfg.assets) {
+    for (const [asset, escrow] of cfg.assets.flatMap((a) => escrows.list.map((e) => [a, e]))) {
       const picked = []
       let riding = 0n
       for (const raw of await store.list()) {
-        const ch = await Channels.earned(cfg, raw)
-        if (!ch.channelConfig?.token || !ch.channelId || !Address.equals(ch.channelConfig.token, asset.address) || !Channels.claimable(ch)) continue
+        if (escrows.find(raw) !== escrow) continue
+        const ch = await Channels.earned(cfg, escrows.view(escrow, raw), escrow)
+        const token = Channels.tokenOf(ch, escrow)
+        if (!token || !ch.channelId || !Address.equals(token, asset.address) || !Channels.claimable(ch, escrow)) continue
         let live
         try {
-          live = await chain.live(ch.channelId)
+          live = await chain.live(ch.channelId, escrow)
         } catch {
           continue
         }
@@ -407,16 +498,21 @@ export function createEngine(options) {
         picked.push(ch)
         riding += delta
       }
-      const plan = await new Payout(cfg, chain).calls(asset.address, picked.length > 0)
+      const plan = await new Payout(cfg, chain, escrow).calls(asset.address, picked.length > 0)
+      const units = escrows.gas(cfg, escrow)
+      if (picked.length || plan.calls.length) {
+        for (const x of await escrows.prepareCalls(escrow, chain)) {
+          calls.push(x)
+          gasUnits += units.createPayee ?? 0
+        }
+      }
       if (picked.length) {
-        const entries = picked.map(Channels.claimEntry)
-        const signature = await BatchSettlement.signClaimBatch(cfg.signingKey(), entries, cfg.chainId)
-        calls.push({ what: `claim ${entries.length} voucher(s)`, to: BatchSettlement.ESCROW, data: BatchSettlement.encodeClaimWithSignature(entries, signature) })
-        gasUnits += cfg.gas.claimBase + entries.length * cfg.gas.claimEntry
+        calls.push(...(await escrows.claimCalls(escrow, cfg.signingKey(), picked, cfg.chainId, () => chain.time(Math.floor(now() / 1000)))))
+        gasUnits += units.claimBase + picked.length * units.claimEntry
       }
       if (plan.calls.length) {
-        gasUnits += cfg.gas.payout
-        for (const x of plan.calls) if (x.what === 'create split') gasUnits += cfg.gas.createSplit
+        gasUnits += units.payout
+        for (const x of plan.calls) if (x.what === 'create split') gasUnits += units.createSplit
         calls = [...calls, ...plan.calls]
         usd += cfg.microUSDOf(asset, (riding + BigInt(plan.owed) + BigInt(plan.held)).toString()) / 1e6
       }
@@ -512,7 +608,9 @@ export function createEngine(options) {
     store,
     chain,
     relay,
+    escrows,
     server,
+    sessions: server?.sessions ?? null,
     gate,
     meter: cfg?.meter ?? null,
     keys: Object.fromEntries(Object.entries(keys).map(([k, v]) => [k, { address: v.address, source: v.source }])),

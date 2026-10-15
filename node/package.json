@@ -1,9 +1,9 @@
 {
-  "name": "@zeam-labs/pass",
-  "version": "1.0.7",
-  "license": "GPL-2.0-only",
+  "name": "@zeambridge/bridge",
+  "version": "2.0.0",
+  "license": "Apache-2.0",
   "author": "ZEAM Labs, LLC <info@zeamlabs.com> (https://www.zeamlabs.com)",
-  "homepage": "https://zeampass.com",
+  "homepage": "https://zeambridge.com",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/zeam-labs/pass.git",
@@ -13,9 +13,10 @@
     "email": "info@zeamlabs.com"
   },
   "type": "module",
-  "description": "ZEAM :: Pass for your own server: a paywall (x402; you keep 90.01%), a key gate, or both, for your MCP and HTTP tools. Runs in your process with your keys.",
+  "description": "ZEAM :: Bridge for your own server: a paywall (x402 and MPP; you keep 90.01%), a key gate, or both, for your MCP and HTTP tools. Runs in your process with your keys. Formerly @zeam-labs/pass.",
   "keywords": [
     "x402",
+    "mpp",
     "mcp",
     "agents",
     "paywall",
@@ -24,7 +25,7 @@
     "usdc",
     "base",
     "zeam",
-    "zeam-pass",
+    "zeam-bridge",
     "model-context-protocol",
     "mcp-server",
     "micropayments",
@@ -38,7 +39,8 @@
     "examples/server.mjs",
     "examples/existing-mcp.mjs",
     "README.md",
-    "LICENSE"
+    "LICENSE",
+    "NOTICE"
   ],
   "engines": {
     "node": ">=18"

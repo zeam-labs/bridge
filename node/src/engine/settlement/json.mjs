@@ -9,6 +9,23 @@ export const Json = {
   base64(value) {
     return Buffer.from(Json.encode(value), 'utf8').toString('base64')
   },
+  sharing() {
+    const parts = new WeakMap()
+    const part = (v) => {
+      if (v === null || typeof v !== 'object') return JSON.stringify(v) === undefined ? undefined : Json.encode(v)
+      if (!parts.has(v)) parts.set(v, Json.encode(v))
+      return parts.get(v)
+    }
+    return (doc) => {
+      if (doc === null || typeof doc !== 'object' || Array.isArray(doc) || typeof doc.toJSON === 'function') return Json.encode(doc)
+      const out = []
+      for (const k of Object.keys(doc)) {
+        const p = part(doc[k])
+        if (p !== undefined) out.push(`${Json.encode(k)}:${p}`)
+      }
+      return `{${out.join(',')}}`
+    }
+  },
   decodeHeader(value) {
     if (typeof value !== 'string' || value.trim() === '') return null
     const clean = value.trim().replace(/[^A-Za-z0-9+/]/g, '')
@@ -78,6 +95,7 @@ export const Reason = {
   VERIFICATION_STATE_UNAVAILABLE: 'invalid_batch_settlement_evm_verification_state_unavailable',
   CHARGE_EXCEEDS_SIGNED_CUMULATIVE: 'invalid_batch_settlement_evm_charge_exceeds_signed_cumulative',
   MISSING_CHANNEL: 'invalid_batch_settlement_evm_missing_channel',
+  REFUND_SETTLING: 'refund_settling',
 }
 
 export class ArrayCache {

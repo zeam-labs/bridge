@@ -1,8 +1,9 @@
 import { http } from 'viem'
 import { Abi } from '../core/abi.mjs'
 import { Address, Hex, Num, big } from '../core/hex.mjs'
-import { BatchSettlement, Erc20 } from '../core/batch.mjs'
+import { Erc20 } from '../core/batch.mjs'
 import { Splits } from '../core/pass.mjs'
+import { ESCROWS, PERMIT2 } from './x402.mjs'
 
 export class RpcError extends Error {
   constructor(message, code = null, data = null) {
@@ -29,13 +30,14 @@ export class Rpc {
 }
 
 export class Chain {
-  static PERMIT2 = '0x000000000022D473030F116dDEE9F6B43aC78BA3'
+  static PERMIT2 = PERMIT2
   static ERC1271_MAGIC = '0x1626ba7e'
 
   constructor(rpc, options = {}) {
     if (typeof rpc === 'string') rpc = new Rpc(rpc, options)
     if (!rpc || typeof rpc.call !== 'function') throw new TypeError('a chain reader needs an RPC URL or an object with call(method, params)')
     this.rpcClient = rpc
+    this.reader = (to, data) => this.call(to, data)
   }
 
   rpc(method, params = []) {
@@ -62,29 +64,27 @@ export class Chain {
     return code !== '0x' && code !== ''
   }
 
-  async channel(channelId) {
-    const c = BatchSettlement.decodeChannels(await this.call(BatchSettlement.ESCROW, BatchSettlement.encodeChannels(channelId)))
-    return { balance: Num.dec(c.balance), totalClaimed: Num.dec(c.totalClaimed) }
+  channel(channelId, escrow = ESCROWS.default) {
+    return escrow.readChannel(this.reader, channelId)
   }
 
-  async pendingWithdrawal(channelId) {
-    const w = BatchSettlement.decodePendingWithdrawals(await this.call(BatchSettlement.ESCROW, BatchSettlement.encodePendingWithdrawals(channelId)))
-    return { amount: Num.dec(w.amount), initiatedAt: Number(Num.dec(w.initiatedAt)) }
+  pendingWithdrawal(channelId, escrow = ESCROWS.default) {
+    return escrow.readClosing(this.reader, channelId)
   }
 
-  async refundNonce(channelId) {
-    return Num.dec(BatchSettlement.decodeRefundNonce(await this.call(BatchSettlement.ESCROW, BatchSettlement.encodeRefundNonce(channelId))))
+  refundNonce(channelId, escrow = ESCROWS.default) {
+    return escrow.readRefundNonce(this.reader, channelId)
   }
 
-  async state(channelId) {
-    const c = await this.channel(channelId)
-    const w = await this.pendingWithdrawal(channelId)
-    return { balance: c.balance, totalClaimed: c.totalClaimed, withdrawRequestedAt: w.initiatedAt, withdrawing: big(w.amount) > 0n, refundNonce: await this.refundNonce(channelId) }
+  async state(channelId, escrow = ESCROWS.default) {
+    const c = await this.channel(channelId, escrow)
+    const w = await this.pendingWithdrawal(channelId, escrow)
+    return { balance: c.balance, totalClaimed: c.totalClaimed, withdrawRequestedAt: w.initiatedAt, withdrawing: big(w.amount) > 0n, refundNonce: await this.refundNonce(channelId, escrow) }
   }
 
-  async live(channelId) {
-    const c = await this.channel(channelId)
-    const w = await this.pendingWithdrawal(channelId)
+  async live(channelId, escrow = ESCROWS.default) {
+    const c = await this.channel(channelId, escrow)
+    const w = await this.pendingWithdrawal(channelId, escrow)
     const payable = big(c.balance) - big(c.totalClaimed)
     return { balance: c.balance, claimed: c.totalClaimed, payable: payable < 0n ? '0' : payable.toString(), withdrawing: big(w.amount) > 0n }
   }
@@ -98,9 +98,8 @@ export class Chain {
     return Num.dec(Erc20.decodeUint256(await this.call(token, data)))
   }
 
-  async receivers(receiver, token) {
-    const r = BatchSettlement.decodeReceivers(await this.call(BatchSettlement.ESCROW, BatchSettlement.encodeReceivers(receiver, token)))
-    return { totalClaimed: Num.dec(r.totalClaimed), totalSettled: Num.dec(r.totalSettled) }
+  receivers(receiver, token, escrow = ESCROWS.default) {
+    return escrow.readPayee(this.reader, receiver, token)
   }
 
   async splitBalance(split, token) {
@@ -116,6 +115,15 @@ export class Chain {
       return false
     }
     return out.slice(0, 10).toLowerCase() === Chain.ERC1271_MAGIC
+  }
+
+  async time(floorSecs = 0) {
+    try {
+      const block = await this.rpc('eth_getBlockByNumber', ['latest', false])
+      return Math.max(Math.trunc(Number(floorSecs)), Number(BigInt(block.timestamp)))
+    } catch {
+      return Math.trunc(Number(floorSecs))
+    }
   }
 
   async receipt(hash) {

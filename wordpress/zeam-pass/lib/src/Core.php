@@ -25,7 +25,7 @@ final class Core
     {
         $missing = self::missing();
         if ($missing !== []) {
-            throw new \RuntimeException(esc_html('ZEAM Pass cannot sign or settle on this server: ' . implode('; ', $missing) . '.'));
+            throw new \RuntimeException(esc_html('ZEAM Bridge cannot sign or settle on this server: ' . implode('; ', $missing) . '.'));
         }
     }
 }

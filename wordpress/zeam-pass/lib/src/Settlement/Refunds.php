@@ -9,7 +9,7 @@ use ZeamPass\Hex;
 use ZeamPass\Pass;
 use ZeamPass\Secp256k1;
 
-final class Refunds
+class Refunds
 {
     const FUTURE_SKEW_MS = 30000;
 
@@ -47,8 +47,11 @@ final class Refunds
 
     public function proofOwner($channelId, $issued, $signature)
     {
+        if ($issued === null || (is_string($issued) && trim($issued) === '')) {
+            return ['ok' => false, 'why' => 'issued is missing: send the ISO 8601 time you signed, as a string'];
+        }
         $t = null;
-        if (is_string($issued) && trim($issued) !== '') {
+        if (is_string($issued)) {
             try {
                 $d = new \DateTimeImmutable($issued);
                 $t = (int) round((float) $d->format('U.u') * 1000);
@@ -64,10 +67,13 @@ final class Refunds
         if ($now - $t > $window || $t - $now > self::FUTURE_SKEW_MS) {
             return ['ok' => false, 'why' => 'issued ' . $issued . ' is outside the ' . (int) $this->cfg->refundWindowSecs . 's window'];
         }
+        if (!is_string($signature) || preg_match('/^(0x)?[0-9a-fA-F]{130}$/D', $signature) !== 1) {
+            return ['ok' => false, 'why' => 'signature is missing or is not 65 bytes of hex'];
+        }
         try {
-            $who = Secp256k1::recoverPersonal(self::message($channelId, $issued), (string) $signature);
+            $who = Secp256k1::recoverPersonal(self::message($channelId, $issued), $signature);
         } catch (\Throwable $e) {
-            return ['ok' => false, 'why' => 'signature does not recover: ' . \ZeamPass\message($e)];
+            return ['ok' => false, 'why' => 'signature does not recover to an address'];
         }
         return ['ok' => true, 'address' => strtolower($who)];
     }
@@ -88,7 +94,10 @@ final class Refunds
     public function handle($channelId, $issued, $signature, array $ask = [])
     {
         $cid = strtolower((string) $channelId);
-        $ch = Verify::isCanonicalChannelId($cid) ? $this->channels->repaired($cid) : null;
+        if (!Verify::isCanonicalChannelId($cid)) {
+            return self::failed(400, 'invalid_request', 'channelId is missing or is not 0x and 64 hex characters: send {channelId, issued, signature}');
+        }
+        $ch = $this->channels->get($cid);
         $sent = isset($ask['channelConfig']) ? $ask['channelConfig'] : null;
         $own = $sent === null ? null : $this->ownConfig($cid, $sent);
         if (isset($own['mismatch'])) {
@@ -105,14 +114,276 @@ final class Refunds
         if (!self::owns($ch !== null ? $ch : ['channelConfig' => $config], $proof['address'])) {
             return self::failed(403, 'not_the_payer', $proof['address'] . ' is not this channel\'s payer');
         }
-        if ($ch === null) {
-            $adopted = $this->adopt($cid, $config);
-            if (isset($adopted['failed'])) {
-                return $adopted['failed'];
-            }
-            $ch = $adopted['channel'];
+        $slot = $this->slot($cid);
+        if ($slot === null) {
+            $known = $this->crowded($cid, self::askKey($ask));
+            return $known !== null ? $known : self::busy();
         }
-        return $this->refundNow($ch, $ask);
+        try {
+            if ($ch === null) {
+                $adopted = $this->adopt($cid, $config);
+                if (isset($adopted['failed'])) {
+                    return $adopted['failed'];
+                }
+                $ch = $adopted['channel'];
+            } else {
+                $before = $this->sent($ch);
+                if ($before !== null) {
+                    return $before;
+                }
+                $fresh = $this->channels->repaired($cid);
+                $ch = $fresh !== null ? $fresh : $ch;
+            }
+            return $this->markedRefund($ch, $ask);
+        } finally {
+            $this->cfg->holds->release($slot);
+        }
+    }
+
+    const WORKERS = 4;
+    const BUSY_RETRY_SECS = 1;
+
+    private function slot($id)
+    {
+        $now = $this->cfg->nowMs();
+        for ($i = 0; $i < self::WORKERS; $i++) {
+            $key = 'refund-worker:' . $id . ':' . $i;
+            try {
+                if ($this->cfg->holds->claim($key, $now + Channels::REFUNDING_TTL_MS + Channels::JUDGING_TTL_MS, $now)) {
+                    return $key;
+                }
+            } catch (\Throwable $e) {
+                return null;
+            }
+        }
+        return null;
+    }
+
+    private function crowded($id, $key)
+    {
+        $r = $this->channels->get($id);
+        $now = $this->cfg->nowMs();
+        if (Channels::refundingWaitMs($r, $now) > 0 && !Channels::judging($r, $now)) {
+            return self::settling(Channels::refundingRetrySecs($this->cfg, $r, $now));
+        }
+        $kept = self::kept($r, $key, $now, $this->lineOf($id));
+        if ($kept !== null) {
+            return $kept;
+        }
+        if (Channels::pendingLive($r, $now)) {
+            return self::callOpen($r, $now);
+        }
+        if ($this->cfg->meter !== null && $this->cfg->meter->busy($id)) {
+            return self::lineBusy();
+        }
+        return null;
+    }
+
+    private static function busy()
+    {
+        return self::failed(503, 'refund_unavailable', 'refund requests on this channel are already being worked out. Nothing was sent for this one. Retry in ' . self::BUSY_RETRY_SECS . 's.', ['retry_after_seconds' => self::BUSY_RETRY_SECS]);
+    }
+
+    const SHARED = ['nothing_to_return', 'gas_payment_needed', 'request_open'];
+    const VERDICT_MS = 5000;
+
+    public static function verdictOf($r)
+    {
+        $v = is_array($r) && isset($r['refundVerdict']) && is_array($r['refundVerdict']) ? $r['refundVerdict'] : [];
+        return [
+            'key' => isset($v['key']) && is_string($v['key']) ? $v['key'] : null,
+            'state' => isset($v['state']) && is_string($v['state']) ? $v['state'] : null,
+            'line' => isset($v['line']) && is_string($v['line']) ? $v['line'] : null,
+            'at' => isset($v['at']) && is_int($v['at']) ? $v['at'] : 0,
+            'answer' => isset($v['answer']) && is_array($v['answer']) ? $v['answer'] : null,
+        ];
+    }
+
+    public static function stateOf($r)
+    {
+        $r = is_array($r) ? $r : [];
+        $at = function ($v) {
+            return $v === null ? null : (string) $v;
+        };
+        $pending = isset($r['pendingRequest']) && is_array($r['pendingRequest']) ? $r['pendingRequest'] : [];
+        $handed = isset($r['handedOver']) && is_array($r['handedOver']) ? $r['handedOver'] : [];
+        return (string) json_encode([
+            $at($r['chargedCumulativeAmount'] ?? null),
+            $at($r['balance'] ?? null),
+            $at($r['totalClaimed'] ?? null),
+            $at($r['signedMaxClaimable'] ?? null),
+            $at($r['refundNonce'] ?? null),
+            $at($pending['expiresAt'] ?? null),
+            $at($handed['nonce'] ?? null),
+            $at($r['withdrawRequestedAt'] ?? null),
+        ]);
+    }
+
+    public static function askKey(array $ask)
+    {
+        return (string) json_encode([isset($ask['selfSend']) && $ask['selfSend'] === true, $ask['gasPayment'] ?? null]);
+    }
+
+    private function markedRefund(array $ch, array $ask)
+    {
+        $id = strtolower($ch['channelId']);
+        $key = self::askKey($ask);
+        $before = $this->sent($ch);
+        if ($before !== null) {
+            return $before;
+        }
+        $kept = self::kept($this->channels->get($id), $key, $this->cfg->nowMs(), $this->lineOf($id));
+        if ($kept !== null) {
+            return $kept;
+        }
+        $holder = '0x' . bin2hex(random_bytes(16));
+        try {
+            return $this->verdict($ch, $ask, $id, $key, $holder);
+        } finally {
+            $this->channels->unweigh($id, $holder);
+        }
+    }
+
+    private function verdict(array $ch, array $ask, $id, $key, $holder)
+    {
+        $judged = $this->judge($ch, $ask, $holder);
+        if (array_key_exists('answer', $judged)) {
+            $after = $this->sent($ch);
+            return $after !== null ? $after : $this->keep($id, $key, $judged['state'], $judged['line'], $judged['answer']);
+        }
+        $marked = $this->channels->mark($id, $holder, true, true);
+        if (isset($marked['unavailable'])) {
+            return self::unheld();
+        }
+        if (isset($marked['settling'])) {
+            $empty = $this->emptied($ch);
+            return $empty !== null ? $empty : self::settling($marked['settling']);
+        }
+        if (isset($marked['open'])) {
+            return $this->keep($id, $key, self::stateOf($marked['open']), $this->lineOf($id), self::callOpen($marked['open'], $marked['at']));
+        }
+        try {
+            $out = $this->underMark($ch, $ask, $judged, $holder);
+        } finally {
+            $this->release($id, $holder);
+        }
+        return $this->keep($id, $key, $out['state'], $out['line'], $out['answer']);
+    }
+
+    private function sent(array $ch)
+    {
+        $r = $this->channels->get($ch['channelId']);
+        $now = $this->cfg->nowMs();
+        if (Channels::refundingWaitMs($r, $now) === 0 || Channels::judging($r, $now)) {
+            return null;
+        }
+        $empty = $this->emptied($ch);
+        return $empty !== null ? $empty : self::settling(Channels::refundingRetrySecs($this->cfg, $r, $now));
+    }
+
+    public static function kept($r, $key, $now, $line)
+    {
+        $v = self::verdictOf($r);
+        if ($v['answer'] === null || $v['key'] !== $key || $v['state'] !== self::stateOf($r) || $v['line'] !== $line) {
+            return null;
+        }
+        return $now >= $v['at'] && $now - $v['at'] < self::VERDICT_MS ? $v['answer'] : null;
+    }
+
+    private function keep($id, $key, $state, $line, array $answer)
+    {
+        $shared = isset($answer['body']['code']) && in_array($answer['body']['code'], self::SHARED, true);
+        try {
+            $still = $shared && $this->lineOf($id) === $line;
+            $this->channels->update($id, function ($r) use ($still, $key, $state, $line, $answer) {
+                if ($r === null) {
+                    return null;
+                }
+                if ($still && self::stateOf($r) === $state) {
+                    $r['refundVerdict'] = ['key' => $key, 'state' => $state, 'line' => $line, 'at' => $this->cfg->nowMs(), 'answer' => $answer];
+                } elseif (isset($r['refundVerdict'])) {
+                    unset($r['refundVerdict']);
+                }
+                return $r;
+            });
+        } catch (\Throwable $e) {
+        }
+        return $answer;
+    }
+
+    private function underMark(array $ch, array $ask, array $judged, $holder)
+    {
+        $id = strtolower($ch['channelId']);
+        $meter = $this->cfg->meter;
+        if ($meter !== null && !$meter->stop($id)) {
+            return ['state' => $judged['state'], 'line' => $this->lineOf($id), 'answer' => self::lineBusy()];
+        }
+        $plan = $this->unchanged($id, $judged) ? $judged : $this->judge($ch, $ask, $holder);
+        return ['state' => $plan['state'], 'line' => $plan['line'], 'answer' => array_key_exists('answer', $plan) ? $plan['answer'] : $this->send($plan, $holder)];
+    }
+
+    private function lineOf($id)
+    {
+        $meter = $this->cfg->meter;
+        if ($meter === null) {
+            return null;
+        }
+        $s = $meter->status($id);
+        return (string) json_encode([$s['metering'] === true, $s['msRemaining'], (bool) $meter->busy($id)]);
+    }
+
+    private function unchanged($id, array $judged)
+    {
+        $raw = $this->channels->get($id);
+        if ($raw === null || self::stateOf($raw) !== $judged['state']) {
+            return false;
+        }
+        $now = Channels::earned($this->cfg, $raw);
+        return Channels::refundable($now, $judged['live']) === $judged['left'] && !Channels::pendingLive($raw, $this->cfg->nowMs());
+    }
+
+    private static function lineBusy()
+    {
+        return self::failed(409, 'request_open', 'a call is running on this channel\'s line. Retry in ' . self::OPEN_RETRY_SECS . 's.', ['retry_after_seconds' => self::OPEN_RETRY_SECS]);
+    }
+
+    private function emptied(array $ch)
+    {
+        $id = strtolower($ch['channelId']);
+        $fresh = $this->channels->get($id);
+        $raw = $fresh !== null ? $fresh : $ch;
+        try {
+            $live = $this->chain->live($id);
+        } catch (\Throwable $e) {
+            return null;
+        }
+        return Big::sign(Channels::n(Channels::refundable(Channels::earned($this->cfg, $raw), $live))) <= 0 ? self::nothing() : null;
+    }
+
+    private static function nothing()
+    {
+        return self::failed(409, 'nothing_to_return', 'nothing to return: the channel holds nothing', ['leftMicroUSD' => 0, 'returnedMicroUSD' => 0, 'gasMicroUSD' => 0]);
+    }
+
+    private static function callOpen(array $ch, $now)
+    {
+        $wait = min(self::OPEN_RETRY_SECS, (int) ceil(((int) $ch['pendingRequest']['expiresAt'] - $now) / 1000));
+        return self::failed(409, 'request_open', "a paid call is open on this channel. Retry in {$wait}s.", ['retry_after_seconds' => $wait]);
+    }
+
+    private static function unheld()
+    {
+        return self::failed(503, 'refund_unavailable', 'the channel could not be held for the refund right now. Nothing was sent. Retry in ' . self::OPEN_RETRY_SECS . 's.', ['retry_after_seconds' => self::OPEN_RETRY_SECS]);
+    }
+
+    private static function settling($secs)
+    {
+        return self::failed(409, 'refund_settling', "a refund is already settling on this channel. Nothing more was sent. Retry in {$secs}s.", ['retry_after_seconds' => $secs]);
+    }
+
+    private function release($id, $holder)
+    {
+        $this->channels->unmark($id, $holder);
     }
 
     private function ownConfig($cid, $config)
@@ -172,7 +443,7 @@ final class Refunds
     const AUTHORIZATION_FIELDS = ['from', 'to', 'value', 'validAfter', 'validBefore', 'nonce'];
     const GAS_PAYMENT_MARGIN_SECS = 30;
     const RETRY_SECS = 60;
-    const REFUND_EVERY_SECS = 3600;
+    const OPEN_RETRY_SECS = 5;
 
     public static function ask($body)
     {
@@ -216,107 +487,135 @@ final class Refunds
 
     public static function usd($microUSD)
     {
+        if (is_int($microUSD) && $microUSD >= 0) {
+            return \ZeamPass\Pricing::usd($microUSD);
+        }
         $s = rtrim(rtrim(sprintf('%.6f', $microUSD / 1e6), '0'), '.');
         return $s === '' ? '0' : $s;
     }
 
     private function frozen(array $raw, array $live, array $ch, $left)
     {
-        if ($this->cfg->meter === null) {
+        $meter = $this->cfg->meter;
+        if ($meter === null) {
             return ['ch' => $ch, 'left' => $left];
         }
-        if (!$this->cfg->meter->stop($ch['channelId'])) {
-            return ['failed' => self::failed(409, 'request_open', 'a call is running on this channel\'s line. Retry in 5s.', ['retry_after_seconds' => 5])];
+        if (!$meter->stop($ch['channelId'])) {
+            return ['failed' => self::lineBusy()];
         }
+        $line = $this->lineOf(strtolower($ch['channelId']));
         $now = Channels::earned($this->cfg, $raw);
         $rest = Channels::refundable($now, $live);
         if (Big::sign(Channels::n($rest)) <= 0) {
-            return ['failed' => self::failed(409, 'nothing_to_return', 'nothing to return: the channel is fully spent', ['leftMicroUSD' => 0, 'returnedMicroUSD' => 0, 'gasMicroUSD' => 0])];
+            return ['line' => $line, 'failed' => self::nothing()];
         }
-        return ['ch' => $now, 'left' => $rest];
+        return ['line' => $line, 'ch' => $now, 'left' => $rest];
     }
 
-    private function refundNow(array $raw, array $ask = [])
+    private function judge(array $incoming, array $ask, $holder)
     {
-        $id = strtolower($raw['channelId']);
+        $id = strtolower($incoming['channelId']);
+        $fresh = $this->channels->get($id);
+        $raw = $fresh !== null ? $fresh : $incoming;
+        $state = self::stateOf($raw);
+        $line = $this->lineOf($id);
+        $refused = function (array $answer) use ($state, &$line) {
+            return ['state' => $state, 'line' => $line, 'answer' => $answer];
+        };
         $ch = Channels::earned($this->cfg, $raw);
         try {
             $live = $this->chain->live($id);
         } catch (\Throwable $e) {
-            return self::failed(409, 'chain_unreadable', 'could not read the channel on chain', ['retry_after_seconds' => self::RETRY_SECS]);
+            return $refused(self::failed(409, 'chain_unreadable', 'could not read the channel on chain', ['retry_after_seconds' => self::RETRY_SECS]));
         }
         $left = Channels::refundable($ch, $live);
         if (Big::sign(Channels::n($left)) <= 0) {
-            return self::failed(409, 'nothing_to_return', 'nothing to return: the channel is fully spent', ['leftMicroUSD' => 0, 'returnedMicroUSD' => 0, 'gasMicroUSD' => 0]);
+            return $refused(self::nothing());
         }
         $now = $this->cfg->nowMs();
         if (Channels::pendingLive($ch, $now)) {
-            $wait = (int) ceil(((int) $ch['pendingRequest']['expiresAt'] - $now) / 1000);
-            return self::failed(409, 'request_open', "a paid call is open on this channel. Retry in {$wait}s.", ['retry_after_seconds' => $wait]);
+            return $refused(self::callOpen($ch, $now));
         }
-        try {
-            $nonce = $this->chain->refundNonce($id);
-        } catch (\Throwable $e) {
-            return self::failed(409, 'chain_unreadable', 'could not read the refund nonce on chain', ['retry_after_seconds' => self::RETRY_SECS]);
-        }
-        if (isset($ask['selfSend']) && $ask['selfSend'] === true) {
-            $f = $this->frozen($raw, $live, $ch, $left);
-            return isset($f['failed']) ? $f['failed'] : $this->selfSend($f['ch'], $live, $f['left'], $nonce);
-        }
-        $since = $now - (int) (isset($ch['lastRefundAt']) ? $ch['lastRefundAt'] : 0);
-        if ($since < 1000 * self::REFUND_EVERY_SECS) {
-            $wait = (int) ceil((1000 * self::REFUND_EVERY_SECS - $since) / 1000);
-            return self::failed(409, 'refund_too_soon', '1 refund per channel per hour. Retry in ' . $wait . 's, or send ' . self::SELF_SEND . ' for a signed refund to send yourself.', ['retry_after_seconds' => $wait, 'leftMicroUSD' => $this->microUSD($ch, $left)]);
+        if (!$this->channels->weigh($id, $holder)) {
+            return $refused(self::unheld());
         }
         $f = $this->frozen($raw, $live, $ch, $left);
+        if (array_key_exists('line', $f)) {
+            $line = $f['line'];
+        }
         if (isset($f['failed'])) {
-            return $f['failed'];
+            return $refused($f['failed']);
         }
         $ch = $f['ch'];
         $left = $f['left'];
+        try {
+            $nonce = $this->chain->refundNonce($id);
+        } catch (\Throwable $e) {
+            return $refused(self::failed(409, 'chain_unreadable', 'could not read the refund nonce on chain', ['retry_after_seconds' => self::RETRY_SECS]));
+        }
+        $plan = ['state' => $state, 'line' => $line, 'live' => $live, 'ch' => $ch, 'left' => $left, 'nonce' => $nonce];
+        if (isset($ask['selfSend']) && $ask['selfSend'] === true) {
+            return $plan + ['self' => true];
+        }
         $leftMicroUSD = $this->microUSD($ch, $left);
         try {
             $call = $this->refundCall($ch, $live, $left, $nonce);
         } catch (\Throwable $e) {
-            return self::failed(409, 'refund_error', substr(\ZeamPass\message($e), 0, 160), ['retry_after_seconds' => self::RETRY_SECS, 'leftMicroUSD' => $leftMicroUSD]);
+            return $refused(self::failed(409, 'refund_error', substr(\ZeamPass\message($e), 0, 160), ['retry_after_seconds' => self::RETRY_SECS, 'leftMicroUSD' => $leftMicroUSD]));
         }
         $gas = $this->refundGas($ch, $live, $call);
         if ($gas === null) {
-            return self::failed(503, 'gas_unpriced', 'refund gas cannot be priced. Retry in 60s, or send ' . self::SELF_SEND . ' for a signed refund to send yourself.', ['retry_after_seconds' => self::RETRY_SECS, 'leftMicroUSD' => $leftMicroUSD]);
+            return $refused(self::failed(503, 'gas_unpriced', 'refund gas cannot be priced. Retry in 60s, or send ' . self::SELF_SEND . ' for a signed refund to send yourself.', ['retry_after_seconds' => self::RETRY_SECS, 'leftMicroUSD' => $leftMicroUSD]));
         }
         $amounts = ['leftMicroUSD' => $leftMicroUSD, 'returnedMicroUSD' => $leftMicroUSD, 'gasMicroUSD' => $gas['gasMicroUSD'], 'feeMicroUSD' => $gas['feeMicroUSD'], 'coverMicroUSD' => $gas['coverMicroUSD']];
-        $payment = null;
-        if (!$gas['covered']) {
-            $asset = $this->cfg->assetOf($ch['channelConfig']['token']);
-            $rule = 'channel fees $' . self::usd($gas['feeMicroUSD']) . ' < deposit and refund gas $' . self::usd($gas['coverMicroUSD']);
-            if ($asset === null || empty($asset['eip3009'])) {
-                return self::failed(409, 'nothing_to_return', $rule . '; this token has no gasless payment for the $' . self::usd($gas['gasMicroUSD']) . ' refund gas. Send ' . self::SELF_SEND . ' for a signed refund of the full balance, sent at your own gas.', array_merge($amounts, ['returnedMicroUSD' => 0], $gas['detail']));
-            }
-            if ($gas['gasMicroUSD'] >= $leftMicroUSD) {
-                return self::failed(409, 'nothing_to_return', $rule . '; refund gas $' . self::usd($gas['gasMicroUSD']) . ' >= balance $' . self::usd($leftMicroUSD) . '. Send ' . self::SELF_SEND . ' for a signed refund of the full balance, sent at your own gas.', array_merge($amounts, ['returnedMicroUSD' => 0], $gas['detail']));
-            }
-            $payTo = $this->gas->gasWallet();
-            if ($payTo === null) {
-                return self::failed(503, 'gas_unpriced', 'the relay is unreachable. Retry in 60s, or send ' . self::SELF_SEND . ' for a signed refund to send yourself.', ['retry_after_seconds' => self::RETRY_SECS, 'leftMicroUSD' => $leftMicroUSD]);
-            }
-            $units = $this->cfg->unitsOfMicroUSD($asset, $gas['gasMicroUSD']);
-            $offered = isset($ask['gasPayment']) ? $ask['gasPayment'] : null;
-            if ($offered === null) {
-                return $this->gasQuote($ch, $asset, $payTo, $units, $amounts, $gas, null);
-            }
-            $bad = $this->gasPaymentProblem($ch, $asset, $payTo, $this->cfg->unitsOfMicroUSD($asset, $gas['costMicroUSD']), $left, $offered);
-            if ($bad !== null) {
-                return $this->gasQuote($ch, $asset, $payTo, $units, $amounts, $gas, $bad);
-            }
-            $payment = ['asset' => $asset, 'payTo' => $payTo, 'authorization' => $offered['authorization'], 'signature' => $offered['signature']];
+        if ($gas['covered']) {
+            return $plan + ['call' => $call, 'gas' => $gas, 'amounts' => $amounts, 'payment' => null];
         }
+        $asset = $this->cfg->assetOf($ch['channelConfig']['token']);
+        $rule = 'channel fees $' . self::usd($gas['feeMicroUSD']) . ' < the gas of ' . self::gasOf($gas) . ' and any calls not yet settled, plus ' . (int) round(($this->cfg->gasBuffer - 1) * 100) . '%, $' . self::usd($gas['coverMicroUSD']);
+        if ($asset === null || empty($asset['eip3009'])) {
+            return $refused(self::failed(409, 'nothing_to_return', $rule . '; this token has no gasless payment for the $' . self::usd($gas['gasMicroUSD']) . ' refund gas. Send ' . self::SELF_SEND . ' for a signed refund of the full balance, sent at your own gas.', array_merge($amounts, ['returnedMicroUSD' => 0], $gas['detail'])));
+        }
+        if ($gas['gasMicroUSD'] >= $leftMicroUSD) {
+            return $refused(self::failed(409, 'nothing_to_return', $rule . '; refund gas $' . self::usd($gas['gasMicroUSD']) . ' >= balance $' . self::usd($leftMicroUSD) . '. Send ' . self::SELF_SEND . ' for a signed refund of the full balance, sent at your own gas.', array_merge($amounts, ['returnedMicroUSD' => 0], $gas['detail'])));
+        }
+        $payTo = $this->gas->gasWallet();
+        if ($payTo === null) {
+            return $refused(self::failed(503, 'gas_unpriced', 'the relay is unreachable. Retry in 60s, or send ' . self::SELF_SEND . ' for a signed refund to send yourself.', ['retry_after_seconds' => self::RETRY_SECS, 'leftMicroUSD' => $leftMicroUSD]));
+        }
+        $units = $this->cfg->unitsOfMicroUSD($asset, $gas['gasMicroUSD']);
+        $offered = isset($ask['gasPayment']) ? $ask['gasPayment'] : null;
+        if ($offered === null) {
+            return $refused($this->gasQuote($ch, $asset, $payTo, $units, $amounts, $gas, null));
+        }
+        $bad = $this->gasPaymentProblem($ch, $asset, $payTo, $this->cfg->unitsOfMicroUSD($asset, $gas['costMicroUSD']), $left, $offered);
+        if ($bad !== null) {
+            return $refused($this->gasQuote($ch, $asset, $payTo, $units, $amounts, $gas, $bad, strpos($bad, 'sending costs') !== false ? ['requoted' => true, 'sendCostMicroUSD' => $gas['costMicroUSD']] : []));
+        }
+        return $plan + ['call' => $call, 'gas' => $gas, 'amounts' => $amounts, 'payment' => ['asset' => $asset, 'payTo' => $payTo, 'authorization' => $offered['authorization'], 'signature' => $offered['signature']]];
+    }
+
+    private function send(array $plan, $holder)
+    {
+        if (!empty($plan['self'])) {
+            $other = $this->channels->sending(strtolower($plan['ch']['channelId']), $holder);
+            if (isset($other['unavailable'])) {
+                return self::unheld();
+            }
+            if ($other !== null) {
+                return self::settling($other['settling']);
+            }
+            return $this->selfSend($plan['ch'], $plan['live'], $plan['left'], $plan['nonce']);
+        }
+        $ch = $plan['ch'];
+        $payment = $plan['payment'];
         if ($payment === null) {
-            return $this->sendRefund($ch, $call, $left, 0, $amounts);
+            return $this->sendRefund($ch, $plan['call'], $plan['left'], 0, $plan['amounts'], $holder, $plan['gas']['freeGasUnits']);
         }
         $pay = ['to' => $payment['asset']['address'], 'data' => BatchSettlement::encodeTransferWithAuthorization($payment['authorization'], $payment['signature'])];
-        $bundle = ['to' => BatchSettlement::MULTICALL3, 'data' => BatchSettlement::encodeAggregate3([$call, $pay])];
-        $out = $this->sendRefund($ch, $bundle, $left, $this->microUSD($ch, $payment['authorization']['value']), $amounts);
-        return isset($out['underpaid']) ? $this->requote($ch, $live, $payment, $amounts, $gas, $out['underpaid'], $call) : $out;
+        $bundle = ['to' => BatchSettlement::MULTICALL3, 'data' => BatchSettlement::encodeAggregate3([$plan['call'], $pay])];
+        $out = $this->sendRefund($ch, $bundle, $plan['left'], $this->microUSD($ch, $payment['authorization']['value']), $plan['amounts'], $holder);
+        return isset($out['underpaid']) ? $this->requote($ch, $plan['live'], $payment, $plan['amounts'], $plan['gas'], $out['underpaid'], $plan['call']) : $out;
     }
 
     private function requote(array $ch, array $live, array $payment, array $amounts, array $gas, $sendCost, $call = null)
@@ -327,7 +626,10 @@ final class Refunds
         }
         $quoted = max($fresh['covered'] ? 0 : $fresh['gasMicroUSD'], (int) ceil($sendCost * $this->cfg->gasBuffer));
         $numbers = array_merge($amounts, ['gasMicroUSD' => $quoted, 'feeMicroUSD' => $fresh['feeMicroUSD'], 'coverMicroUSD' => $fresh['coverMicroUSD'], 'sendCostMicroUSD' => $sendCost]);
-        $moved = 'refund gas rose past the quote margin: sending costs $' . self::usd($sendCost) . ', your payment is $' . self::usd($this->microUSD($ch, $payment['authorization']['value'])) . '. Nothing was sent';
+        $paying = $this->microUSD($ch, $payment['authorization']['value']);
+        $moved = $fresh['covered'] || $paying >= $fresh['gasMicroUSD']
+            ? 'refund gas rose past the quote margin: sending costs $' . self::usd($sendCost) . ', your payment is $' . self::usd($paying) . '. Nothing was sent'
+            : 'your payment, $' . self::usd($paying) . ', is under the quote, $' . self::usd($fresh['gasMicroUSD']) . ', and under what sending costs, $' . self::usd($sendCost) . '. Nothing was sent';
         if ($quoted >= $amounts['leftMicroUSD']) {
             return self::failed(409, 'nothing_to_return', $moved . '; refund gas $' . self::usd($quoted) . ' (margin included) >= balance $' . self::usd($amounts['leftMicroUSD']) . '. Send ' . self::SELF_SEND . ' for a signed refund of the full balance, sent at your own gas.', array_merge($numbers, ['returnedMicroUSD' => 0], $fresh['detail']));
         }
@@ -356,10 +658,12 @@ final class Refunds
     public function refundGas(array $ch, array $live, $call = null)
     {
         $bundled = self::bundledClaim($ch, $live);
-        $q = $this->gas->refund(Big::sign($bundled) > 0, true);
+        $alreadyPaid = self::gasCounted($ch, $this->cfg->gas, $this->gas->relayPaid($ch['channelId']));
+        $q = $this->gas->refund(Big::sign($bundled) > 0, true, $alreadyPaid);
         if ($q === null) {
             return null;
         }
+        $counted = ['alreadyPaid' => $alreadyPaid, 'freeGasUnits' => $this->cfg->gas['refund'] + (Big::sign($bundled) > 0 ? $this->cfg->gas['refundClaim'] : 0)];
         $cover = $q['cover'];
         $earned = $this->microUSD($ch, Big::strval(Big::add(Channels::n($live['claimed']), $bundled)));
         $feeMicroUSD = GasQuote::feeMicroUSD($earned, $this->cfg->feeShare);
@@ -367,13 +671,33 @@ final class Refunds
             return ['gasUnits' => $p['gasUnits'], 'gasUnitsWithMargin' => $p['gasUnitsWithMargin'], 'gasPriceWei' => $p['gasPriceWei'], 'ethUSD' => $p['ethUSD'], 'l1FeeWei' => $p['l1FeeWei'], 'marginPercent' => $p['marginPercent'], 'quotedBy' => $p['quotedBy']];
         };
         if ($feeMicroUSD >= $cover['microUSD']) {
-            return ['covered' => true, 'gasMicroUSD' => 0, 'costMicroUSD' => 0, 'feeMicroUSD' => $feeMicroUSD, 'coverMicroUSD' => $cover['microUSD'], 'detail' => $detailOf($q['pay'])];
+            return ['covered' => true, 'gasMicroUSD' => 0, 'costMicroUSD' => 0, 'feeMicroUSD' => $feeMicroUSD, 'coverMicroUSD' => $cover['microUSD'], 'detail' => $detailOf($q['pay'])] + $counted;
         }
         $pay = $this->gas->relayQuote($call);
         if ($pay === null) {
             $pay = $q['pay'];
         }
-        return ['covered' => false, 'gasMicroUSD' => $pay['microUSD'], 'costMicroUSD' => $pay['costMicroUSD'], 'feeMicroUSD' => $feeMicroUSD, 'coverMicroUSD' => $cover['microUSD'], 'detail' => $detailOf($pay)];
+        return ['covered' => false, 'gasMicroUSD' => $pay['microUSD'], 'costMicroUSD' => $pay['costMicroUSD'], 'feeMicroUSD' => $feeMicroUSD, 'coverMicroUSD' => $cover['microUSD'], 'detail' => $detailOf($pay)] + $counted;
+    }
+
+    public static function gasCounted($ch, array $gas, $relayPaid)
+    {
+        return max(self::gasAlreadyPaid($ch, $gas), is_int($relayPaid) && $relayPaid > 0 ? $relayPaid : 0);
+    }
+
+    public static function gasAlreadyPaid($ch, array $gas)
+    {
+        $count = function ($v) {
+            return is_numeric($v) && $v > 0 ? (int) $v : 0;
+        };
+        $deposits = is_array($ch) && isset($ch['depositsWePaid']) ? $count($ch['depositsWePaid']) : 0;
+        $refunds = is_array($ch) && isset($ch['refundGasWePaid']) ? $count($ch['refundGasWePaid']) : 0;
+        return max(0, $deposits - 1) * $gas['deposit'] + $refunds;
+    }
+
+    public static function gasOf(array $gasInfo)
+    {
+        return isset($gasInfo['alreadyPaid']) && $gasInfo['alreadyPaid'] > 0 ? 'its deposit, its refund, the further deposits and earlier refunds ZEAM paid for' : 'its deposit, its refund';
     }
 
     private function gasPaymentProblem(array $ch, array $asset, $payTo, $units, $left, array $p)
@@ -413,7 +737,7 @@ final class Refunds
             return 'gasPayment nonce is not 32 bytes';
         }
         try {
-            $signer = Secp256k1::recoverHash(BatchSettlement::transferAuthorizationDigest(self::tokenDomain($this->cfg, $asset), $a), $p['signature']);
+            $signer = Secp256k1::isCanonical($p['signature']) ? Secp256k1::recoverHash(BatchSettlement::transferAuthorizationDigest(self::tokenDomain($this->cfg, $asset), $a), $p['signature']) : null;
         } catch (\Throwable $e) {
             $signer = null;
         }
@@ -447,7 +771,7 @@ final class Refunds
         return self::answer(409, array_merge([
             'op' => 'refund_quote',
             'code' => 'gas_payment_needed',
-            'why' => $lead . 'channel fees $' . self::usd($gasInfo['feeMicroUSD']) . ' < deposit and refund gas $' . self::usd($gasInfo['coverMicroUSD']) . '. Refund gas: $' . self::usd($gas) . ' USDC, no ETH (' . $d['gasUnits'] . ' gas, L1 fee ' . $d['l1FeeWei'] . ' wei, ' . $d['gasPriceWei'] . ' wei per gas, $' . Json::encode($d['ethUSD']) . ' per ETH, ' . $d['marginPercent'] . '% margin; ' . ($d['quotedBy'] === 'relay' ? 'priced by the relay' : 'priced from measured refunds') . '). Sign authorization (EIP-3009 TransferWithAuthorization; typed data in sign) and POST again with gasPayment: {authorization, signature} within ' . $secs . 's. The refund of $' . self::usd($amounts['leftMicroUSD']) . ' and the gas payment go in one transaction: $' . self::usd($amounts['leftMicroUSD'] - $gas) . ' net to you. Or send ' . self::SELF_SEND . ' for a signed refund of the full balance, sent at your own gas.',
+            'why' => $lead . 'channel fees $' . self::usd($gasInfo['feeMicroUSD']) . ' < the gas of ' . self::gasOf($gasInfo) . ' and any calls not yet settled, plus ' . (int) round(($this->cfg->gasBuffer - 1) * 100) . '%, $' . self::usd($gasInfo['coverMicroUSD']) . '. Refund gas: $' . self::usd($gas) . ' USDC, no ETH (' . $d['gasUnits'] . ' gas, L1 fee ' . $d['l1FeeWei'] . ' wei, ' . $d['gasPriceWei'] . ' wei per gas, $' . Json::encode($d['ethUSD']) . ' per ETH, ' . $d['marginPercent'] . '% margin; ' . ($d['quotedBy'] === 'relay' ? 'priced by the relay' : 'priced from measured refunds') . '). Sign authorization (EIP-3009 TransferWithAuthorization; typed data in sign) and POST again with gasPayment: {authorization, signature} within ' . $secs . 's. The refund of $' . self::usd($amounts['leftMicroUSD']) . ' and the gas payment go in one transaction: $' . self::usd($amounts['leftMicroUSD'] - $gas) . ' net to you. Or send ' . self::SELF_SEND . ' for a signed refund of the full balance, sent at your own gas.',
         ], $amounts, $d, $extra, [
             'payTo' => $authorization['to'],
             'authorization' => $authorization,
@@ -480,7 +804,20 @@ final class Refunds
         ];
     }
 
-    private function sendRefund(array $ch, array $call, $left, $gasMicroUSD, array $amounts = [])
+    private function sendRefund(array $ch, array $call, $left, $gasMicroUSD, array $amounts, $holder, $freeGasUnits = 0)
+    {
+        $id = strtolower($ch['channelId']);
+        $other = $this->channels->sending($id, $holder);
+        if (isset($other['unavailable'])) {
+            return self::unheld();
+        }
+        if ($other !== null) {
+            return self::settling($other['settling']);
+        }
+        return $this->sendRefundNow($ch, $call, $left, $gasMicroUSD, $amounts, $freeGasUnits);
+    }
+
+    private function sendRefundNow(array $ch, array $call, $left, $gasMicroUSD, array $amounts = [], $freeGasUnits = 0)
     {
         $id = strtolower($ch['channelId']);
         $sent = $this->relay->send([$call], $this->cfg->relaySplit());
@@ -494,10 +831,6 @@ final class Refunds
             ];
             if ($gasMicroUSD > 0 && isset($sent[0]['code']) && $sent[0]['code'] === 'underpaid') {
                 return ['underpaid' => max(1, isset($sent[0]['gasMicroUSD']) ? (int) $sent[0]['gasMicroUSD'] : 0)];
-            }
-            if (preg_match('/one refund an hour/', $error)) {
-                $wait = preg_match('/retry in (\d+)s/', $error, $m) ? (int) $m[1] : self::REFUND_EVERY_SECS;
-                return self::failed(409, 'refund_too_soon', '1 refund per channel per hour. Retry in ' . $wait . 's, or send ' . self::SELF_SEND . ' for a signed refund to send yourself.', array_merge(['retry_after_seconds' => $wait], $numbers));
             }
             return self::failed(409, 'refund_error', substr($error, 0, 160), array_merge(['retry_after_seconds' => self::RETRY_SECS], $numbers));
         }
@@ -516,18 +849,22 @@ final class Refunds
             }
         }
         $drained = $after !== null && Big::cmp(Channels::n($after['balance']), Channels::n($after['claimed'])) <= 0;
-        $at = $this->cfg->nowMs();
         $state = null;
-        $this->channels->update($id, function ($r) use ($after, $at, $ch) {
+        $gasTable = $this->cfg->gas;
+        $readAt = $this->cfg->nowMs();
+        $this->channels->update($id, function ($r) use ($after, $ch, $gasMicroUSD, $freeGasUnits, $gasTable, $readAt) {
             if ($r === null) {
                 return null;
             }
-            $r['lastRefundAt'] = $at;
+            if ($gasMicroUSD === 0 && $freeGasUnits > 0) {
+                $r['refundGasWePaid'] = self::gasAlreadyPaid(['refundGasWePaid' => isset($r['refundGasWePaid']) ? $r['refundGasWePaid'] : 0], $gasTable) + $freeGasUnits;
+            }
             if ($after === null && Big::cmp(Channels::n(isset($ch['chargedCumulativeAmount']) ? $ch['chargedCumulativeAmount'] : '0'), Channels::n(isset($r['chargedCumulativeAmount']) ? $r['chargedCumulativeAmount'] : '0')) < 0) {
                 $r['chargedCumulativeAmount'] = $ch['chargedCumulativeAmount'];
             }
             if ($after !== null) {
                 $r['balance'] = $after['balance'];
+                $r['repairedAt'] = $readAt;
                 $r['totalClaimed'] = $after['claimed'];
                 $r['chargedCumulativeAmount'] = $after['claimed'];
                 $r['refundNonce'] = (int) (isset($r['refundNonce']) ? $r['refundNonce'] : 0) + 1;
@@ -545,7 +882,7 @@ final class Refunds
             $body['timeReturnedMs'] = $timeMs;
         }
         $body['why'] = $gasMicroUSD > 0
-            ? 'refund $' . self::usd($returned) . ' and gas payment $' . self::usd($gasMicroUSD) . ' (' . $this->gas->marginPercent() . '% margin included) sent in one transaction: $' . self::usd($returned - $gasMicroUSD) . ' net to you'
+            ? 'refund $' . self::usd($returned) . ' and your gas payment $' . self::usd($gasMicroUSD) . ' sent in one transaction: $' . self::usd($returned - $gasMicroUSD) . ' net to you'
             : 'refund $' . self::usd($returned) . ' sent; ZEAM paid the gas';
         if ($state !== null) {
             $body['channelState'] = $state;

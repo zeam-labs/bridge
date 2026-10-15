@@ -1,16 +1,19 @@
 import { createHash, randomBytes } from 'node:crypto'
 import { ChannelFileStore } from './stores.mjs'
 import { Secp256k1 } from './core/secp256k1.mjs'
-import { microOf, usd } from './pricing.mjs'
+import { ESCROWS } from './settlement/x402.mjs'
+import { MAX_MICRO, MAX_USD, microOf, mulDiv, usd } from './pricing.mjs'
 
 const NONCE_SECS = 300
 const KEEP_CREDITED = 64
 const KEEP_NONCES = 8
-const KEEP_LINES = 8
 
 export const Clock = {
   HOLD_MS: 2000,
   KEEP_DONE: 512,
+  MAX_LIVE_CALLS: 1000,
+  ALIVE_MS: 1000,
+  DEAD_MS: 30000,
 
   fresh(channelId) {
     return { channelId: String(channelId).toLowerCase(), balanceMs: 0, spentMs: 0, returnedMs: 0, on: false, since: null, lastActive: null, calls: {}, done: [], credited: [], nonces: {}, lines: [] }
@@ -91,11 +94,12 @@ export const Clock = {
     return rec
   },
 
-  begin(rec, id, now, idleMs = 0) {
+  begin(rec, id, now, idleMs = 0, cap = null) {
     Clock.settle(rec, now, idleMs)
     if (!rec.on) return { ok: false, code: 'meter_off' }
     const left = Clock.left(rec, now, idleMs)
     if (left <= 0) return { ok: false, code: 'out_of_time' }
+    if (cap !== null && Object.keys(rec.calls).length >= cap) return { ok: false, code: 'too_many_calls' }
     Clock.active(rec, now, idleMs)
     const deadline = now + left
     rec.calls[id] = { start: now, deadline }
@@ -117,6 +121,22 @@ export const Clock = {
     return { elapsedMs: c === null ? 0 : ran - from, over: c === null || ran > c.deadline }
   },
 
+  renew(rec, id, now, idleMs = 0, start = null, last = null) {
+    rec.done = rec.done ?? []
+    const c = rec.calls[id] ?? null
+    const due = c === null ? last : c.deadline
+    if (c !== null) rec.done.push([start !== null && start > c.start ? start : c.start, Math.min(now, c.deadline)])
+    delete rec.calls[id]
+    const covers = due === null || due >= now || rec.since === null ? now : Math.min(now, due + Math.max(0, Clock.left(rec, now, idleMs)))
+    if (due !== null && covers > due) rec.done.push([due, covers])
+    Clock.settle(rec, now, idleMs)
+    const left = Clock.left(rec, now, idleMs)
+    if (covers < now || left <= 0) return { ok: false, code: 'out_of_time' }
+    const deadline = now + left
+    rec.calls[id] = { start: now, deadline }
+    return { ok: true, deadline }
+  },
+
   buy(rec, ms, key, now, idleMs = 0) {
     if (rec.credited.includes(key)) return false
     Clock.settle(rec, now, idleMs)
@@ -136,7 +156,7 @@ export const Clock = {
 
   unburnedMicro(rec, now, idleMs, rateMicro, rateMs) {
     const left = Clock.remaining(rec, now, idleMs)
-    return Math.floor((left * rateMicro + rateMs - 1) / rateMs)
+    return mulDiv(left, rateMicro, rateMs, rateMs - 1)
   },
 
   forget(rec, now, idleMs = 0) {
@@ -162,21 +182,23 @@ const gcd = (a, b) => (b === 0 ? a : gcd(b, a % b))
 
 export function timeOptions(o) {
   if (o === undefined || o === null || o === false) return null
-  if (typeof o !== 'object') throw new TypeError('pass: time is { usd: "0.00025", ms: 250 }: that many dollars buys that many milliseconds')
+  if (typeof o !== 'object') throw new TypeError('bridge: time is { usd: "0.00025", ms: 250 }: that many dollars buys that many milliseconds')
   const micro = microOf(o.usd ?? o.block, 'time.usd')
   const given = o.ms ?? o.blockMs
   const ms = given === undefined ? 250 : Math.trunc(Number(given))
   const idleMs = o.idleMs === undefined ? 0 : Math.trunc(Number(o.idleMs))
-  if (!(ms >= 1 && ms <= 3600000)) throw new TypeError('pass: time.ms is 1 to 3600000')
-  if (!(idleMs >= 0 && idleMs <= 3600000)) throw new TypeError('pass: time.idleMs is 0 to 3600000')
+  const maxCalls = o.maxCalls === undefined || o.maxCalls === null ? Clock.MAX_LIVE_CALLS : Math.trunc(Number(o.maxCalls))
+  if (!(ms >= 1 && ms <= 3600000)) throw new TypeError('bridge: time.ms is 1 to 3600000')
+  if (!(idleMs >= 0 && idleMs <= 3600000)) throw new TypeError('bridge: time.idleMs is 0 to 3600000')
+  if (!(maxCalls >= 1 && maxCalls <= 1000)) throw new TypeError('bridge: time.maxCalls is 1 to 1000')
   const legacyCap = o.maxBlocks === undefined || o.maxBlocks === null ? undefined : Number(o.maxBlocks) * ms
   const cap = o.maxMs ?? legacyCap
   const maxMs = cap === undefined || cap === null ? null : Math.trunc(Number(cap))
   const g = gcd(micro, ms)
   const rateMicro = micro / g
   const rateMs = ms / g
-  if (maxMs !== null && !(maxMs >= rateMs && maxMs % rateMs === 0)) throw new TypeError(`pass: time.maxMs is a multiple of ${rateMs} ms, the smallest amount this price sells; leave it out for no maximum`)
-  return { rateMicro, rateMs, unitMs: ms, idleMs, maxMs }
+  if (maxMs !== null && !(maxMs >= rateMs && maxMs % rateMs === 0)) throw new TypeError(`bridge: time.maxMs is a multiple of ${rateMs} ms, the smallest amount this price sells; leave it out for no maximum`)
+  return { rateMicro, rateMs, unitMs: ms, idleMs, maxMs, maxCalls }
 }
 
 export const timeRate = (t) => `$${usd(t.rateMicro)} per ${t.rateMs === 1 ? 'ms' : `${t.rateMs} ms`}`
@@ -187,19 +209,92 @@ export function boughtMs(t, args) {
   return t.unitMs
 }
 
+export function timeMicro(t, ms) {
+  const micro = (ms / t.rateMs) * t.rateMicro
+  if (!(micro <= MAX_MICRO)) throw new TypeError(`bridge: that much line time costs more than $${MAX_USD}; above that a number stops counting micro-USD exactly. Buy less at a time`)
+  return micro
+}
+
 export function timeText(t, base = '') {
   const idle = t.idleMs > 0 ? ` and ${t.idleMs} ms after each` : ''
   const step = t.rateMs > 1 ? ` in steps of ${t.rateMs} ms` : ''
   const most = t.maxMs ? ` (up to ${t.maxMs} ms a purchase)` : ''
-  return `Line time: ${timeRate(t)}. buy_time {ms}${step}${most}; buying again adds time; the time is credited to the paying channel once the payment settles. Open a line: POST ${base}/line {"op":"open","channelId"}, sign the message it returns with the payer key, POST {"op":"prove","channelId","nonce","signature"}. Send the credential as x-line (MCP: _meta["zeam-pass/line"]). Time burns while a call runs on the line${idle}; a call stops when the time runs out. {"op":"off"}: no new calls on the line; a running call burns to its end. Unburned time comes back with a refund.`
+  return `Line time: ${timeRate(t)}. buy_time {"ms": N}${step}${most}; buying again adds time; the time is credited to the paying channel once the payment settles. Open a line: POST ${base}/line {"op":"open","channelId":"0x…"}, sign the message it returns with the payer key, POST {"op":"prove","channelId":"0x…","nonce":"…","signature":"0x…"}. Send the credential as x-line (MCP: _meta["zeam-pass/line"]). Time burns while a call runs on the line${idle}; a call stops when the time runs out. {"op":"off"}: no new calls on the line; a running call burns to its end. Unburned time comes back with a refund.`
 }
 
 export class TimeMeter {
-  constructor(dir, t, { now = () => Date.now(), clocks = null, lines = null } = {}) {
+  constructor(dir, t, { now = () => Date.now(), clocks = null, lines = null, alive = null } = {}) {
     this.t = t
     this.now = now
     this.clocks = clocks ?? new ChannelFileStore(`${dir}/clocks`)
     this.lines = lines ?? new ChannelFileStore(`${dir}/lines`)
+    this.alive = alive ?? new ChannelFileStore(`${dir}/alive`)
+    this.boot = '0x' + randomBytes(32).toString('hex')
+    this.pulsed = null
+    this.pulsing = null
+    this.marks = new Map()
+    this.starts = new Map()
+    this.stops = new Map()
+  }
+
+  async pulse() {
+    const now = this.now()
+    if (this.pulsed !== null && now >= this.pulsed && now - this.pulsed < Clock.ALIVE_MS) return
+    this.pulsed = now
+    await this.alive.update(this.boot, () => ({ channelId: this.boot, at: now }))
+  }
+
+  keepAlive() {
+    if (this.pulsing !== null) return
+    this.pulsing = setInterval(() => {
+      if (this.starts.size === 0) {
+        clearInterval(this.pulsing)
+        this.pulsing = null
+        return
+      }
+      this.pulse().catch(() => {})
+    }, Clock.ALIVE_MS)
+    this.pulsing.unref?.()
+  }
+
+  async lastAlive(boot, now) {
+    const hit = this.marks.get(boot)
+    if (hit !== undefined && now >= hit.read && now - hit.read < Clock.ALIVE_MS) return hit.at
+    const mark = await this.alive.get(boot).catch(() => null)
+    const at = Number.isFinite(mark?.at) ? mark.at : 0
+    this.marks.set(boot, { at, read: now })
+    return at
+  }
+
+  async reap(rec, now) {
+    for (const [id, c] of Object.entries(rec.calls ?? {})) {
+      if (typeof c.by !== 'string' || c.by === this.boot) continue
+      const at = await this.lastAlive(c.by, now)
+      if (now - at <= Clock.DEAD_MS) continue
+      const ran = Math.max(at, c.start)
+      rec.done = rec.done ?? []
+      rec.done.push([c.start, Math.min(ran, c.deadline)])
+      delete rec.calls[id]
+      Clock.active(rec, ran, this.t.idleMs)
+    }
+    return rec
+  }
+
+  running(rec, now) {
+    for (const [id, c] of Object.entries(rec.calls ?? {})) {
+      const started = this.starts.get(`${rec.channelId}:${id}`)
+      const stopped = this.stops.get(`${rec.channelId}:${id}`)
+      const ran = stopped === undefined ? now : Math.min(stopped, now)
+      if (ran > c.deadline) continue
+      if (started !== undefined && started > c.start) c.start = Math.min(started, ran)
+      if (stopped !== undefined) c.deadline = Math.max(c.start, ran)
+    }
+    return rec
+  }
+
+  stopped(channelId, id, at) {
+    const key = `${String(channelId).toLowerCase()}:${id}`
+    if (!this.stops.has(key)) this.stops.set(key, at)
   }
 
   static hash(credential) {
@@ -207,13 +302,13 @@ export class TimeMeter {
   }
 
   callMs(priceMicro) {
-    return Math.floor((priceMicro * this.t.rateMs) / this.t.rateMicro)
+    return Math.min(mulDiv(priceMicro, this.t.rateMs, this.t.rateMicro), Number.MAX_SAFE_INTEGER)
   }
 
   async change(channelId, fn) {
     let out
-    await this.clocks.update(channelId, (current) => {
-      const rec = current ?? Clock.fresh(channelId)
+    await this.clocks.update(channelId, async (current) => {
+      const rec = await this.reap(current ?? Clock.fresh(channelId), this.now())
       out = fn(rec)
       return rec
     })
@@ -221,8 +316,9 @@ export class TimeMeter {
   }
 
   async status(channelId) {
-    const rec = (await this.clocks.get(channelId)) ?? Clock.fresh(channelId)
+    const stored = (await this.clocks.get(channelId)) ?? Clock.fresh(channelId)
     const now = this.now()
+    const rec = this.running(await this.reap(structuredClone(stored), now), now)
     return { channelId: rec.channelId, msRemaining: Clock.remaining(rec, now, this.t.idleMs), msSpent: Clock.spent(rec, now, this.t.idleMs), msReturned: rec.returnedMs, metering: rec.on, rateUSD: usd(this.t.rateMicro), rateMs: this.t.rateMs }
   }
 
@@ -239,12 +335,36 @@ export class TimeMeter {
   }
 
   async begin(channelId, id) {
-    const b = await this.change(channelId, (rec) => Clock.begin(rec, id, this.now(), this.t.idleMs))
-    return b.ok ? { ...b, started: this.now() } : b
+    await this.pulse()
+    const b = await this.change(channelId, (rec) => {
+      const r = Clock.begin(rec, id, this.now(), this.t.idleMs, this.t.maxCalls)
+      if (r.ok) rec.calls[id].by = this.boot
+      return r
+    })
+    if (!b.ok) return b
+    const started = this.now()
+    this.starts.set(`${String(channelId).toLowerCase()}:${id}`, started)
+    this.keepAlive()
+    return { ...b, started }
   }
 
-  end(channelId, id, started = null, stopped = null) {
-    return this.change(channelId, (rec) => { const now = this.now(); return { ...Clock.end(rec, id, now, this.t.idleMs, started, stopped), msRemaining: Clock.left(rec, now, this.t.idleMs) } })
+  async end(channelId, id, started = null, stopped = null) {
+    if (stopped !== null) this.stopped(channelId, id, stopped)
+    try {
+      return await this.change(channelId, (rec) => { const now = this.now(); return { ...Clock.end(rec, id, now, this.t.idleMs, started, stopped), msRemaining: Clock.left(rec, now, this.t.idleMs) } })
+    } finally {
+      this.starts.delete(`${String(channelId).toLowerCase()}:${id}`)
+      this.stops.delete(`${String(channelId).toLowerCase()}:${id}`)
+    }
+  }
+
+  renew(channelId, id, last = null) {
+    const started = this.starts.get(`${String(channelId).toLowerCase()}:${id}`) ?? null
+    return this.change(channelId, (rec) => {
+      const r = Clock.renew(rec, id, this.now(), this.t.idleMs, started, last)
+      if (r.ok) rec.calls[id].by = this.boot
+      return r
+    })
   }
 
   stop(channelId) {
@@ -257,14 +377,15 @@ export class TimeMeter {
   }
 
   async busy(channelId) {
-    const rec = await this.clocks.get(channelId)
     const now = this.now()
+    const stored = await this.clocks.get(channelId)
+    const rec = stored === null ? null : await this.reap(stored, now)
     return rec !== null && Object.values(rec.calls ?? {}).some((c) => c.deadline > now)
   }
 
   async unburnedMicro(channelId) {
-    const rec = await this.clocks.get(channelId)
-    return rec === null ? 0 : Clock.unburnedMicro(rec, this.now(), this.t.idleMs, this.t.rateMicro, this.t.rateMs)
+    const stored = await this.clocks.get(channelId)
+    return stored === null ? 0 : Clock.unburnedMicro(await this.reap(stored, this.now()), this.now(), this.t.idleMs, this.t.rateMicro, this.t.rateMs)
   }
 
   async forget(channelId) {
@@ -288,7 +409,9 @@ export class TimeMeter {
     })
   }
 
-  async prove(channel, nonce, signature) {
+  async prove(channel, nonce, signature, owners = null) {
+    if (nonce === undefined || nonce === null || nonce === '') return { ok: false, status: 400, code: 'bad_request', why: 'nonce is missing: send the nonce the open answer gave, with your signature of its message' }
+    if (typeof signature !== 'string' || !signature) return { ok: false, status: 400, code: 'bad_request', why: 'signature is missing or is not a string: sign the message the open answer gave and send it with the nonce' }
     const channelId = String(channel.channelId).toLowerCase()
     const now = this.now()
     const live = await this.change(channelId, (rec) => {
@@ -296,28 +419,22 @@ export class TimeMeter {
       delete rec.nonces[String(nonce)]
       return until !== undefined && until > now
     })
-    if (!live) return { ok: false, status: 400, code: 'no_challenge', why: 'no live challenge with that nonce. Send {"op":"open"} again.' }
+    if (!live) return { ok: false, status: 400, code: 'no_challenge', why: 'no live challenge with that nonce. Send {"op":"open","channelId":"0x…"} again and sign what it returns.' }
     let who
     try {
       who = (await Secp256k1.recoverPersonal(Clock.lineMessage(channelId, nonce), String(signature ?? ''))).toLowerCase()
     } catch (e) {
       return { ok: false, status: 400, code: 'bad_signature', why: `the signature does not recover: ${String(e?.message ?? e).slice(0, 80)}` }
     }
-    const payer = String(channel.channelConfig?.payer ?? '').toLowerCase()
-    const auth = String(channel.channelConfig?.payerAuthorizer ?? '').toLowerCase()
-    if (who !== payer && who !== auth) return { ok: false, status: 403, code: 'not_the_payer', why: `${who} is not this channel's payer` }
+    if (!(owners ?? ESCROWS.default.owners(channel.channelConfig)).some((a) => who === String(a ?? '').toLowerCase())) return { ok: false, status: 403, code: 'not_the_payer', why: `${who} is not this channel's payer` }
     const credential = randomBytes(32).toString('base64url')
     const h = TimeMeter.hash(credential)
     await this.lines.update(h, () => ({ channelId, at: now }))
-    let dropped = []
     const msRemaining = await this.change(channelId, (rec) => {
-      const all = [...rec.lines, h]
-      dropped = all.slice(0, -KEEP_LINES)
-      rec.lines = all.slice(-KEEP_LINES)
+      rec.lines = [...rec.lines, h]
       Clock.switch(rec, true, now, this.t.idleMs)
       return Clock.left(rec, now, this.t.idleMs)
     })
-    for (const x of dropped) await this.lines.update(x, () => null).catch(() => {})
     return { ok: true, credential, channelId, msRemaining }
   }
 

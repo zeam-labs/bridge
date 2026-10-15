@@ -6,15 +6,232 @@ use ZeamPass\Big;
 
 final class Channels
 {
+    const REFUNDING_TTL_MS = 180000;
+    const JUDGING_TTL_MS = 30000;
+    const JUDGING_POLL_MS = 20;
+
     private $cfg;
     private $store;
     private $chain;
 
-    public function __construct(Config $cfg, Store $store, Chain $chain)
+    public function __construct(?Config $cfg, Store $store, ?Chain $chain = null)
     {
         $this->cfg = $cfg;
         $this->store = $store;
         $this->chain = $chain;
+    }
+
+    public static function refundingWaitMs($c, $now)
+    {
+        $until = ($c === null || !isset($c['refundingUntil'])) ? 0 : (int) $c['refundingUntil'];
+        return $until > $now ? $until - $now : 0;
+    }
+
+    public static function refundingRetrySecs($cfg, $c, $now)
+    {
+        return self::retrySecs($cfg, self::refundingWaitMs($c, $now));
+    }
+
+    public static function retrySecs($cfg, $left)
+    {
+        $look = max(1, (int) ($cfg !== null && isset($cfg->drainWaitMs) ? $cfg->drainWaitMs : Config::DRAIN_WAIT_MS));
+        return max(1, (int) ceil(min($left > 0 ? $left : $look, $look) / 1000));
+    }
+
+    public static function judging($c, $now)
+    {
+        return $c !== null && isset($c['refundingJudging']) && $c['refundingJudging'] === true && self::refundingWaitMs($c, $now) > 0;
+    }
+
+    public static function weighed($c, $now)
+    {
+        if ($c === null || !isset($c['refundsJudged']) || !is_array($c['refundsJudged'])) {
+            return [];
+        }
+        return array_filter($c['refundsJudged'], function ($until) use ($now) {
+            return (int) $until > $now;
+        });
+    }
+
+    public static function beingJudged($c, $now)
+    {
+        return count(self::weighed($c, $now)) > 0;
+    }
+
+    public static function judgedRetrySecs($cfg, $c, $now)
+    {
+        $until = max(array_merge([0], array_map('intval', array_values(self::weighed($c, $now)))));
+        return self::retrySecs($cfg, $until > $now ? $until - $now : 0);
+    }
+
+    public static function held($c, $now, $pending = false)
+    {
+        return self::judging($c, $now) || ($pending && self::beingJudged($c, $now) && self::refundingWaitMs($c, $now) === 0);
+    }
+
+    public static function unweighed(array $r, $holder, $now)
+    {
+        $rest = self::weighed($r, $now);
+        unset($rest[$holder]);
+        if (count($rest) > 0) {
+            $r['refundsJudged'] = $rest;
+        } else {
+            unset($r['refundsJudged']);
+        }
+        return $r;
+    }
+
+    private function nowMs()
+    {
+        return $this->cfg !== null ? $this->cfg->nowMs() : (int) floor(microtime(true) * 1000);
+    }
+
+    private function sleepMs($ms)
+    {
+        if ($this->cfg !== null) {
+            $this->cfg->sleepMs($ms);
+            return;
+        }
+        usleep((int) $ms * 1000);
+    }
+
+    public function judgeWaitMs()
+    {
+        return max(0, (int) ($this->cfg !== null && isset($this->cfg->refundJudgeWaitMs) ? $this->cfg->refundJudgeWaitMs : 5000));
+    }
+
+    public function judged($channelId, $pending = false)
+    {
+        $deadline = $this->nowMs() + $this->judgeWaitMs();
+        for (;;) {
+            $c = $this->get($channelId);
+            $now = $this->nowMs();
+            if (!self::held($c, $now, $pending) || $now >= $deadline) {
+                return $c;
+            }
+            $this->sleepMs(self::JUDGING_POLL_MS);
+        }
+    }
+
+    public function weigh($channelId, $holder)
+    {
+        $deadline = $this->nowMs() + $this->judgeWaitMs();
+        for (;;) {
+            $wait = false;
+            try {
+                $this->update($channelId, function ($r) use ($holder, $deadline, &$wait) {
+                    if ($r === null) {
+                        return $r;
+                    }
+                    $now = $this->nowMs();
+                    $weighed = Channels::weighed($r, $now);
+                    if ($now < $deadline && Channels::judging($r, $now) && !array_key_exists((string) ($r['refundingBy'] ?? ''), $weighed)) {
+                        $wait = true;
+                        return $r;
+                    }
+                    $weighed[$holder] = $now + Channels::JUDGING_TTL_MS;
+                    $r['refundsJudged'] = $weighed;
+                    return $r;
+                });
+            } catch (\Throwable $e) {
+                return false;
+            }
+            if (!$wait) {
+                return true;
+            }
+            $this->sleepMs(self::JUDGING_POLL_MS);
+        }
+    }
+
+    public function unweigh($channelId, $holder)
+    {
+        try {
+            $this->update($channelId, function ($r) use ($holder) {
+                return $r === null ? $r : Channels::unweighed($r, $holder, $this->nowMs());
+            });
+        } catch (\Throwable $e) {
+        }
+    }
+
+    public function mark($channelId, $holder, $refuseOpen = true, $sending = false)
+    {
+        $cfg = $this->cfg;
+        for (;;) {
+            $out = ['ok' => true];
+            try {
+                $this->update($channelId, function ($r) use ($cfg, $holder, $refuseOpen, $sending, &$out) {
+                    if ($r === null) {
+                        return $r;
+                    }
+                    $now = $this->nowMs();
+                    if (Channels::judging($r, $now)) {
+                        $out = ['wait' => true];
+                    } elseif (Channels::refundingWaitMs($r, $now) > 0) {
+                        $out = ['settling' => Channels::refundingRetrySecs($cfg, $r, $now)];
+                    } elseif (!$sending && Channels::beingJudged($r, $now)) {
+                        $out = ['judged' => Channels::judgedRetrySecs($cfg, $r, $now)];
+                    } elseif ($refuseOpen && Channels::pendingLive($r, $now)) {
+                        $out = ['open' => $r, 'at' => $now];
+                    } elseif ($sending) {
+                        $r['refundingUntil'] = $now + Channels::JUDGING_TTL_MS;
+                        $r['refundingBy'] = $holder;
+                        $r['refundingJudging'] = true;
+                    } else {
+                        $r['refundingUntil'] = $now + Channels::JUDGING_TTL_MS;
+                        $r['refundingBy'] = $holder;
+                        $r['refundingJudging'] = true;
+                    }
+                    return $r;
+                });
+            } catch (\Throwable $e) {
+                return ['unavailable' => true];
+            }
+            if (!isset($out['wait'])) {
+                return $out;
+            }
+            $this->sleepMs(self::JUDGING_POLL_MS);
+        }
+    }
+
+    public function sending($channelId, $holder)
+    {
+        $other = null;
+        $cfg = $this->cfg;
+        try {
+            $this->update($channelId, function ($r) use ($cfg, $holder, &$other) {
+                if ($r === null) {
+                    return $r;
+                }
+                $now = $this->nowMs();
+                if (!isset($r['refundingBy']) || $r['refundingBy'] !== $holder || Channels::refundingWaitMs($r, $now) === 0) {
+                    $other = Channels::refundingWaitMs($r, $now) > 0 ? ['settling' => Channels::refundingRetrySecs($cfg, $r, $now)] : ['unavailable' => true];
+                    return $r;
+                }
+                $r['refundingUntil'] = $now + Channels::REFUNDING_TTL_MS;
+                $r['refundingBy'] = $holder;
+                unset($r['refundingJudging']);
+                return Channels::unweighed($r, $holder, $now);
+            });
+        } catch (\Throwable $e) {
+            return ['unavailable' => true];
+        }
+        return $other;
+    }
+
+    public function unmark($channelId, $holder)
+    {
+        try {
+            $this->update($channelId, function ($r) use ($holder) {
+                if ($r === null) {
+                    return $r;
+                }
+                if (isset($r['refundingBy']) && $r['refundingBy'] === $holder) {
+                    unset($r['refundingUntil'], $r['refundingBy'], $r['refundingJudging']);
+                }
+                return Channels::unweighed($r, $holder, $this->nowMs());
+            });
+        } catch (\Throwable $e) {
+        }
     }
 
     public static function n($value)
@@ -71,7 +288,7 @@ final class Channels
             }
         }
         $cfg = $this->cfg;
-        return $this->update($channelId, function ($c) use ($st, $nonce, $now, $cfg) {
+        return $this->update($channelId, function ($c) use ($st, $nonce, $now, $cfg, $channel) {
             if ($c === null) {
                 return null;
             }
@@ -82,6 +299,8 @@ final class Channels
                     $c['balance'] = $st['balance'];
                 }
             } elseif (isset($c['balance']) && Big::cmp(Channels::n($st['balance']), Channels::n($c['balance'])) < 0) {
+                $c['balance'] = $st['balance'];
+            } elseif (isset($c['balance'], $channel['balance']) && Big::cmp(Channels::n($st['balance']), Channels::n($c['balance'])) > 0 && (string) $c['balance'] === (string) $channel['balance'] && Channels::refundingWaitMs($c, $now) === 0) {
                 $c['balance'] = $st['balance'];
             }
             $charged = Channels::n(isset($c['chargedCumulativeAmount']) ? $c['chargedCumulativeAmount'] : '0');

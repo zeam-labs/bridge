@@ -2,9 +2,9 @@ import http from 'node:http'
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js'
 import { z } from 'zod'
-import { pass } from '@zeam-labs/pass'
+import { bridge, setting } from '@zeambridge/bridge'
 
-const agents = pass({ name: process.env.PASS_NAME, payout: process.env.PASS_PAYOUT, price: process.env.PASS_PRICE })
+const agents = bridge({ name: setting('BRIDGE_NAME'), payout: setting('BRIDGE_PAYOUT'), price: setting('BRIDGE_PRICE') })
 
 const build = () => {
   const server = agents.instrument(new McpServer({ name: 'existing-mcp', version: '1.0.0' }), { free: ['about'] })

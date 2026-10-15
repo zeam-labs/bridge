@@ -134,6 +134,42 @@ final class Verify
         throw new \InvalidArgumentException(esc_html('not an unsigned integer: ' . (is_scalar($value) ? (string) $value : gettype($value))));
     }
 
+    const MAX_SAFE = 9007199254740991;
+    const AMOUNT_FORM = 'voucher.maxClaimableAmount is not an unsigned integer: send it as a base-10 or 0x string, or as a whole JSON number up to 9007199254740991';
+
+    public static function amount($value)
+    {
+        if (is_int($value)) {
+            if ($value >= 0 && $value <= self::MAX_SAFE) {
+                return Big::init($value);
+            }
+            throw new \InvalidArgumentException(esc_html('not an unsigned integer a JSON number can carry exactly: ' . $value));
+        }
+        if (is_float($value)) {
+            if (is_finite($value) && floor($value) === $value && $value >= 0 && $value <= self::MAX_SAFE) {
+                return Big::init((int) $value);
+            }
+            throw new \InvalidArgumentException(esc_html('not an unsigned integer a JSON number can carry exactly: ' . $value));
+        }
+        if (is_string($value)) {
+            return self::uint($value);
+        }
+        throw new \InvalidArgumentException(esc_html('not an unsigned integer: ' . (is_scalar($value) ? var_export($value, true) : gettype($value))));
+    }
+
+    public static function normalized($raw)
+    {
+        if (!is_array($raw) || !isset($raw['voucher']) || !is_array($raw['voucher']) || !array_key_exists('maxClaimableAmount', $raw['voucher'])) {
+            return $raw;
+        }
+        try {
+            $raw['voucher']['maxClaimableAmount'] = Big::strval(self::amount($raw['voucher']['maxClaimableAmount']));
+        } catch (\Throwable $e) {
+            return null;
+        }
+        return $raw;
+    }
+
     public function configError(array $config, $channelId, array $req)
     {
         self::strictConfig($config);
@@ -168,7 +204,7 @@ final class Verify
     public static function recovers($address, $digest, $signature)
     {
         try {
-            return Address::equals(Secp256k1::recoverHash($digest, $signature), $address);
+            return Secp256k1::isCanonical($signature) && Address::equals(Secp256k1::recoverHash($digest, $signature), $address);
         } catch (\Throwable $e) {
             return false;
         }
@@ -506,7 +542,7 @@ final class Verify
         }
         $max = self::uint($raw['voucher']['maxClaimableAmount']);
         if (Big::cmp($max, Big::init((string) $channel['balance'], 10)) > 0) {
-            return self::invalid(Reason::EXCEEDS_BALANCE, $payer);
+            return null;
         }
         if (Big::cmp($max, Big::init((string) $channel['totalClaimed'], 10)) <= 0) {
             return self::invalid(Reason::BELOW_CLAIMED, $payer);

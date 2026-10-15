@@ -1,5 +1,5 @@
-Vendored PHP dependencies for the ZEAM Pass settlement core.
-Resolved with composer 2 (docker image composer:2) on 2026-09-26: composer require simplito/elliptic-php kornrunner/keccak
+Vendored PHP dependencies for the ZEAM Bridge settlement core.
+Resolved with Composer 2 on 2026-09-26: composer require simplito/elliptic-php kornrunner/keccak
 Only library sources and license files are copied; tests, docs, benchmarks and build files are left out.
 Comments are removed from the PHP sources (PHP tokenizer: T_COMMENT and T_DOC_COMMENT tokens, trailing whitespace, runs of blank lines), 2026-10-01; the code is otherwise upstream's. License files are verbatim.
 Loaded by ../autoload.php; no Composer at runtime.

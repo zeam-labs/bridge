@@ -44,7 +44,7 @@ final class Credits
     public function addNote($note, $issuer, $sellerPayout, $name)
     {
         if (!$issuer || !Address::isAddress($issuer)) {
-            return ['ok' => false, 'why' => 'this Pass has no credit issuer set'];
+            return ['ok' => false, 'why' => 'this Bridge has no credit issuer set'];
         }
         if (!is_array($note)) {
             return ['ok' => false, 'why' => 'not a credit note'];
@@ -133,7 +133,7 @@ final class Credits
             return self::fail('bad_checks', 'checks is a multiple of 1,000');
         }
         if (!Address::isAddress($sellerPayout) || !preg_match('/^[a-z][a-z0-9-]{1,31}$/D', (string) $name)) {
-            return self::fail('bad_seller', 'seller is the seller\'s payout address and name its Pass name');
+            return self::fail('bad_seller', 'seller is the seller\'s payout address and name its Bridge name');
         }
         $url = self::creditRequestUrl($creditUrl, $checks, $sellerPayout, $name);
         try {
@@ -189,7 +189,7 @@ final class Credits
         if (!is_array($note)) {
             return self::fail('not_bought', 'the credit service answered 200 without a note', 200);
         }
-        $added = $this->issuer ? $this->addNote($note, $this->issuer, $sellerPayout, $name) : ['ok' => false, 'why' => 'this Pass has no credit issuer set'];
+        $added = $this->issuer ? $this->addNote($note, $this->issuer, $sellerPayout, $name) : ['ok' => false, 'why' => 'this Bridge has no credit issuer set'];
         return ['ok' => $added['ok'], 'note' => $note, 'added' => $added];
     }
 }

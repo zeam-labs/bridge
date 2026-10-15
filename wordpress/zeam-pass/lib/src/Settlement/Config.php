@@ -17,6 +17,7 @@ final class Config
     const SCHEME = 'batch-settlement';
     const WITHDRAW_DELAY = 86400;
     const MAX_TIMEOUT_SECONDS = 240;
+    const DRAIN_WAIT_MS = 2000;
     const FEE_SHARE = 0.0999;
     const GAS = [
         'deposit' => 145000,
@@ -24,6 +25,7 @@ final class Config
         'claimEntry' => 45000,
         'claimAlone' => 80000,
         'payout' => 210000,
+        'charge' => 80000,
         'createSplit' => 280000,
         'refund' => 97000,
         'refundClaim' => 37000,
@@ -74,11 +76,13 @@ final class Config
     public $receiptPollMs = 1000;
     public $stateCatchUpMs = 2000;
     public $drainTries = 15;
-    public $drainWaitMs = 2000;
+    public $drainWaitMs = self::DRAIN_WAIT_MS;
     public $repairEveryMs = 60000;
     public $gasPaymentSecs = 300;
+    public $refundJudgeWaitMs = 5000;
     public $cache;
     public $meter = null;
+    public $holds;
 
     private $receiverAuthorizerKey;
     private $clock;
@@ -115,7 +119,7 @@ final class Config
         foreach ([
             'withdrawDelay', 'maxTimeoutSeconds', 'depositFloorMicroUSD', 'wethUSD', 'gasPriceWei', 'feeShare', 'gasBuffer',
             'floorMargin', 'idleClaimSecs', 'maxClaimsPerBatch', 'payoutMinUnits', 'refundWindowSecs', 'refundUrl',
-            'receiptTimeoutSecs', 'receiptPollMs', 'stateCatchUpMs', 'drainTries', 'drainWaitMs', 'repairEveryMs', 'gasPaymentSecs',
+            'receiptTimeoutSecs', 'receiptPollMs', 'stateCatchUpMs', 'drainTries', 'drainWaitMs', 'repairEveryMs', 'gasPaymentSecs', 'refundJudgeWaitMs',
         ] as $k) {
             if (array_key_exists($k, $o)) {
                 $this->$k = $o[$k];
@@ -137,6 +141,7 @@ final class Config
         $this->sleeper = isset($o['sleep']) && is_callable($o['sleep']) ? $o['sleep'] : null;
         $this->cache = isset($o['cache']) && $o['cache'] instanceof Cache ? $o['cache'] : new ArrayCache($this->clock);
         $this->meter = isset($o['meter']) && $o['meter'] instanceof TimeMeter ? $o['meter'] : null;
+        $this->holds = isset($o['holds']) && $o['holds'] instanceof Holds ? $o['holds'] : new CacheHolds($this->cache);
     }
 
     public static function usdc()
@@ -224,6 +229,11 @@ final class Config
     public function signingKey()
     {
         return $this->receiverAuthorizerKey;
+    }
+
+    public function mppSecret()
+    {
+        return hash_hmac('sha256', 'zeam-pass/mpp-challenge-binding', Hex::toBin($this->receiverAuthorizerKey), true);
     }
 
     public function nowMs()

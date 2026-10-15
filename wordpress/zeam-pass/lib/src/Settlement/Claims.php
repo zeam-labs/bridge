@@ -27,7 +27,7 @@ final class Claims
         $this->payout = new Payout($cfg, $this->chain);
     }
 
-    public function worthClaiming(array $asset, array $all)
+    public function claimable(array $asset, array $all)
     {
         $now = $this->cfg->nowMs();
         $found = [];
@@ -75,6 +75,14 @@ final class Claims
         $rest = array_values(array_filter($found, function ($x) {
             return !$x['urgent'];
         }));
+        return ['urgent' => $urgent, 'rest' => $rest];
+    }
+
+    public function worthClaiming(array $asset, array $all, $found = null)
+    {
+        $found = $found !== null ? $found : $this->claimable($asset, $all);
+        $urgent = $found['urgent'];
+        $rest = $found['rest'];
         if ($rest === []) {
             return $urgent;
         }
@@ -111,20 +119,38 @@ final class Claims
 
     private function runAsset(array $asset, array $all)
     {
-        $selected = array_slice($this->worthClaiming($asset, $all), 0, max(1, (int) $this->cfg->maxClaimsPerBatch));
+        $cap = max(1, (int) $this->cfg->maxClaimsPerBatch);
+        $found = $this->claimable($asset, $all);
+        $wide = array_slice(array_merge($found['urgent'], $found['rest']), 0, $cap);
+        $selected = array_slice($this->worthClaiming($asset, $all, $found), 0, $cap);
+        $planFor = function ($riding) use ($asset) {
+            try {
+                return $this->payout->calls($asset['address'], $riding);
+            } catch (\Throwable $e) {
+                return ['calls' => [], 'owed' => '0', 'held' => '0', 'error' => \ZeamPass\message($e)];
+            }
+        };
+        $plan = $planFor($selected !== []);
+        $quoted = null;
+        $widePlan = count($wide) === count($selected) ? $plan : $planFor($wide !== []);
+        if ($widePlan['calls'] !== []) {
+            $quoted = $this->relay->sendQuote(array_merge($wide !== [] ? [$this->claimCall($wide)] : [], $widePlan['calls']), $this->cfg->relaySplit());
+            if ($quoted !== null) {
+                $selected = $wide;
+                $plan = $widePlan;
+            }
+        }
         $riding = Big::init(0);
         foreach ($selected as $x) {
             $riding = Big::add($riding, Big::init($x['units'], 10));
         }
-        try {
-            $plan = $this->payout->calls($asset['address'], $selected !== []);
-        } catch (\Throwable $e) {
-            $plan = ['calls' => [], 'owed' => '0', 'held' => '0', 'error' => \ZeamPass\message($e)];
-        }
         $payoutCalls = $plan['calls'];
         $usd = 0.0;
-        $payoutOk = false;
-        if ($payoutCalls !== []) {
+        $payoutOk = $quoted !== null && $quoted['covered'];
+        if ($payoutCalls !== [] && $quoted !== null) {
+            $units = Big::strval(Big::add(Big::add($riding, Big::init($plan['owed'], 10)), Big::init($plan['held'], 10)));
+            $usd = $this->cfg->microUSDOf($asset, $units) / 1e6;
+        } elseif ($payoutCalls !== []) {
             $units = Big::strval(Big::add(Big::add($riding, Big::init($plan['owed'], 10)), Big::init($plan['held'], 10)));
             $usd = $this->cfg->microUSDOf($asset, $units) / 1e6;
             $gasUnits = $this->cfg->gas['payout'] + ($selected !== [] ? $this->cfg->gas['claimBase'] + count($selected) * $this->cfg->gas['claimEntry'] : 0);
@@ -165,11 +191,26 @@ final class Claims
             $out['calls'][] = ['what' => $call['what']] + $results[$i];
         }
         if ($claiming !== [] && isset($results[0]['hash'])) {
+            $deadline = $this->cfg->nowMs() + $this->cfg->stateCatchUpMs;
             foreach ($claiming as $x) {
                 $id = $x['c']['channelId'];
-                try {
-                    $st = $this->chain->channel($id);
-                } catch (\Throwable $e) {
+                $expected = Channels::n($x['c']['chargedCumulativeAmount']);
+                $st = null;
+                while (true) {
+                    try {
+                        $st = $this->chain->channel($id);
+                    } catch (\Throwable $e) {
+                        $st = null;
+                    }
+                    if ($st !== null && Big::cmp(Channels::n($st['totalClaimed']), $expected) >= 0) {
+                        break;
+                    }
+                    if ($this->cfg->nowMs() >= $deadline) {
+                        break;
+                    }
+                    $this->cfg->sleepMs(150);
+                }
+                if ($st === null) {
                     continue;
                 }
                 $this->channels->update($id, function ($r) use ($st) {

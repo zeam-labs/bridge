@@ -34,6 +34,7 @@ const ZEAM_PASS_DEFAULT_CREDITS = 'https://api.zeampass.com/credits';
 const ZEAM_PASS_DEFAULT_RPC = 'https://mainnet.base.org';
 const ZEAM_PASS_MULTICALL3 = '0xcA11bde05977b3631167028862bE2a173976CA11';
 const ZEAM_PASS_MODES = ['paywall', 'gate', 'both'];
+const ZEAM_PASS_CALL_KEPT_MS = 86400000;
 const ZEAM_PASS_BAD_GRANT_HOW = 'Send a new x-grant: signed by an admitted key, delegate = the key that signs this call. ZEAM Pass agent guide, section 3.';
 const ZEAM_PASS_GRANTED_BY = 'X-Pass-Granted-By';
 
@@ -82,17 +83,19 @@ function zeam_pass_gated_mode()
 
 function zeam_pass_fee_recipient()
 {
-    return defined('ZEAM_PASS_FEE_RECIPIENT') && is_string(ZEAM_PASS_FEE_RECIPIENT) && ZEAM_PASS_FEE_RECIPIENT !== '' ? ZEAM_PASS_FEE_RECIPIENT : ZEAM_PASS_DEFAULT_FEE_RECIPIENT;
+    $set = zeam_pass_defined('FEE_RECIPIENT');
+    return is_string($set) && $set !== '' ? $set : ZEAM_PASS_DEFAULT_FEE_RECIPIENT;
 }
 
 function zeam_pass_payout_is_fee_recipient()
 {
-    return defined('ZEAM_PASS_PAYOUT_IS_FEE_RECIPIENT') && ZEAM_PASS_PAYOUT_IS_FEE_RECIPIENT === true;
+    return zeam_pass_defined('PAYOUT_IS_FEE_RECIPIENT') === true;
 }
 
 function zeam_pass_credit_issuer()
 {
-    return defined('ZEAM_PASS_CREDIT_ISSUER') && is_string(ZEAM_PASS_CREDIT_ISSUER) && ZEAM_PASS_CREDIT_ISSUER !== '' ? ZEAM_PASS_CREDIT_ISSUER : ZEAM_PASS_DEFAULT_CREDIT_ISSUER;
+    $set = zeam_pass_defined('CREDIT_ISSUER');
+    return is_string($set) && $set !== '' ? $set : ZEAM_PASS_DEFAULT_CREDIT_ISSUER;
 }
 
 function zeam_pass_url_opt($key, $default)
@@ -136,14 +139,22 @@ function zeam_pass_payout()
     return preg_match('/^0x[0-9a-fA-F]{40}$/D', $payout) ? $payout : '';
 }
 
-function zeam_pass_price_micro()
+function zeam_pass_usd_micro($price)
 {
-    $price = trim((string) zeam_pass_opt('price', ''));
+    $price = trim((string) $price);
     if (!preg_match('/^\d+(\.\d{1,6})?$/D', $price)) {
         return 0;
     }
-    $micro = (int) round((float) $price * 1000000);
-    return $micro >= 1 && $micro <= 1000000000 ? $micro : 0;
+    try {
+        return \ZeamPass\Pricing::microOf($price);
+    } catch (\InvalidArgumentException $e) {
+        return 0;
+    }
+}
+
+function zeam_pass_price_micro()
+{
+    return zeam_pass_usd_micro(zeam_pass_opt('price', ''));
 }
 
 function zeam_pass_admit_list()
@@ -180,7 +191,7 @@ function zeam_pass_blockers()
     if (zeam_pass_payout() === '') {
         $out[] = 'no wallet is connected';
     } elseif ((strtolower(zeam_pass_payout()) === strtolower(zeam_pass_fee_recipient())) !== zeam_pass_payout_is_fee_recipient()) {
-        $out[] = zeam_pass_payout_is_fee_recipient() ? 'ZEAM_PASS_PAYOUT_IS_FEE_RECIPIENT needs the wallet to be the fee recipient' : 'the wallet is the fee recipient; define ZEAM_PASS_PAYOUT_IS_FEE_RECIPIENT as true to pay it 100%';
+        $out[] = zeam_pass_payout_is_fee_recipient() ? 'ZEAM_BRIDGE_PAYOUT_IS_FEE_RECIPIENT needs the wallet to be the fee recipient' : 'the wallet is the fee recipient; define ZEAM_BRIDGE_PAYOUT_IS_FEE_RECIPIENT as true to pay it 100%';
     }
     if (zeam_pass_paid_mode() && zeam_pass_price_micro() < 1) {
         $out[] = 'no price per call is set';
@@ -190,7 +201,7 @@ function zeam_pass_blockers()
         if ($state === 'missing') {
             $out[] = 'the settle key has not been generated';
         } elseif ($state === 'locked') {
-            $out[] = 'the settle key cannot be decrypted: restore the ZEAM_PASS_KEY and WordPress salts it was made with';
+            $out[] = 'the settle key cannot be decrypted: restore ' . zeam_pass_locked_restore('settle');
         }
     }
     return $out;
@@ -236,6 +247,7 @@ function zeam_pass_engine($fresh = false)
         'rpcUrl' => zeam_pass_rpc_url(),
         'refundUrl' => rest_url(ZEAM_PASS_NS . '/refund'),
         'cache' => new ZeamPassCache(),
+        'holds' => new ZeamPassHolds(),
         'meter' => zeam_pass_time_meter(),
     ]);
     $store = new ZeamPassChannelStore();
@@ -288,7 +300,20 @@ function zeam_pass_payer_of(array $payload)
         return strtolower($auth);
     }
     $payer = isset($cfg['payer']) && is_string($cfg['payer']) ? $cfg['payer'] : '';
-    return preg_match('/^0x[0-9a-fA-F]{40}$/D', $payer) ? strtolower($payer) : null;
+    if (preg_match('/^0x[0-9a-fA-F]{40}$/D', $payer)) {
+        return strtolower($payer);
+    }
+    $from = isset($payload['payload']['authorization']['from']) && is_string($payload['payload']['authorization']['from']) ? $payload['payload']['authorization']['from'] : '';
+    return preg_match('/^0x[0-9a-fA-F]{40}$/D', $from) ? strtolower($from) : null;
+}
+
+function zeam_pass_channels()
+{
+    try {
+        return zeam_pass_engine()['server']->channels();
+    } catch (Throwable $e) {
+        return new \ZeamPass\Settlement\Channels(null, new ZeamPassChannelStore());
+    }
 }
 
 function zeam_pass_admits_payer($who, $grantHeader, $tool)
@@ -304,10 +329,15 @@ function zeam_pass_admits_payer($who, $grantHeader, $tool)
     return $a['ok'] ? ['ok' => true, 'root' => strtolower((string) $a['root'])] : $a;
 }
 
-function zeam_pass_tool_failed($out)
+function zeam_pass_tool_failed($out, $tool)
 {
     $data = $out->get_error_data();
-    return zeam_pass_refusal((int) (isset($data['status']) ? $data['status'] : 500), ['error' => $out->get_error_code(), 'message' => $out->get_error_message()]);
+    $fields = is_array($data) ? $data : [];
+    $given = isset($fields['status']) && is_numeric($fields['status']) ? (int) $fields['status'] : null;
+    $status = is_int($given) && $given >= 400 && $given <= 599 && $given !== 402 ? $given : 500;
+    unset($fields['status']);
+    $wait = $fields['retry_after_seconds'] ?? null;
+    return zeam_pass_refusal($status, ['error' => $out->get_error_code(), 'message' => $out->get_error_message(), 'tool' => $tool] + $fields, is_int($wait) && $wait > 0 ? ['Retry-After' => (string) $wait] : []);
 }
 
 function zeam_pass_free_take($tool, $who)
@@ -335,7 +365,7 @@ function zeam_pass_serve_free($tool, array $args, $who)
     }
     $out = zeam_pass_run_safely($tool, $args, new ZeamPassMeter());
     if (is_wp_error($out)) {
-        return zeam_pass_tool_failed($out);
+        return zeam_pass_tool_failed($out, $tool);
     }
     return ['delivered' => true, 'status' => 200, 'headers' => [], 'body' => $out];
 }
@@ -349,11 +379,74 @@ function zeam_pass_charge_units(array $e, array $hold, $price, $units)
     return $micro === 0 ? '0' : $e['cfg']->unitsOfMicroUSD($e['cfg']->assetOf($hold['requirement']['asset']), $micro);
 }
 
-function zeam_pass_serve_paid($tool, $resource, array $args, $payment, $grant, $both, $price = null, $bound = null, $extensions = null)
+function zeam_pass_bad_grant($server, $resource, $why, $price, array $listing, $extensions)
+{
+    $q = $server->paymentRequired($resource, $extensions, null, ['admission' => 'Only admitted keys pay here, or keys with an x-grant from an admitted key.', 'contact' => zeam_pass_contact()] + $listing + ['error' => 'bad_grant'], $price);
+    return zeam_pass_refusal(402, array_merge($q['body'], ['message' => $why, 'how' => ZEAM_PASS_BAD_GRANT_HOW]), $q['headers']);
+}
+
+function zeam_pass_serve_mpp($server, $tool, $resource, array $args, $credential, $grant, $both, $price, $bound, array $listing = [], $extensions = null)
+{
+    zeam_pass_allow_seconds(180);
+    $held = $server->mppHold($credential, $resource, is_array($price) ? $price['micro'] : null);
+    if (!$held['ok']) {
+        return zeam_pass_refusal($held['status'], $held['body'], $held['headers']);
+    }
+    $hold = $held['hold'];
+    $grantedBy = null;
+    if ($both) {
+        $who = strtolower($hold['verified']['payer']);
+        $a = zeam_pass_admits_payer($who, $grant, $tool);
+        if (!$a['ok']) {
+            $server->mppRelease($hold);
+            if ($a['code'] === 'bad_grant') {
+                return zeam_pass_bad_grant($server, $resource, $a['why'], $price, $listing, $extensions);
+            }
+            return zeam_pass_refusal(403, ['error' => 'refused', 'message' => $a['why'], 'how' => zeam_pass_refused_how(), 'contact' => zeam_pass_contact()]);
+        }
+        if ($a['root'] !== $who) {
+            $grantedBy = $a['root'];
+        }
+    }
+    $started = zeam_pass_now_ms();
+    $call = zeam_pass_call_open();
+    if ($call !== null) {
+        register_shutdown_function('zeam_pass_call_close', $call);
+    }
+    $meter = new ZeamPassMeter($bound === null ? null : $started + $bound, null, $call);
+    $out = zeam_pass_run_safely($tool, $args, $meter);
+    $cut = zeam_pass_call_ended($call, $meter, zeam_pass_now_ms());
+    if ($bound !== null && zeam_pass_now_ms() - $started > $bound) {
+        $server->mppRelease($hold);
+        return zeam_pass_refusal(402, zeam_pass_out_of_time(false, $bound));
+    }
+    if ($cut !== null) {
+        $server->mppRelease($hold);
+        return zeam_pass_refusal(499, zeam_pass_hung_up(false) + ['tool' => $tool]);
+    }
+    if (is_wp_error($out)) {
+        $server->mppRelease($hold);
+        return zeam_pass_tool_failed($out, $tool);
+    }
+    $settled = $server->mppSettle($hold);
+    if (!$settled['ok']) {
+        return zeam_pass_refusal($settled['status'], $settled['body'], $settled['headers']);
+    }
+    $headers = $settled['headers'];
+    if ($grantedBy !== null) {
+        $headers[ZEAM_PASS_GRANTED_BY] = $grantedBy;
+    }
+    return ['delivered' => true, 'status' => 200, 'headers' => $headers, 'body' => $out];
+}
+
+function zeam_pass_serve_paid($tool, $resource, array $args, $payment, $grant, $both, $price = null, $bound = null, $extensions = null, $credential = '')
 {
     $e = zeam_pass_engine();
     $server = $e['server'];
     $listing = zeam_pass_listing();
+    if ($payment === '' && $credential !== '' && \ZeamPass\Settlement\Server::mppOffered($price)) {
+        return zeam_pass_serve_mpp($server, $tool, $resource, $args, $credential, $grant, $both, $price, $bound, $listing, $extensions);
+    }
     if ($payment === '') {
         $q = $server->paymentRequired($resource, $extensions, null, ($both ? ['admission' => 'Only admitted keys pay here, or keys with an x-grant from an admitted key.', 'contact' => zeam_pass_contact()] : ['contact' => zeam_pass_contact()]) + $listing, $price);
         return zeam_pass_refusal($q['status'], $q['body'], $q['headers']);
@@ -363,10 +456,13 @@ function zeam_pass_serve_paid($tool, $resource, array $args, $payment, $grant, $
         $payload = \ZeamPass\Settlement\Json::decodeHeader($payment);
         if ($payload !== null) {
             $who = zeam_pass_payer_of($payload);
+            $bad = $who === null ? $server->malformed($payment) : null;
+            if ($bad !== null) {
+                return zeam_pass_refusal($bad['status'], $bad['body'], $bad['headers']);
+            }
             $a = zeam_pass_admits_payer($who, $grant, $tool);
             if (!$a['ok'] && $a['code'] === 'bad_grant') {
-                $q = $server->paymentRequired($resource, $extensions, null, ['admission' => 'Only admitted keys pay here, or keys with an x-grant from an admitted key.', 'contact' => zeam_pass_contact()] + $listing + ['error' => 'bad_grant'], $price);
-                return zeam_pass_refusal(402, array_merge($q['body'], ['message' => $a['why'], 'how' => ZEAM_PASS_BAD_GRANT_HOW]), $q['headers']);
+                return zeam_pass_bad_grant($server, $resource, $a['why'], $price, $listing, $extensions);
             }
             if (!$a['ok']) {
                 return zeam_pass_refusal(403, ['error' => 'refused', 'message' => $a['why'], 'how' => zeam_pass_refused_how(), 'contact' => zeam_pass_contact()]);
@@ -383,40 +479,49 @@ function zeam_pass_serve_paid($tool, $resource, array $args, $payment, $grant, $
     }
     $hold = $held['hold'];
     $started = zeam_pass_now_ms();
-    $meter = new ZeamPassMeter($bound === null ? null : $started + $bound, $hold['channelId']);
+    $call = zeam_pass_call_open();
+    if ($call !== null) {
+        register_shutdown_function('zeam_pass_call_close', $call);
+    }
+    $meter = new ZeamPassMeter($bound === null ? null : $started + $bound, $hold['channelId'], $call);
     $out = zeam_pass_run_safely($tool, $args, $meter);
+    $cut = zeam_pass_call_ended($call, $meter, zeam_pass_now_ms());
     if ($bound !== null && zeam_pass_now_ms() - $started > $bound) {
         $server->release($hold);
         return zeam_pass_refusal(402, zeam_pass_out_of_time(false, $bound));
     }
+    if ($cut !== null) {
+        $server->release($hold);
+        return zeam_pass_refusal(499, zeam_pass_hung_up(false) + ['tool' => $tool]);
+    }
     if (is_wp_error($out)) {
         $server->release($hold);
-        return zeam_pass_tool_failed($out);
+        return zeam_pass_tool_failed($out, $tool);
     }
     $metered = is_array($price) && isset($price['unitMicro']) && $price['unitMicro'] !== null;
     if ($metered && $meter->reported() === null) {
         $server->release($hold);
-        return zeam_pass_refusal(500, ['error' => 'tool_failed', 'message' => ZEAM_PASS_NO_UNITS]);
+        return zeam_pass_refusal(500, ['error' => 'tool_failed', 'message' => ZEAM_PASS_NO_UNITS, 'tool' => $tool]);
     }
-    $bought = null;
-    if ((zeam_pass_tools()[$tool]['builtin'] ?? null) === 'buy_time') {
-        $bought = ['channelId' => $hold['channelId'], 'ms' => zeam_pass_bought_ms($args), 'key' => $hold['pendingId']];
+    $bought = ((zeam_pass_tools()[$tool]['builtin'] ?? null) === 'buy_time')
+        ? ['channelId' => $hold['channelId'], 'ms' => zeam_pass_bought_ms($args), 'key' => $hold['pendingId']]
+        : null;
+    $settled = $server->settle($hold, $metered ? zeam_pass_charge_units($e, $hold, $price, $meter->reported()) : null);
+    if (!$settled['ok']) {
+        return zeam_pass_refusal($settled['status'], $settled['body'], $settled['headers']);
+    }
+    if ($bought !== null) {
         try {
             zeam_pass_time_meter()->credit($bought['channelId'], $bought['ms'], $bought['key']);
         } catch (Throwable $ex) {
-            $server->release($hold);
-            return zeam_pass_refusal(500, ['error' => 'tool_failed', 'message' => 'the time could not be recorded, so nothing was charged: ' . \ZeamPass\message($ex)]);
+            return zeam_pass_refusal(500, ['error' => 'tool_failed', 'message' => 'the payment settled but the time could not be recorded: ' . \ZeamPass\message($ex), 'tool' => $tool]);
         }
-    }
-    $settled = $server->settle($hold, $metered ? zeam_pass_charge_units($e, $hold, $price, $meter->reported()) : null);
-    if (!$settled['ok']) {
-        if ($bought !== null) {
+        if (is_array($out) && array_key_exists('msRemaining', $out)) {
             try {
-                zeam_pass_time_meter()->uncredit($bought['channelId'], $bought['ms'], $bought['key']);
+                $out['msRemaining'] = zeam_pass_time_meter()->status($bought['channelId'])['msRemaining'];
             } catch (Throwable $ex) {
             }
         }
-        return zeam_pass_refusal($settled['status'], $settled['body'], $settled['headers']);
     }
     $headers = ['PAYMENT-RESPONSE' => $settled['headers']['PAYMENT-RESPONSE']];
     if ($grantedBy !== null) {
@@ -430,35 +535,228 @@ function zeam_pass_out_of_time($onLine, $ms = null)
     return ['error' => 'out_of_time', 'message' => $onLine ? 'the line ran out of time during the call. Its time is spent. Buy time: buy_time.' : "the call ran past the {$ms} ms its price buys. Nothing was charged. Buy time and call on a line."];
 }
 
+function zeam_pass_hung_up($onLine)
+{
+    return ['error' => 'client_gone', 'message' => 'the caller hung up or canceled the call, so it was stopped. ' . ($onLine ? 'The line is billed for the time the call ran, nothing after.' : 'Nothing was charged.')];
+}
+
+function zeam_pass_caller_gone(...$set)
+{
+    static $gone = null;
+    if ($set) {
+        $gone = $set[0] === null ? null : (bool) $set[0];
+    }
+    return $gone !== null ? $gone : connection_aborted() === 1;
+}
+
+function zeam_pass_call_key($id)
+{
+    if (is_string($id)) {
+        return '0x' . hash('sha256', 'string ' . $id);
+    }
+    return (is_int($id) || is_float($id)) ? '0x' . hash('sha256', 'number ' . json_encode((float) $id)) : null;
+}
+
+function zeam_pass_callers($named = null)
+{
+    $line = is_string($named) && trim($named) !== '' ? trim($named) : trim((string) zeam_pass_request_line());
+    $session = trim((string) zeam_pass_request_session());
+    $by = [];
+    if ($line !== '') {
+        $by[] = hash('sha256', 'line ' . $line);
+    }
+    if (\ZeamPass\Settlement\Mpp::mcpInSession($session) || preg_match(ZEAM_PASS_MCP_SESSION, $session) === 1) {
+        $by[] = hash('sha256', 'session ' . $session);
+    }
+    return $by;
+}
+
+function zeam_pass_call_open($channelId = null, $meterId = null, $started = null, $deadline = null)
+{
+    $asked = zeam_pass_request_call();
+    if (!is_array($asked) || ($asked['key'] ?? null) === null || empty($asked['by'])) {
+        return null;
+    }
+    $handle = ['key' => $asked['key'], 'id' => bin2hex(random_bytes(8))];
+    $now = zeam_pass_now_ms();
+    $entry = ['by' => array_values($asked['by']), 'channelId' => $channelId, 'call' => $meterId, 'started' => $started, 'deadline' => $deadline, 'at' => $now, 'cutAt' => null];
+    try {
+        (new ZeamPassMeterStore('call'))->update($handle['key'], function ($rec) use ($handle, $entry, $now) {
+            $calls = [];
+            foreach ((array) ($rec['calls'] ?? []) as $k => $c) {
+                if ($now - (int) ($c['at'] ?? 0) <= ZEAM_PASS_CALL_KEPT_MS) {
+                    $calls[$k] = $c;
+                }
+            }
+            $calls[$handle['id']] = $entry;
+            return ['calls' => $calls];
+        });
+    } catch (\Throwable $e) {
+        return null;
+    }
+    return $handle;
+}
+
+function zeam_pass_call_cut($handle)
+{
+    if (is_array($handle)) {
+        try {
+            $rec = (new ZeamPassMeterStore('call'))->get($handle['key']);
+        } catch (\Throwable $e) {
+            $rec = null;
+        }
+        $at = $rec['calls'][$handle['id']]['cutAt'] ?? null;
+        if ($at !== null) {
+            return (int) $at;
+        }
+    }
+    return zeam_pass_caller_gone() ? zeam_pass_now_ms() : null;
+}
+
+function zeam_pass_call_close($handle)
+{
+    if (!is_array($handle)) {
+        return null;
+    }
+    $entry = null;
+    try {
+        (new ZeamPassMeterStore('call'))->update($handle['key'], function ($rec) use ($handle, &$entry) {
+            $calls = (array) ($rec['calls'] ?? []);
+            $entry = $calls[$handle['id']] ?? null;
+            unset($calls[$handle['id']]);
+            return $calls === [] ? null : ['calls' => $calls];
+        });
+    } catch (\Throwable $e) {
+        return null;
+    }
+    return $entry;
+}
+
+function zeam_pass_call_ended($handle, ZeamPassMeter $meter, $stopped)
+{
+    $entry = zeam_pass_call_close($handle);
+    $cut = $entry['cutAt'] ?? null;
+    if ($cut === null && zeam_pass_caller_gone()) {
+        $cut = $meter->cutAt() ?? $stopped;
+    }
+    return $cut === null ? null : min((int) $cut, (int) $stopped);
+}
+
+function zeam_pass_call_cancel($key, array $by)
+{
+    $store = new ZeamPassMeterStore('call');
+    $holds = function ($c) use ($by) {
+        return ($c['cutAt'] ?? null) === null && array_intersect($by, (array) ($c['by'] ?? [])) !== [];
+    };
+    $now = zeam_pass_now_ms();
+    if (array_filter((array) ($store->get($key)['calls'] ?? []), $holds) === []) {
+        return 0;
+    }
+    $hit = [];
+    $store->update($key, function ($rec) use ($holds, $now, &$hit) {
+        $calls = (array) ($rec['calls'] ?? []);
+        foreach ($calls as $id => $c) {
+            if ($holds($c)) {
+                $calls[$id]['cutAt'] = $now;
+                $hit[] = $calls[$id];
+            }
+        }
+        return $calls === [] ? null : ['calls' => $calls];
+    });
+    foreach ($hit as $c) {
+        if (is_string($c['channelId'] ?? null) && is_string($c['call'] ?? null)) {
+            zeam_pass_time_meter()->end($c['channelId'], $c['call'], $c['started'] ?? null, $now);
+        }
+    }
+    return count($hit);
+}
+
 function zeam_pass_serve_on_line($tool, array $args, $credential)
 {
     $meter = zeam_pass_time_meter();
     $channelId = $meter->line($credential);
     if ($channelId === null) {
-        return zeam_pass_refusal(403, ['error' => 'line_unknown', 'message' => 'no open line with that credential. Open one: POST <base>/line {"op":"open","channelId"}.']);
+        return zeam_pass_refusal(403, ['error' => 'line_unknown', 'message' => 'no open line with that credential. Open one: POST {"op":"open","channelId":"0x…"} to this seller\'s line route, the address its 402 time line names.']);
     }
-    $ch = (new ZeamPassChannelStore())->get($channelId);
+    $ch = zeam_pass_channels()->judged($channelId);
     if ($ch === null) {
         return zeam_pass_refusal(403, ['error' => 'line_unknown', 'message' => 'no channel for this line.']);
     }
     if ((int) ($ch['withdrawRequestedAt'] ?? 0) > 0) {
         return zeam_pass_refusal(402, ['error' => 'channel_leaving', 'message' => 'this channel is withdrawing. Open a new channel.']);
     }
+    if (\ZeamPass\Settlement\Channels::refundingWaitMs($ch, $meter->nowMs()) > 0) {
+        $secs = \ZeamPass\Settlement\Channels::refundingRetrySecs(null, $ch, $meter->nowMs());
+        return zeam_pass_refusal(402, ['error' => 'refund_settling', 'message' => "a refund is settling on this channel, retry in {$secs}s.", 'retry_after_seconds' => $secs]);
+    }
+    if (zeam_pass_caller_gone()) {
+        return zeam_pass_refusal(499, zeam_pass_hung_up(true));
+    }
     $id = bin2hex(random_bytes(8));
     $b = $meter->begin($channelId, $id);
     if (!$b['ok']) {
-        return zeam_pass_refusal(402, ['error' => $b['code'], 'message' => $b['code'] === 'meter_off' ? 'the meter is off. Send {"op":"on"} to the line.' : 'this line has no time left. Buy time: buy_time.', 'msRemaining' => $meter->status($channelId)['msRemaining']]);
+        $msRemaining = $meter->status($channelId)['msRemaining'];
+        if ($b['code'] === 'too_many_calls') {
+            return zeam_pass_refusal(429, ['error' => 'too_many_calls', 'message' => 'too many calls are live on this line; wait for one to finish, then retry.', 'msRemaining' => $msRemaining]);
+        }
+        return zeam_pass_refusal(402, ['error' => $b['code'], 'message' => $b['code'] === 'meter_off' ? 'the meter is off. Switch it on: POST ' . rest_url(ZEAM_PASS_NS . '/line') . ' {"op":"on","credential":"<yours>"}.' : 'this line has no time left. Buy time: buy_time.', 'msRemaining' => $msRemaining]);
     }
     zeam_pass_allow_seconds(max(180, (int) ceil(($b['deadline'] - zeam_pass_now_ms()) / 1000) + 60));
-    $out = zeam_pass_run_safely($tool, $args, new ZeamPassMeter($b['deadline'], $channelId));
-    $e = $meter->end($channelId, $id, $b['started'], $meter->nowMs());
+    $open = new ArrayObject(['open' => true]);
+    $call = zeam_pass_call_open($channelId, $id, $b['started'], $b['deadline']);
+    register_shutdown_function('zeam_pass_line_abandoned', $meter, $channelId, $id, $b['started'], $open, $call);
+    $told = new ZeamPassMeter($b['deadline'], $channelId, $call);
+    $out = zeam_pass_run_safely($tool, $args, $told);
+    $stopped = $meter->nowMs();
+    $cut = zeam_pass_call_ended($call, $told, $stopped);
+    if ($cut !== null) {
+        $e = $meter->end($channelId, $id, $b['started'], $cut);
+        $open['open'] = false;
+        if ($cut > $b['deadline']) {
+            return zeam_pass_refusal(402, zeam_pass_out_of_time(true) + ['msRemaining' => $e['msRemaining']]);
+        }
+        $elapsed = max(0, $cut - $b['started']);
+        return zeam_pass_line_read(zeam_pass_refusal(499, zeam_pass_hung_up(true) + ['msRemaining' => $e['msRemaining'], 'elapsedMs' => $elapsed]), $channelId, $e['msRemaining'], $elapsed);
+    }
+    $renewed = $stopped > $b['deadline'] && $meter->renew($channelId, $id, $b['started'], $b['deadline'])['ok'];
+    $e = $meter->end($channelId, $id, $b['started'], $stopped);
+    $open['open'] = false;
     if ($e['over']) {
         return zeam_pass_refusal(402, zeam_pass_out_of_time(true) + ['msRemaining' => $e['msRemaining']]);
     }
+    if ($renewed) {
+        $e['elapsedMs'] = $stopped - $b['started'];
+    }
     if (is_wp_error($out)) {
-        return zeam_pass_tool_failed($out);
+        $failed = zeam_pass_tool_failed($out, $tool);
+        $failed['mcpBody'] = $failed['body'];
+        $failed['body'] += ['msRemaining' => $e['msRemaining'], 'elapsedMs' => $e['elapsedMs']];
+        return zeam_pass_line_read($failed, $channelId, $e['msRemaining'], $e['elapsedMs']);
     }
     return ['delivered' => true, 'status' => 200, 'headers' => ['X-Pass-Ms-Remaining' => (string) $e['msRemaining'], 'X-Pass-Ms-Elapsed' => (string) $e['elapsedMs']], 'body' => $out, 'meter' => ['channelId' => $channelId, 'msRemaining' => $e['msRemaining'], 'elapsedMs' => $e['elapsedMs']]];
+}
+
+function zeam_pass_line_read(array $s, $channelId, $msRemaining, $elapsedMs)
+{
+    $s['headers']['X-Pass-Ms-Remaining'] = (string) $msRemaining;
+    $s['headers']['X-Pass-Ms-Elapsed'] = (string) $elapsedMs;
+    $s['meter'] = ['channelId' => $channelId, 'msRemaining' => $msRemaining, 'elapsedMs' => $elapsedMs];
+    return $s;
+}
+
+function zeam_pass_line_abandoned($meter, $channelId, $id, $started, $open, $call = null)
+{
+    if (!$open['open']) {
+        return null;
+    }
+    $open['open'] = false;
+    try {
+        $now = $meter->nowMs();
+        $cut = zeam_pass_call_close($call)['cutAt'] ?? null;
+        return $meter->end($channelId, $id, $started, $cut === null ? $now : min((int) $cut, $now));
+    } catch (\Throwable $e) {
+        return null;
+    }
 }
 
 function zeam_pass_line_op($args, $headerCredential = '')
@@ -476,6 +774,9 @@ function zeam_pass_line_op($args, $headerCredential = '')
     $op = $args['op'];
     if ($op === 'open' || $op === 'prove') {
         $id = isset($args['channelId']) && is_string($args['channelId']) && preg_match('/^0x[0-9a-fA-F]{64}$/D', $args['channelId']) ? strtolower($args['channelId']) : null;
+        if ($id === null) {
+            return $fail(400, 'bad_request', 'channelId is missing or is not 0x and 64 hex characters: send "channelId":"0x…" with the op');
+        }
         $ch = $id !== null ? (new ZeamPassChannelStore())->get($id) : null;
         if (!isset($ch['channelConfig'])) {
             return $fail(404, 'unknown_channel', 'no channel with that id here. Pay a call on it first, e.g. buy_time.');
@@ -494,6 +795,9 @@ function zeam_pass_line_op($args, $headerCredential = '')
         return ['status' => 200, 'body' => ['op' => 'opened', 'credential' => $r['credential'], 'channelId' => $id, 'msRemaining' => $r['msRemaining'], 'metering' => true]];
     }
     $credential = isset($args['credential']) && is_string($args['credential']) && $args['credential'] !== '' ? $args['credential'] : (string) $headerCredential;
+    if ($credential === '') {
+        return $fail(400, 'bad_request', 'credential is missing or is not a string: add "credential":"<yours>" to the body, or send it as the x-line header');
+    }
     $id = $meter->line($credential);
     if ($id === null) {
         return $fail(403, 'line_unknown', 'no open line with that credential');
@@ -502,8 +806,28 @@ function zeam_pass_line_op($args, $headerCredential = '')
         $meter->close($credential);
         return ['status' => 200, 'body' => ['op' => 'closed', 'channelId' => $id]];
     }
-    if ($op !== 'status') {
-        $meter->switch($id, $op === 'on');
+    if ($op === 'on') {
+        $holder = '0x' . bin2hex(random_bytes(16));
+        $channels = zeam_pass_channels();
+        $marked = $channels->mark($id, $holder, false);
+        if (isset($marked['unavailable'])) {
+            return ['status' => 503, 'body' => ['op' => 'line_failed', 'code' => 'line_unavailable', 'why' => 'the line could not be read right now. Retry.']];
+        }
+        if (isset($marked['settling'])) {
+            $secs = $marked['settling'];
+            return ['status' => 402, 'body' => ['op' => 'line_failed', 'code' => 'refund_settling', 'why' => "a refund is settling on this channel, retry in {$secs}s.", 'retry_after_seconds' => $secs]];
+        }
+        if (isset($marked['judged'])) {
+            $secs = $marked['judged'];
+            return ['status' => 402, 'body' => ['op' => 'line_failed', 'code' => 'refund_pending', 'why' => "a refund asked for on this channel is being worked out, and the meter stays off until it is answered. Retry in {$secs}s.", 'retry_after_seconds' => $secs]];
+        }
+        try {
+            $meter->switch($id, true);
+        } finally {
+            $channels->unmark($id, $holder);
+        }
+    } elseif ($op !== 'status') {
+        $meter->switch($id, false);
     }
     return ['status' => 200, 'body' => ['op' => $op] + $meter->status($id)];
 }
@@ -564,7 +888,7 @@ function zeam_pass_serve_gate($tool, $resource, array $args, $payment, $grant)
     }
     $out = zeam_pass_run_safely($tool, $args);
     if (is_wp_error($out)) {
-        return zeam_pass_tool_failed($out);
+        return zeam_pass_tool_failed($out, $tool);
     }
     $headers = [];
     if ($a['root'] !== $a['signer']) {
@@ -579,7 +903,7 @@ function zeam_pass_refund(array $body)
         return ['status' => 404, 'body' => ['op' => 'refund_failed', 'code' => 'not_a_paywall', 'why' => 'this site has no paid calls']];
     }
     if (!zeam_pass_ready()) {
-        return ['status' => 503, 'body' => ['op' => 'refund_failed', 'code' => 'not_ready', 'why' => 'this site has not finished setting up ZEAM Pass']];
+        return ['status' => 503, 'body' => ['op' => 'refund_failed', 'code' => 'not_ready', 'why' => 'this site has not finished setting up ZEAM Bridge']];
     }
     zeam_pass_allow_seconds(180);
     $e = zeam_pass_engine();
