@@ -1,9 +1,9 @@
+import copy
 import json
 import math
 import re
 import secrets
 import threading
-import weakref
 
 from ..batch_settlement import BatchSettlement
 from ..core import Address, Hex, Secp256k1
@@ -15,6 +15,7 @@ from .chain import Chain
 from .gas_quote import GasQuote
 from .relay import Relay
 from .verify import Verify
+from ..discovery import percent, refund_rule
 
 
 _DIGITS = re.compile(r"[0-9]+")
@@ -79,6 +80,14 @@ class Refunds:
         cid = php_str(channel_id).lower()
         if not Verify.is_canonical_channel_id(cid):
             return Refunds._failed(400, "invalid_request", "channelId is missing or is not 0x and 64 hex characters: send {channelId, issued, signature}")
+        holder = "0x" + secrets.token_hex(16)
+        turn = self.channels.ticket(cid, holder)
+        try:
+            return {**self._checked(cid, issued, signature, ask, holder), "turn": turn}
+        finally:
+            self.channels.serial(cid, lambda g: self._left(g, holder))
+
+    def _checked(self, cid, issued, signature, ask, holder):
         ch = self.channels.get(cid)
         sent = (ask or {}).get("channelConfig")
         own = None if sent is None else self._own_config(cid, sent)
@@ -92,78 +101,218 @@ class Refunds:
             return Refunds._failed(400, "proof_invalid", proof["why"], {"sign": Refunds.message(cid, "<ISO8601 within five minutes>")})
         if not Refunds.owns(ch if ch is not None else {"channelConfig": config}, proof["address"]):
             return Refunds._failed(403, "not_the_payer", proof["address"] + " is not this channel's payer")
-        entered = self._enter(cid, Refunds.ask_key(ask or {}))
-        if "answer" in entered:
-            return entered["answer"]
-        try:
-            if ch is None:
-                adopted = self._adopt(cid, config)
-                if adopted.get("failed") is not None:
-                    return adopted["failed"]
-                ch = adopted["channel"]
-            else:
-                before = self._sent(ch)
-                if before is not None:
-                    return before
-                ch = self.channels.repaired(cid) or ch
-            return self._marked_refund(ch, ask or {})
-        finally:
-            entered["leave"]()
+        if ch is None:
+            adopted = self._adopt(cid, config)
+            if adopted.get("failed") is not None:
+                return adopted["failed"]
+            ch = adopted["channel"]
+        return self._worked(cid, ch, ask or {}, holder)
 
     WORKERS = 4
-    WAIT_POLL_MS = 50
     BUSY_RETRY_SECS = 1
-    _SLOTS = weakref.WeakKeyDictionary()
-    _SLOTS_LOCK = threading.Lock()
+    TURN_LOOK_MS = 1000
+    READ_SHARED_MS = 100
+    JUDGE_TRIES = 3
 
-    def _slot(self, ident):
-        with Refunds._SLOTS_LOCK:
-            held = Refunds._SLOTS.setdefault(self.store, {})
-            count = held.get(ident, 0)
-            if count >= Refunds.WORKERS:
-                return None
-            held[ident] = count + 1
-        left = []
-
-        def leave():
-            with Refunds._SLOTS_LOCK:
-                if left:
-                    return
-                left.append(True)
-                rest = held.get(ident, 1) - 1
-                if rest > 0:
-                    held[ident] = rest
-                else:
-                    held.pop(ident, None)
-        return leave
-
-    def _enter(self, ident, key):
+    def _worked(self, ident, ch, ask, holder):
+        key = Refunds.ask_key(ask)
         deadline = self.cfg.now_ms() + self.channels.judge_wait_ms()
-        while True:
-            leave = self._slot(ident)
-            if leave is not None:
-                return {"leave": leave}
-            known = self._crowded(ident, key)
-            if known is not None:
-                return {"answer": known}
-            if self.cfg.now_ms() >= deadline:
-                return {"answer": Refunds._busy()}
-            self.cfg.sleep_ms(Refunds.WAIT_POLL_MS)
+        try:
+            while True:
+                step = self.channels.serial(ident, lambda g: self._arrive(g, ident, ch, key, holder, deadline))
+                if "wait" in step:
+                    self.channels.waited(step["wait"], deadline)
+                    continue
+                if "read" in step:
+                    live = self._read(ident, step["read"], step.get("own"))
+                    step = self.channels.serial(ident, lambda g: self._arrived(g, ident, ch, holder, live, step["read"]))
+                answer = step.get("answer")
+                if answer is not None and answer["body"].get("code") == "nothing_to_return" and not php_empty((self.channels.get(ident) or {}).get("handedOver")):
+                    self.channels.repaired(ident)
+                if answer is not None:
+                    return self._told(ch, step)
+                break
+            return self._turns(ident, ch, ask, key, holder, deadline)
+        finally:
+            self.channels.serial(ident, lambda g: self._left(g, holder))
 
-    def _crowded(self, ident, key):
-        r = self.channels.get(ident)
+    def _read(self, ident, read, own):
+        if own:
+            try:
+                read["live"] = self.chain.live(ident)
+            except Exception:
+                read["live"] = None
+            read["done"].set()
+        else:
+            read["done"].wait()
+        return read["live"]
+
+    def _arrive(self, g, ident, ch, key, holder, deadline):
         now = self.cfg.now_ms()
-        if Channels.refunding_wait_ms(r, now) > 0 and not Channels.judging(r, now):
-            return Refunds._settling(Channels.refunding_retry_secs(self.cfg, r, now))
-        kept = Refunds._kept(r, key, now, self._line_of(ident))
-        if kept is not None:
-            return kept
+        r = self.channels.get(ident)
+        if Channels.refunding_wait_ms(r, now) > 0:
+            return {"answer": Refunds._settling(Channels.refunding_retry_secs(self.cfg, r, now)), "settling": Channels.live(g.held, now) + Channels.live(g.arriving, now) < Refunds.WORKERS}
         if Channels.pending_live(r, now):
-            return Refunds._call_open(r, now)
+            return {"answer": Refunds._call_open(r, now)}
         meter = getattr(self.cfg, "meter", None)
         if meter is not None and meter.busy(ident):
-            return Refunds._line_busy()
-        return None
+            return {"answer": Refunds._line_busy()}
+        if Channels.holding(g, now):
+            Channels.seat(g, holder, g.held, now + Channels.JUDGING_TTL_MS)
+            return {"joined": True}
+        if not Channels.arriving(g, now) and not Channels.ahead(g, holder, now):
+            kept = Refunds._kept(r, key, now, self._line_of(ident))
+            if kept is not None:
+                return {"answer": kept}
+        seen = g.last_read
+        if seen is not None and 0 <= now - seen["at"] < Refunds.READ_SHARED_MS:
+            return self._arrived(g, ident, ch, holder, seen["live"], None)
+        if Channels._earlier(g, holder, g.arriving, now) >= Refunds.WORKERS:
+            return {"answer": Refunds._busy()} if now >= deadline else {"wait": self.channels.waiter(g)}
+        Channels.seat(g, holder, g.arriving, now + Channels.JUDGING_TTL_MS)
+        own = g.reading is None
+        if own:
+            g.reading = {"readers": 0, "done": threading.Event(), "live": None}
+        g.reading["readers"] += 1
+        return {"read": g.reading, "own": own}
+
+    def _arrived(self, g, ident, ch, holder, live, read):
+        now = self.cfg.now_ms()
+        g.arriving.pop(holder, None)
+        if read is not None:
+            read["readers"] -= 1
+            if g.reading is read:
+                g.reading = None
+        try:
+            r = self.channels.get(ident)
+            if Channels.refunding_wait_ms(r, now) > 0:
+                return {"answer": Refunds._settling(Channels.refunding_retry_secs(self.cfg, r, now)), "settling": Channels.live(g.held, now) < Refunds.WORKERS}
+            if not Channels.holding(g, now):
+                if live is None:
+                    return {"answer": Refunds._failed(409, "chain_unreadable", "could not read the channel on chain", {"retry_after_seconds": Refunds.RETRY_SECS})}
+                g.last_read = {"at": now, "live": live}
+                raw = r if r is not None else ch
+                if n(Channels.refundable(Channels.earned(self.cfg, raw), live)) <= 0:
+                    return {"answer": Refunds._nothing()}
+                if Channels.pending_live(r, now):
+                    return {"answer": Refunds._call_open(r, now)}
+                meter = getattr(self.cfg, "meter", None)
+                if meter is not None and not meter.stop(ident):
+                    return {"answer": Refunds._line_busy()}
+            Channels.seat(g, holder, g.held, now + Channels.JUDGING_TTL_MS)
+            return {"joined": True}
+        finally:
+            self.channels.wake(g)
+
+    def _turns(self, ident, ch, ask, key, holder, deadline):
+        tries = 1
+        while True:
+            step = self.channels.serial(ident, lambda g: self._turn(g, ident, key, holder, deadline))
+            if "answer" in step:
+                return self._told(ch, step)
+            if "wait" in step:
+                self.channels.waited(step["wait"], step["until"])
+                continue
+            judged = self._judge(ch, ask)
+            decided = self.channels.serial(ident, lambda g: self._decide(g, ident, key, holder, judged, tries))
+            if decided.get("again"):
+                tries += 1
+                continue
+            if "answer" in decided:
+                return decided["answer"]
+            try:
+                return self._send(decided["plan"])
+            finally:
+                self.channels.serial(ident, lambda g: self._unsend(g, ident, holder))
+
+    def _turn(self, g, ident, key, holder, deadline):
+        now = self.cfg.now_ms()
+        r = self.channels.get(ident)
+        if Channels.refunding_wait_ms(r, now) > 0:
+            return {"answer": Refunds._settling(Channels.refunding_retry_secs(self.cfg, r, now)), "settling": list(g.held).index(holder) < Refunds.WORKERS if holder in g.held else True}
+        judge = Channels.judge_of(g, now)
+        if judge is not None and judge["holder"] == holder:
+            judge["until"] = now + Channels.JUDGING_TTL_MS
+            return {"judge": True}
+        Channels.seat(g, holder, g.held, now + Channels.JUDGING_TTL_MS)
+        place = Channels.place(g, holder, now)
+        slot = place
+        if judge is None and place == 0 and not Channels.ahead(g, holder, now):
+            if Channels.pending_live(r, now):
+                return {"answer": Refunds._call_open(r, now)}
+            kept = Refunds._kept(r, key, now, self._line_of(ident))
+            if kept is not None:
+                return {"answer": kept}
+            g.judge = {"holder": holder, "until": now + Channels.JUDGING_TTL_MS}
+            return {"judge": True}
+        if slot >= Refunds.WORKERS and now >= deadline:
+            return {"answer": Refunds._call_open(r, now) if Channels.pending_live(r, now) else Refunds._busy()}
+        until = now + Refunds.TURN_LOOK_MS
+        if slot >= Refunds.WORKERS:
+            until = min(until, deadline)
+        return {"wait": self.channels.waiter(g), "until": until}
+
+    def _decide(self, g, ident, key, holder, judged, tries):
+        now = self.cfg.now_ms()
+        r = self.channels.get(ident)
+        moved = r is not None and Refunds.state_of(r) != judged["state"]
+        if "answer" in judged:
+            if moved and tries < Refunds.JUDGE_TRIES and not Channels.pending_live(r, now):
+                return {"again": True}
+            answer = Refunds._call_open(r, now) if Channels.pending_live(r, now) else judged["answer"]
+            self._done(g, holder)
+            return {"answer": self._keep(ident, key, judged["state"], judged["line"], answer)}
+        if not self._unchanged(ident, judged):
+            if tries < Refunds.JUDGE_TRIES and not Channels.pending_live(r, now):
+                return {"again": True}
+            self._done(g, holder)
+            return {"answer": Refunds._call_open(r, now) if Channels.pending_live(r, now) else Refunds._unheld()}
+
+        def mark(c):
+            if c is None:
+                return c
+            c["refundingUntil"] = now + Channels.REFUNDING_TTL_MS
+            c["refundingBy"] = holder
+            return c
+
+        try:
+            self.channels.update(ident, mark)
+        except Exception:
+            self._done(g, holder)
+            return {"answer": Refunds._unheld()}
+        self._done(g, holder)
+        return {"plan": judged}
+
+    def _done(self, g, holder):
+        if g.judge is not None and g.judge["holder"] == holder:
+            g.judge = None
+        g.held.pop(holder, None)
+        self.channels.wake(g)
+
+    def _left(self, g, holder):
+        g.checking.pop(holder, None)
+        g.order.pop(holder, None)
+        g.arriving.pop(holder, None)
+        self._done(g, holder)
+
+    def _unsend(self, g, ident, holder):
+        def drop(r):
+            if r is None or r.get("refundingBy") != holder:
+                return r
+            r.pop("refundingUntil", None)
+            r.pop("refundingBy", None)
+            return r
+
+        try:
+            self.channels.update(ident, drop)
+        except Exception:
+            pass
+        self.channels.wake(g)
+
+    def _told(self, ch, step):
+        if step.get("settling") is True:
+            return self._emptied(ch) or step["answer"]
+        return step["answer"]
 
     @staticmethod
     def _busy():
@@ -198,45 +347,6 @@ class Refunds:
     def ask_key(ask):
         return json.dumps([(ask or {}).get("selfSend") is True, (ask or {}).get("gasPayment")], sort_keys=True, separators=(",", ":"))
 
-    def _marked_refund(self, ch, ask):
-        ident = ch["channelId"].lower()
-        key = Refunds.ask_key(ask)
-        before = self._sent(ch)
-        if before is not None:
-            return before
-        kept = Refunds._kept(self.channels.get(ident), key, self.cfg.now_ms(), self._line_of(ident))
-        if kept is not None:
-            return kept
-        holder = "0x" + secrets.token_hex(16)
-        try:
-            return self._verdict(ch, ask, ident, key, holder)
-        finally:
-            self.channels.unweigh(ident, holder)
-
-    def _verdict(self, ch, ask, ident, key, holder):
-        judged = self._judge(ch, ask, holder)
-        if "answer" in judged:
-            return self._sent(ch) or self._keep(ident, key, judged["state"], judged["line"], judged["answer"])
-        marked = self.channels.mark(ident, holder, True, True)
-        if marked.get("unavailable"):
-            return Refunds._unheld()
-        if "settling" in marked:
-            return self._emptied(ch) or Refunds._settling(marked["settling"])
-        if "open" in marked:
-            return self._keep(ident, key, Refunds.state_of(marked["open"]), self._line_of(ident), Refunds._call_open(marked["open"], marked["at"]))
-        try:
-            out = self._under_mark(ch, ask, judged, holder)
-        finally:
-            self._release(ident, holder)
-        return self._keep(ident, key, out["state"], out["line"], out["answer"])
-
-    def _sent(self, ch):
-        r = self.channels.get(ch["channelId"].lower())
-        now = self.cfg.now_ms()
-        if Channels.refunding_wait_ms(r, now) == 0 or Channels.judging(r, now):
-            return None
-        return self._emptied(ch) or Refunds._settling(Channels.refunding_retry_secs(self.cfg, r, now))
-
     @staticmethod
     def _kept(r, key, now, line):
         v = Refunds.verdict_of(r)
@@ -265,14 +375,6 @@ class Refunds:
         except Exception:
             pass
         return answer
-
-    def _under_mark(self, ch, ask, judged, holder):
-        ident = ch["channelId"].lower()
-        meter = getattr(self.cfg, "meter", None)
-        if meter is not None and not meter.stop(ident):
-            return {"state": judged["state"], "line": self._line_of(ident), "answer": Refunds._line_busy()}
-        plan = judged if self._unchanged(ident, judged) else self._judge(ch, ask, holder)
-        return {"state": plan["state"], "line": plan["line"], "answer": plan["answer"] if "answer" in plan else self._send(plan, holder)}
 
     def _line_of(self, ident):
         meter = getattr(self.cfg, "meter", None)
@@ -318,9 +420,6 @@ class Refunds:
     @staticmethod
     def _settling(secs):
         return Refunds._failed(409, "refund_settling", f"a refund is already settling on this channel. Nothing more was sent. Retry in {secs}s.", {"retry_after_seconds": secs})
-
-    def _release(self, ident, holder):
-        return self.channels.unmark(ident, holder)
 
     def _own_config(self, cid, config):
         fields = {"mismatch": "fields", "why": "channelConfig needs payer, payerAuthorizer, receiver, receiverAuthorizer, token, withdrawDelay and salt, as deposited"}
@@ -402,10 +501,10 @@ class Refunds:
         s = ("%.6f" % (micro_usd / 1e6)).rstrip("0").rstrip(".")
         return "0" if s == "" else s
 
-    def _judge(self, incoming, ask, holder):
+    def _judge(self, incoming, ask):
         ask = ask or {}
         ident = incoming["channelId"].lower()
-        raw = self.channels.get(ident) or incoming
+        raw = self.channels.repaired(ident) or incoming
         state = Refunds.state_of(raw)
         line = self._line_of(ident)
 
@@ -423,8 +522,6 @@ class Refunds:
         now = self.cfg.now_ms()
         if Channels.pending_live(ch, now):
             return refused(Refunds._call_open(ch, now))
-        if not self.channels.weigh(ident, holder):
-            return refused(Refunds._unheld())
         f = self._frozen(raw, live, ch, left)
         line = f.get("line", line)
         if "failed" in f:
@@ -452,7 +549,7 @@ class Refunds:
         payment = None
         if not gas["covered"]:
             asset = self.cfg.asset_of(ch["channelConfig"]["token"])
-            rule = "channel fees $" + Refunds.usd(gas["feeMicroUSD"]) + " < the gas of " + Refunds.gas_of(gas) + " and any calls not yet settled, plus " + str(int(php_round((self.cfg.gasBuffer - 1) * 100))) + "%, $" + Refunds.usd(gas["coverMicroUSD"])
+            rule = Refunds.rule(self.cfg, gas)
             if asset is None or not asset.get("eip3009"):
                 return refused(Refunds._failed(409, "nothing_to_return", rule + "; this token has no gasless payment for the $"
                                        + Refunds.usd(gas["gasMicroUSD"]) + " refund gas. " + Refunds.SELF, {**amounts, "returnedMicroUSD": 0, **gas["detail"]}))
@@ -475,21 +572,16 @@ class Refunds:
             payment = {"asset": asset, "payTo": pay_to, "authorization": offered["authorization"], "signature": offered["signature"]}
         return {**plan, "call": call, "gas": gas, "amounts": amounts, "payment": payment}
 
-    def _send(self, plan, holder):
+    def _send(self, plan):
         ch, live, left = plan["ch"], plan["live"], plan["left"]
         if plan.get("self"):
-            other = self.channels.sending(ch["channelId"].lower(), holder)
-            if other is not None and other.get("unavailable"):
-                return Refunds._unheld()
-            if other is not None:
-                return Refunds._settling(other["settling"])
             return self._self_send(ch, live, left, plan["nonce"])
         call, gas, amounts, payment = plan["call"], plan["gas"], plan["amounts"], plan["payment"]
         if payment is None:
-            return self._send_refund(ch, call, left, 0, amounts, holder, gas["freeGasUnits"])
+            return self._send_refund_now(ch, call, left, 0, amounts, gas["freeGasUnits"])
         pay = {"to": payment["asset"]["address"], "data": BatchSettlement.encode_transfer_with_authorization(payment["authorization"], payment["signature"])}
         bundle = {"to": BatchSettlement.MULTICALL3, "data": BatchSettlement.encode_aggregate3([call, pay])}
-        out = self._send_refund(ch, bundle, left, self._micro_usd(ch, payment["authorization"]["value"]), amounts, holder)
+        out = self._send_refund_now(ch, bundle, left, self._micro_usd(ch, payment["authorization"]["value"]), amounts)
         return out if "underpaid" not in out else self._requote(ch, live, payment, amounts, gas, out["underpaid"], call)
 
     def _frozen(self, raw, live, ch, left):
@@ -526,7 +618,7 @@ class Refunds:
                                {"requoted": True, "sendCostMicroUSD": send_cost})
 
     SELF_SEND = '{"selfSend": true}'
-    SELF = "Send " + SELF_SEND + " for a signed refund of the full balance, sent at your own gas."
+    SELF = "Send " + SELF_SEND + " for a signed refund of the full balance, sent from any wallet at your own gas."
 
     def _self_send(self, ch, live, left, nonce):
         handed = ch.get("handedOver") if isinstance(ch.get("handedOver"), dict) else {}
@@ -550,16 +642,18 @@ class Refunds:
         if q is None:
             return None
         counted = {"alreadyPaid": already_paid, "freeGasUnits": self.cfg.gas["refund"] + (self.cfg.gas["refundClaim"] if bundled > 0 else 0)}
-        cover = q["cover"]
         earned = self._micro_usd(ch, str(n(live["claimed"]) + bundled))
         fee_micro_usd = GasQuote.fee_micro_usd(earned, self.cfg.feeShare)
 
         def detail_of(p):
             return {k: p[k] for k in ("gasUnits", "gasUnitsWithMargin", "gasPriceWei", "ethUSD", "l1FeeWei", "marginPercent", "quotedBy")}
 
-        if fee_micro_usd >= cover["microUSD"]:
-            return {"covered": True, "gasMicroUSD": 0, "costMicroUSD": 0, "feeMicroUSD": fee_micro_usd, "coverMicroUSD": cover["microUSD"], "detail": detail_of(q["pay"]), **counted}
+        if fee_micro_usd >= q["cover"]["microUSD"]:
+            return {"covered": True, "gasMicroUSD": 0, "costMicroUSD": 0, "feeMicroUSD": fee_micro_usd, "coverMicroUSD": q["cover"]["microUSD"], "detail": detail_of(q["pay"]), **counted}
         pay = self.gas.relay_quote(call) or q["pay"]
+        cover = q["cover"] if pay is q["pay"] else self.gas.priced(q["cover"]["gasUnits"], pay["gasPriceWei"], pay["ethUSD"])
+        if fee_micro_usd >= cover["microUSD"]:
+            return {"covered": True, "gasMicroUSD": 0, "costMicroUSD": 0, "feeMicroUSD": fee_micro_usd, "coverMicroUSD": cover["microUSD"], "detail": detail_of(pay), **counted}
         return {"covered": False, "gasMicroUSD": pay["microUSD"], "costMicroUSD": pay["costMicroUSD"], "feeMicroUSD": fee_micro_usd, "coverMicroUSD": cover["microUSD"], "detail": detail_of(pay), **counted}
 
     @staticmethod
@@ -582,6 +676,11 @@ class Refunds:
     @staticmethod
     def gas_of(gas_info):
         return "its deposit, its refund, the further deposits and earlier refunds ZEAM paid for" if gas_info.get("alreadyPaid", 0) > 0 else "its deposit, its refund"
+
+    @staticmethod
+    def rule(cfg, gas_info, pay=None):
+        return (refund_rule(int(php_round((cfg.gasBuffer - 1) * 100)), None if pay is None else php_str(pay)) + " Our fee is " + percent(cfg.feeShare) + "% of what the buyer spent: $" + Refunds.usd(gas_info["feeMicroUSD"])
+                + " on this channel, under the $" + Refunds.usd(gas_info["coverMicroUSD"]) + " of gas it must cover (" + Refunds.gas_of(gas_info) + " and the calls not yet settled, the margin included)")
 
     def gas_payment_problem(self, ch, asset, pay_to, units, left, p):
         a = p.get("authorization")
@@ -632,14 +731,13 @@ class Refunds:
         return Refunds._answer(409, {
             "op": "refund_quote",
             "code": "gas_payment_needed",
-            "why": lead + "channel fees $" + Refunds.usd(gas_info["feeMicroUSD"]) + " < the gas of " + Refunds.gas_of(gas_info) + " and any calls not yet settled, plus " + str(int(php_round((self.cfg.gasBuffer - 1) * 100))) + "%, $"
-                   + Refunds.usd(gas_info["coverMicroUSD"]) + ". Refund gas: $" + Refunds.usd(gas)
+            "why": lead + Refunds.rule(self.cfg, gas_info, d["marginPercent"]) + ". Refund gas: $" + Refunds.usd(gas)
                    + " USDC, no ETH (" + php_str(d["gasUnits"]) + " gas, L1 fee " + php_str(d["l1FeeWei"]) + " wei, "
                    + php_str(d["gasPriceWei"]) + " wei per gas, $" + php_str(d["ethUSD"]) + " per ETH, " + php_str(d["marginPercent"]) + "% margin; "
                    + ("priced by the relay" if d["quotedBy"] == "relay" else "priced from measured refunds") + "). Sign authorization (EIP-3009 TransferWithAuthorization; typed data in sign) and POST again with "
                    + "gasPayment: {authorization, signature} within " + str(secs) + "s. The refund of $" + Refunds.usd(amounts["leftMicroUSD"])
                    + " and the gas payment go in one transaction: $" + Refunds.usd(amounts["leftMicroUSD"] - gas) + " net to you. Or send "
-                   + Refunds.SELF_SEND + " for a signed refund of the full balance, sent at your own gas.",
+                   + Refunds.SELF_SEND + " for a signed refund of the full balance, sent from any wallet at your own gas.",
             **amounts,
             "gasMicroUSD": gas,
             **d,
@@ -668,15 +766,6 @@ class Refunds:
             "to": BatchSettlement.ESCROW,
             "data": BatchSettlement.encode_multicall([BatchSettlement.encode_claim_with_signature(claims, claim_sig), refund]),
         }
-
-    def _send_refund(self, ch, call, left, gas_micro_usd, amounts, holder, free_gas_units=0):
-        ident = ch["channelId"].lower()
-        other = self.channels.sending(ident, holder)
-        if other is not None and other.get("unavailable"):
-            return Refunds._unheld()
-        if other is not None:
-            return Refunds._settling(other["settling"])
-        return self._send_refund_now(ch, call, left, gas_micro_usd, amounts, free_gas_units)
 
     def _send_refund_now(self, ch, call, left, gas_micro_usd, amounts=None, free_gas_units=0):
         amounts = amounts or {}
@@ -769,7 +858,7 @@ class Refunds:
             "op": "refund_signed",
             "microUSD": self._micro_usd(ch, left),
             "transaction": transaction,
-            "why": "signed refund of the full balance; send it at your own gas",
+            "why": "signed refund of the full balance; send it from any wallet at your own gas",
         }
         if time_ms > 0:
             body["timeReturnedMs"] = time_ms

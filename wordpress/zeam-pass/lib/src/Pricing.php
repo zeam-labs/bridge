@@ -163,6 +163,10 @@ final class Pricing
         if (isset($price['unitMicro']) && $price['unitMicro'] !== null) {
             return 'Up to $' . self::usd($price['micro']) . ' per call, reserved; charged $' . self::usd($price['unitMicro']) . ' per unit the call reports, at most the reserve. A failed call is not charged.';
         }
+        if (!empty($price['rateMicro'])) {
+            $callMs = min(self::mulDiv($price['micro'], $price['rateMs'], $price['rateMicro']), self::MAX_MICRO);
+            return '$' . self::usd($price['micro']) . ' per call of up to ' . $callMs . ' ms without a line; $' . self::usd($price['rateMicro']) . ' per ' . ($price['rateMs'] === 1 ? 'ms' : $price['rateMs'] . ' ms') . ' on a line. A failed call without a line is not charged; on a line a call burns the time it runs, failed or not.';
+        }
         return '$' . self::usd($price['micro']) . ' per call. A failed call is not charged.';
     }
 }

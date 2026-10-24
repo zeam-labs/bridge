@@ -14,10 +14,12 @@ agents.tool({
 const handle = agents.handle('/agents')
 
 http.createServer(async (req, res) => {
+  const hung = new AbortController()
+  res.on('close', () => { if (!res.writableEnded) hung.abort() })
   let body = ''
   for await (const c of req) body += c
   const request = new Request(`http://${req.headers.host}${req.url}`, { method: req.method, headers: req.headers, body: ['GET', 'HEAD'].includes(req.method) ? undefined : body })
-  const response = (await handle(request)) ?? new Response('the site\'s own page')
+  const response = (await handle(request, { signal: hung.signal })) ?? new Response('the site\'s own page')
   res.writeHead(response.status, Object.fromEntries(response.headers))
   res.end(Buffer.from(await response.arrayBuffer()))
 }).listen(Number(process.env.PORT ?? 18620), '127.0.0.1', () => console.log('acme on', process.env.PORT ?? 18620))

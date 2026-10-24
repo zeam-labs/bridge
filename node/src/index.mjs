@@ -2,8 +2,9 @@ import { CONTRACTS, GRANTED_BY, createEngine, feeRecipient } from './engine/inde
 import { randomBytes } from 'node:crypto'
 import { FreeLimit, describe as describePrice, priceOf, usd } from './engine/pricing.mjs'
 import { boughtMs, timeMicro, timeRate, timeText } from './engine/meter.mjs'
-import { bazaar } from './engine/bazaar.mjs'
-import { CACHE_CONTROL, discovery } from './engine/discovery.mjs'
+import { bazaar, forHeader } from './engine/bazaar.mjs'
+import { Json } from './engine/settlement/json.mjs'
+import { CACHE_CONTROL, FAILED_CALL, discovery } from './engine/discovery.mjs'
 import { StateFile } from './engine/stores.mjs'
 import { Books, gasOf } from './engine/health.mjs'
 import { Config } from './engine/settlement/config.mjs'
@@ -39,7 +40,9 @@ const METHODS = ['get', 'put', 'post', 'delete', 'options', 'head', 'patch', 'tr
 const PAYMENT_ANSWERS = [402, 403, 429, 503]
 const MCP_VERSIONS = ['2025-11-25', '2025-06-18', '2025-03-26', '2024-11-05']
 const CORS = { 'access-control-allow-origin': '*', 'access-control-expose-headers': 'PAYMENT-REQUIRED, PAYMENT-RESPONSE, WWW-Authenticate, Payment-Receipt, X-Pass-Granted-By, X-Pass-Ms-Remaining, X-Pass-Ms-Elapsed' }
+const SESSIONS_HOW = '; an MPP session pays each call from one deposit'
 const HOW = { paywall: 'Paid per call with x402 or MPP', gate: 'Admitted keys only, proven by a zero-value x402 signature; nothing is paid', both: 'Admitted keys only, paid per call with x402 or MPP' }
+const REFUND_TURN = 'Zeam-Refund-Turn'
 const PREFLIGHT = { ...CORS, 'access-control-allow-methods': 'POST, OPTIONS', 'access-control-allow-headers': 'content-type, payment-signature, x-payment, authorization, payment-authorization, x-line, x-grant, mcp-protocol-version, mcp-session-id, mcp-method, mcp-name', 'access-control-max-age': '86400' }
 
 const names = Object.freeze({
@@ -62,7 +65,7 @@ const bare = (url) => (typeof url === 'string' ? url.split('#')[0].split('?')[0]
 const brief = (t) => (typeof t?.summary === 'string' && t.summary.trim() !== '' ? t.summary.trim() : t?.description)
 const BAD_CURSOR = 'Invalid params: cursor is not one this server gave for this list; ask again without it'
 const PRICE_LIST_HOW = `prices is the price of the tool called, alone. Every tool's price: tools/list at mcp, in each tool's _meta["${META_PRICE}"]. Every paid tool's price: also the document at openapi, in each operation's x-price.`
-const RESULT_NOT_JSON = 'the result is not valid JSON (a non-finite number or a non-JSON value); nothing was charged'
+const RESULT_NOT_JSON = `the result is not valid JSON (a non-finite number or a non-JSON value). ${FAILED_CALL}`
 const said = (out) => (Array.isArray(out?.content) ? out.content.map((c) => c?.text).filter((t) => typeof t === 'string').join('\n') : '') || 'the tool reported an error'
 
 class Fault extends Error {
@@ -223,6 +226,8 @@ function gone(signal) {
   return r instanceof Error && typeof r.code === 'string' ? r : Object.assign(new Error('the caller hung up or canceled the call, so it was stopped.'), { code: 'client_gone' })
 }
 
+const hangupOf = (request, info) => (info?.signal instanceof AbortSignal ? info.signal : request?.signal ?? null)
+
 function hungUp(e, onLine, more = {}) {
   return { status: Number.isInteger(e.status) ? e.status : 499, body: { error: e.code, message: `${message(e)} ${onLine ? 'The line is billed for the time the call ran, nothing after.' : 'Nothing was charged.'}`, ...more } }
 }
@@ -293,17 +298,23 @@ function bridge(options = {}) {
   const ownPrice = (t) => t.price !== undefined || t.unit !== undefined
   const time = o.time
   const meter = engine.meter
-  const priceFor = (t, args = {}) => {
-    if (t.builtin === 'buy_time') { const ms = boughtMs(time, args); return { micro: timeMicro(time, ms), unitMicro: null, ms } }
+  const onTime = (p) => (p !== null && time && p.unitMicro === null ? { ...p, rateMicro: time.rateMicro, rateMs: time.rateMs } : p)
+  const basePrice = (t, args) => {
     if (ownPrice(t)) return priceOf({ price: t.price, unit: t.unit }, o.priceMicroUSD)
     if (typeof o.prices === 'function') return priceOf(o.prices(t.name, args), o.priceMicroUSD)
     return priceOf(o.prices?.[t.name], o.priceMicroUSD)
   }
+  const priceFor = (t, args = {}) => {
+    if (t.builtin === 'buy_time') { const ms = boughtMs(time, args); return { micro: timeMicro(time, ms), unitMicro: null, ms } }
+    return t.meter === 'time' ? onTime(basePrice(t, args)) : basePrice(t, args)
+  }
   const asked = (t, args) => (t.builtin === 'buy_time' && kind(args) === 'object' && !Object.hasOwn(args, 'ms') && Number.isSafeInteger(args.blocks) && args.blocks >= 1 ? { ...args, ms: args.blocks * time.unitMs } : args)
+  const lineVaries = () => ({ per: 'time', usd: usd(time.rateMicro), ms: time.rateMs, varies: true })
   const priceTag = (t) => {
     if (t.builtin === 'line') return { usd: '0', per: 'call', free: true }
     if (t.builtin === 'buy_time') return { usd: usd(time.rateMicro), per: 'ms', ms: time.rateMs, ...(time.maxMs ? { maxMs: time.maxMs } : {}) }
-    if (t.meter === 'time' && !(typeof o.prices === 'function' && !ownPrice(t))) {
+    if (t.meter === 'time') {
+      if (typeof o.prices === 'function' && !ownPrice(t)) return lineVaries()
       const p = priceFor(t)
       return { per: 'time', usd: usd(time.rateMicro), ms: time.rateMs, callUSD: usd(p.micro), callMs: meter.callMs(p.micro) }
     }
@@ -355,16 +366,19 @@ function bridge(options = {}) {
 
   const quotes = (r) => r.status === 402 && kind(r.body) === 'object' && Array.isArray(r.body.accepts) && !Object.hasOwn(r.body, 'error') && !Object.hasOwn(r.body, 'type')
 
-  async function unpaid(r, tool, base, via) {
+  async function unpaid(r, tool, base, via, args) {
     if (!options.unpaid || !quotes(r)) return r
     let more
-    try { more = await options.unpaid({ tool, base, via, body: r.body }) } catch { return r }
+    try { more = await options.unpaid({ tool, base, via, body: r.body, args: kind(args) === 'object' ? args : null }) } catch { return r }
     if (kind(more) !== 'object') return r
     const fields = kind(more.fields) === 'object' && serialize(more.fields) !== null ? more.fields : {}
-    return { ...r, body: { ...fields, ...r.body }, ...(typeof more.text === 'string' && more.text !== '' ? { text: more.text } : {}) }
+    const added = Object.fromEntries(Object.entries(fields).filter(([k]) => !Object.hasOwn(r.body, k)))
+    const terms = decodeHeader(r.headers['PAYMENT-REQUIRED'])
+    const headers = kind(terms) === 'object' && Object.keys(added).length ? { ...r.headers, 'PAYMENT-REQUIRED': Json.base64(forHeader({ ...added, ...terms })) } : r.headers
+    return { ...r, headers, body: { ...added, ...r.body }, ...(typeof more.text === 'string' && more.text !== '' ? { text: more.text } : {}) }
   }
 
-  async function check({ path = '/', header, resource, tool: described, refundUrl = null, price = null, base = null, shared = null, paymentOnly = false }) {
+  async function check({ path = '/', header, resource, tool: described, refundUrl = null, price = null, base = null, shared = null, paymentOnly = false, args = null }) {
     const payment = first(header('payment-signature'), header('x-payment'))
     const grant = first(header('x-grant'))
     const offered = first(header('payment-authorization'), header('authorization'))
@@ -374,7 +388,7 @@ function bridge(options = {}) {
     const extensions = bazaar(tool, via)
     const at = baseOf(refundUrl, base)
     const r = await engine.check({ tool: { name: tool.name, description: brief(tool) }, resource, payment, grant, credential, refundUrl, price, listing: listing(at, tool.name, shared?.prices ?? null), extensions, shared, paymentOnly })
-    return r.ok ? { ok: true, ticket: r.ticket, status: 200, headers: {}, body: {} } : unpaid({ ok: false, status: r.status, headers: r.headers ?? {}, body: r.body }, tool.name, at, via)
+    return r.ok ? { ok: true, ticket: r.ticket, status: 200, headers: {}, body: {} } : unpaid({ ok: false, status: r.status, headers: r.headers ?? {}, body: r.body }, tool.name, at, via, args)
   }
 
   function done(ticket, ok, used = {}) {
@@ -422,13 +436,10 @@ function bridge(options = {}) {
     const failed = threw || isFailure(value)
     const buying = !failed && time && c.ticket?.hold && req.tool?.name === 'buy_time' && tools.get('buy_time')?.builtin === 'buy_time'
     const bought = buying ? { channelId: c.ticket.hold.channelId, ms: boughtMs(time, req.args), key: c.ticket.hold.pendingId } : null
+    if (bought) c.ticket.hold.owedMs = bought.ms
     const d = await done(c.ticket, !failed, { units: m.units })
     if (bought && d.ok) {
-      try {
-        await meter.credit(bought.channelId, bought.ms, bought.key)
-      } catch (e) {
-        return { value, threw: true, error: new Error(`the payment settled but the time could not be recorded: ${message(e)}`), failed: true, settlement: d }
-      }
+      await meter.credit(bought.channelId, bought.ms, bought.key).catch(() => null)
       const now = await meter.status(bought.channelId).catch(() => null)
       if (now !== null && kind(value?.value) === 'object' && Object.hasOwn(value.value, 'msRemaining')) {
         const stated = { ...value.value, msRemaining: now.msRemaining }
@@ -468,30 +479,32 @@ function bridge(options = {}) {
     return { ...kept, ...body }
   }
 
-  const outOfTime = (onLine, ms) => ({ error: 'out_of_time', message: onLine ? 'the line ran out of time during the call. Its time is spent. Buy time: buy_time.' : `the call ran past the ${ms} ms its price buys. Nothing was charged. Buy time and call on a line.` })
+  const outOfTime = (onLine, ms) => ({ error: 'out_of_time', message: onLine ? 'the line ran out of time during the call. Its time is spent. Buy time: buy_time.' : `the call needs more than the ${ms} ms its price buys, so it was cut. Nothing was charged. Buy time and call on a line.` })
 
   const baseOf = (refundUrl = null, base = null) => (base !== null && base !== undefined ? String(base).replace(/\/+$/, '') : String(refundUrl ?? o.refundUrl ?? '').replace(/\/refund$/, ''))
 
   const onLine = (t, args, credential, hangup = null, work = (ctx) => perform(t, args, ctx), at = baseOf()) => (closed ? Promise.resolve(shut()) : fly(() => ridden(t, work, credential, hangup, at)))
 
-  async function known(credential) {
+  async function known(credential, then = null) {
     const channelId = await meter.line(credential)
     if (!channelId) return { status: 403, body: { error: 'line_unknown', message: 'no open line with that credential. Open one: POST {"op":"open","channelId":"0x…"} to this seller\'s line route, the address its 402 time line names.' } }
-    const ch = await engine.server.channels.judged(channelId)
-    if (!ch) return { status: 403, body: { error: 'line_unknown', message: 'no channel for this line.' } }
-    const refundSecs = Channels.refundingWaitMs(ch, meter.now()) > 0 ? Channels.refundingRetrySecs(engine.cfg, ch, meter.now()) : 0
-    if (refundSecs > 0) return { status: 402, body: { error: 'refund_settling', message: `a refund is settling on this channel, retry in ${refundSecs}s.`, retry_after_seconds: refundSecs } }
-    if (Number(ch.withdrawRequestedAt ?? 0) > 0) return { status: 402, body: { error: 'channel_leaving', message: 'this channel is withdrawing. Open a new channel.' } }
-    return { status: 200, channelId }
+    const channels = engine.server.channels
+    const k = await channels.untilAnswered(channelId, engine.cfg.nowMs() + channels.judgeWaitMs(), async (g, ch) => {
+      if (!ch) return { status: 403, body: { error: 'line_unknown', message: 'no channel for this line.' } }
+      if (Number(ch.withdrawRequestedAt ?? 0) > 0) return { status: 402, body: { error: 'channel_leaving', message: 'this channel is withdrawing. Open a new channel.' } }
+      return { status: 200, channelId, then: then === null ? null : await then(channelId) }
+    })
+    if (k.settling !== undefined) return { status: 402, body: { error: 'refund_settling', message: `a refund is settling on this channel, retry in ${k.settling}s.`, retry_after_seconds: k.settling } }
+    return k
   }
 
   async function seat(credential, hangup, at = baseOf()) {
-    const k = await known(credential)
+    const id = randomBytes(8).toString('hex')
+    const k = await known(credential, (channelId) => (hangup?.aborted ? null : meter.begin(channelId, id)))
     if (k.status !== 200) return { refused: k }
     const channelId = k.channelId
-    if (hangup?.aborted) return { refused: hungUp(gone(hangup), true) }
-    const id = randomBytes(8).toString('hex')
-    const b = await meter.begin(channelId, id)
+    if (k.then === null) return { refused: hungUp(gone(hangup), true) }
+    const b = k.then
     if (!b.ok) {
       const msRemaining = (await meter.status(channelId)).msRemaining
       if (b.code === 'too_many_calls') return { refused: { status: 429, body: { error: 'too_many_calls', message: 'too many calls are live on this line; wait for one to finish, then retry.', msRemaining } } }
@@ -539,7 +552,7 @@ function bridge(options = {}) {
     const meta = { channelId: s.channelId, msRemaining: e.msRemaining, elapsedMs: e.elapsedMs }
     const hung = error !== null && quit(hangup)
     if (cut || (e.over && !hung)) return { status: 402, body: whenCut(had, { ...outOfTime(true), msRemaining: e.msRemaining }) }
-    if (hung) return { ...hungUp(gone(quit(hangup)), true, { msRemaining: e.msRemaining, elapsedMs: e.elapsedMs }), meta }
+    if (hung) { const h = hungUp(gone(quit(hangup)), true, { msRemaining: e.msRemaining, elapsedMs: e.elapsedMs }); return { status: h.status, body: whenCut(had, h.body), meta } }
     if (error !== null) return { status: 500, body: { error: 'tool_failed', tool: t.name, message: message(error) }, meta }
     if (value.isError) {
       const f = failedHttp(value.value, t.name)
@@ -625,30 +638,45 @@ function bridge(options = {}) {
       }
       const escrow = engine.escrows.find(ch)
       if (escrow === null) return fail(409, 'unknown_escrow', "this channel's record names an escrow this seller does not serve.")
-      const r = await meter.prove(ch, args.nonce, args.signature, escrow.owners(ch.channelConfig))
+      const channels = engine.server.channels
+      const deadline = engine.cfg.nowMs() + channels.judgeWaitMs()
+      let r
+      try {
+        r = await meter.prove(ch, args.nonce, args.signature, escrow.owners(ch.channelConfig), async (attach) => {
+          const out = await channels.untilAnswered(id, deadline, (g, rec, now, asked) => attach(asked ? { judged: Channels.retrySecs(engine.cfg, 0) } : null))
+          return out.settling !== undefined ? channels.serial(id, () => attach({ settling: out.settling })) : out
+        })
+      } catch {
+        return { status: 503, body: { op: 'line_failed', code: 'line_unavailable', why: 'the line could not be read right now. Retry.' } }
+      }
+      if (r.refused?.settling !== undefined) return { status: 402, body: { op: 'line_failed', code: 'refund_settling', why: `a refund is settling on this channel, and a first line would switch its meter on. Nothing was opened: send {"op":"open"} again in ${r.refused.settling}s.`, retry_after_seconds: r.refused.settling } }
+      if (r.refused?.judged !== undefined) return { status: 402, body: { op: 'line_failed', code: 'refund_pending', why: `a refund asked for on this channel is being worked out, and the meter stays off until it is answered. Nothing was opened: send {"op":"open"} again in ${r.refused.judged}s.`, retry_after_seconds: r.refused.judged } }
       if (!r.ok) return fail(r.status, r.code, r.why)
-      return { status: 200, body: { op: 'opened', credential: r.credential, channelId: id, msRemaining: r.msRemaining, metering: true } }
+      return { status: 200, body: { op: 'opened', credential: r.credential, channelId: id, msRemaining: r.msRemaining, metering: r.metering } }
     }
     const credential = typeof args.credential === 'string' && args.credential !== '' ? args.credential : headerCredential
     if (!credential) return fail(400, 'bad_request', 'credential is missing or is not a string: add "credential":"<yours>" to the body, or send it as the x-line header')
     const id = await meter.line(credential)
     if (!id) return fail(403, 'line_unknown', 'no open line with that credential')
+    const channels = engine.server.channels
     if (args.op === 'close') {
-      await meter.close(credential)
+      await channels.serial(id, () => meter.close(credential))
       return { status: 200, body: { op: 'closed', channelId: id } }
     }
     if (args.op === 'on') {
-      const holder = '0x' + randomBytes(16).toString('hex')
-      const marked = await engine.server.channels.mark(id, holder, false)
-      if (marked.unavailable) return { status: 503, body: { op: 'line_failed', code: 'line_unavailable', why: 'the line could not be read right now. Retry.' } }
-      if (marked.settling !== undefined) return { status: 402, body: { op: 'line_failed', code: 'refund_settling', why: `a refund is settling on this channel, retry in ${marked.settling}s.`, retry_after_seconds: marked.settling } }
-      if (marked.judged !== undefined) return { status: 402, body: { op: 'line_failed', code: 'refund_pending', why: `a refund asked for on this channel is being worked out, and the meter stays off until it is answered. Retry in ${marked.judged}s.`, retry_after_seconds: marked.judged } }
+      let on
       try {
-        await meter.switch(id, true)
-      } finally {
-        await engine.server.channels.unmark(id, holder)
+        on = await channels.untilAnswered(id, engine.cfg.nowMs() + channels.judgeWaitMs(), async (g, ch, now, asked) => {
+          if (asked) return { judged: Channels.retrySecs(engine.cfg, 0) }
+          await meter.switch(id, true)
+          return {}
+        })
+      } catch {
+        return { status: 503, body: { op: 'line_failed', code: 'line_unavailable', why: 'the line could not be read right now. Retry.' } }
       }
-    } else if (args.op !== 'status') await meter.switch(id, false)
+      if (on.settling !== undefined) return { status: 402, body: { op: 'line_failed', code: 'refund_settling', why: `a refund is settling on this channel, retry in ${on.settling}s.`, retry_after_seconds: on.settling } }
+      if (on.judged !== undefined) return { status: 402, body: { op: 'line_failed', code: 'refund_pending', why: `a refund asked for on this channel is being worked out, and the meter stays off until it is answered. Retry in ${on.judged}s.`, retry_after_seconds: on.judged } }
+    } else if (args.op !== 'status') await channels.serial(id, () => meter.switch(id, false))
     return { status: 200, body: { op: args.op, ...(await meter.status(id)) } }
   }
 
@@ -809,10 +837,10 @@ function bridge(options = {}) {
 
   const probe = (t, args, payment, credential) => payment === '' && kind(args) === 'object' && Object.keys(args).length === 0 && !t.builtin && !isFree(t) && !(t.meter === 'time' && credential)
 
-  async function terms(t, path, header, resource, refundUrl, shared = null) {
+  async function terms(t, path, header, resource, refundUrl, shared = null, args = null) {
     let price
     try { price = engine.mode === 'gate' ? null : priceFor(t, {}) } catch { return null }
-    const q = await check({ path, header, resource, tool: offer(t), refundUrl, price, shared })
+    const q = await check({ path, header, resource, tool: offer(t), refundUrl, price, shared, args })
     return q.ok ? null : q
   }
 
@@ -915,7 +943,7 @@ function bridge(options = {}) {
     const spec = kind(what) === 'object' ? what : {}
     if (spec.free === true) return null
     const path = typeof spec.path === 'string' ? spec.path : '/'
-    const c = await check({ path, header: () => '', resource: root ? publicUrl(`${root}${path}`) : undefined, tool: kind(spec.tool) === 'object' ? { name: path, ...spec.tool } : undefined, refundUrl: root ? publicUrl(`${root}/refund`) ?? null : null, price: routePrice(spec.price, null) })
+    const c = await check({ path, header: () => '', resource: root ? publicUrl(`${root}${path}`) : undefined, tool: kind(spec.tool) === 'object' ? { name: path, ...spec.tool } : undefined, refundUrl: root ? publicUrl(`${root}/refund`) ?? null : null, price: spec.meter === 'time' ? onTime(routePrice(spec.price, null)) : routePrice(spec.price, null) })
     return offered(c.ok ? null : c)
   }
 
@@ -938,7 +966,7 @@ function bridge(options = {}) {
     const paying = first(request.headers.get('payment-signature'), request.headers.get('x-payment')) || (Credential.is(first(request.headers.get('payment-authorization'), request.headers.get('authorization'))) ? 'paid' : '')
     const probing = probe(t, args, paying, lineOf(request))
     if (bad && probing) {
-      const q = await terms(t, `/v1/${toolName}`, (h) => request.headers.get(h), publicUrl(request.url), refundUrl)
+      const q = await terms(t, `/v1/${toolName}`, (h) => request.headers.get(h), publicUrl(request.url), refundUrl, null, args)
       return q ? json(q.status, q.body, q.headers) : json(400, { error: 'invalid_arguments', tool: toolName, message: bad })
     }
     if (bad) return json(400, { error: 'invalid_arguments', tool: toolName, message: bad })
@@ -959,7 +987,7 @@ function bridge(options = {}) {
       return new Response(f.value.body, { status: 200, headers: { 'content-type': 'application/json' } })
     }
     const credential = lineOf(request)
-    const hangup = request.signal
+    const hangup = hangupOf(request, info)
     if (t.meter === 'time' && credential) {
       const l = await onLine(t, args, credential, hangup, undefined, baseOf(refundUrl))
       if (l.status !== 200) return json(l.status, told(l), { ...(l.headers ?? {}), ...(l.meta ? reading(l.meta) : {}) })
@@ -971,7 +999,7 @@ function bridge(options = {}) {
     const g = await gate({ path: `/v1/${toolName}`, header: (h) => request.headers.get(h), resource: publicUrl(request.url), tool: offer(t), refundUrl, price, args }, (ctx) => within(bound, (signal) => perform(t, args, { ...ctx, signal }), { hangup }), (r) => r.isError, hangup)
     if (g.refused) return json(g.refused.status, g.refused.body, g.refused.headers)
     if (g.threw && g.error?.code === 'out_of_time') return json(402, whenCut(g.cut, outOfTime(false, bound)))
-    if (g.threw && quit(hangup)) { const l = hungUp(g.error, false, { tool: toolName }); return json(l.status, l.body) }
+    if (g.threw && quit(hangup)) { const l = hungUp(g.error, false, { tool: toolName }); return json(l.status, whenCut(g.cut, l.body)) }
     if (g.threw && g.error instanceof Fault) throw g.error.cause
     if (g.failed && g.threw) return json(500, { error: 'tool_failed', message: message(g.error), tool: toolName })
     if (g.failed) {
@@ -996,7 +1024,7 @@ function bridge(options = {}) {
     const bad = validate(t.inputSchema, asked(t, args))
     const probing = probe(t, args, params._meta?.[META_PAYMENT] || params._meta?.[McpPayment.CREDENTIAL] ? 'paid' : '', first(typeof params._meta?.[META_LINE] === 'string' ? params._meta[META_LINE] : '', info.line))
     if (bad && probing) {
-      const q = await terms(t, `mcp:${t.name}`, payHeader(null, grant), resource, refundUrl)
+      const q = await terms(t, `mcp:${t.name}`, payHeader(null, grant), resource, refundUrl, null, args)
       return q ? refusal(q) : failure({ error: 'invalid_arguments', tool: t.name, message: bad })
     }
     if (bad) return failure({ error: 'invalid_arguments', tool: t.name, message: bad })
@@ -1023,7 +1051,7 @@ function bridge(options = {}) {
     const g = await gate({ path: `mcp:${t.name}`, header: payHeader(params._meta?.[META_PAYMENT], grant, params._meta), resource, tool: offer(t), refundUrl, price, args }, (ctx) => within(bound, (signal) => perform(t, args, { ...ctx, signal }), { hangup: info.signal ?? null }), (r) => r.isError, info.signal ?? null)
     if (g.refused) return refusal(g.refused)
     if (g.threw && g.error?.code === 'out_of_time') return failure(whenCut(g.cut, outOfTime(false, bound)))
-    if (g.threw && quit(info.signal)) return failure({ ...hungUp(g.error, false).body, tool: t.name })
+    if (g.threw && quit(info.signal)) return failure(whenCut(g.cut, { ...hungUp(g.error, false).body, tool: t.name }))
     if (g.threw && g.error instanceof Fault) throw g.error.cause
     if (g.threw) return failure({ error: 'tool_failed', tool: t.name, message: message(g.error) })
     if (g.failed) return failed(g.value.value, t.name)
@@ -1118,7 +1146,7 @@ function bridge(options = {}) {
     if (Array.isArray(body) && !body.length) return json(400, { jsonrpc: '2.0', id: null, error: { code: -32600, message: 'invalid request: empty batch' } })
     const resource = publicUrl(request.url)
     const grant = request.headers.get('x-grant')
-    info = { ...info, line: lineOf(request), session: request.headers.get('mcp-session-id'), signal: request.signal, at: { method: request.method, path: new URL(request.url).pathname, ip: info.ip } }
+    info = { ...info, line: lineOf(request), session: request.headers.get('mcp-session-id'), signal: hangupOf(request, info), at: { method: request.method, path: new URL(request.url).pathname, ip: info.ip } }
     const opened = !era.modern && kind(body) === 'object' && body.method === 'initialize' && body.id !== undefined ? { 'mcp-session-id': takesMpp() && McpPayment.declares(body.params?.capabilities) ? McpPayment.session() : `mcp.${Base64Url.encode(randomBytes(12))}` } : {}
     info.payment = takesMpp() && (era.modern ? McpPayment.declares(body.params?._meta?.['io.modelcontextprotocol/clientCapabilities']) : McpPayment.inSession(request.headers.get('mcp-session-id')))
     if (era.modern) {
@@ -1140,7 +1168,7 @@ function bridge(options = {}) {
     if (kind(b) !== 'object') return json(400, { op: 'refund_failed', code: 'invalid_request', why: 'expected { channelId, issued, signature }, optional selfSend or gasPayment' })
     try {
       const r = await engine.refund(b)
-      return json(r.status, r.body)
+      return Number.isSafeInteger(r.turn) ? json(r.status, { ...r.body, turn: r.turn }, { [REFUND_TURN]: String(r.turn) }) : json(r.status, r.body)
     } catch (e) { return json(503, { op: 'refund_failed', code: 'refund_unavailable', why: message(e), retry_after_seconds: 5 }) }
   }
 
@@ -1164,12 +1192,12 @@ function bridge(options = {}) {
     : 'the payment check or settlement failed (error payment_unavailable); nothing is charged. Retry')
   const answers = (t, tag) => (isFree(t)
     ? { 200: { description: 'the result' }, 400: { description: 'invalid arguments' }, 500: { description: 'the tool failed' }, ...(freeCap(t) && !t.builtin ? { 429: { description: `over ${freeCap(t)} free calls an hour per address` } } : {}) }
-    : { 200: { description: 'the result' }, 400: { description: engine.mode === 'gate' ? 'invalid arguments; nothing is charged' : 'invalid arguments (error invalid_arguments), or a payment that does not decode (error bad_payment_header) or is neither a voucher nor a deposit (error bad_payment_type); nothing is charged' }, 402: { description: engine.mode === 'gate' ? 'a zero-value x402 signature is required; nothing is paid' : `${t.builtin === 'buy_time' || tag.per === 'unit' ? 'x402 payment required' : 'payment required: x402, or MPP when the 402 carries a Payment challenge'}${t.meter === 'time' ? '; on a line, the meter is off or the line is out of time' : ''}; a refund settling on the channel answers refund_settling` }, 403: { description: `key not admitted${t.meter === 'time' ? '; on a line, no line with that credential' : ''}` }, ...(t.meter === 'time' ? { 429: { description: 'too many calls are live on the line (error too_many_calls)' } } : {}), 500: { description: `the tool failed; nothing is charged per call${t.meter === 'time' ? ', and on a line the call has used the time it ran' : ''}` }, 503: { description: unavailable() } })
+    : { 200: { description: 'the result' }, 400: { description: engine.mode === 'gate' ? 'invalid arguments; nothing is charged' : 'invalid arguments (error invalid_arguments), or a payment that does not decode (error bad_payment_header) or is neither a voucher nor a deposit (error bad_payment_type); nothing is charged' }, 402: { description: engine.mode === 'gate' ? 'a zero-value x402 signature is required; nothing is paid' : `${t.builtin === 'buy_time' || tag.per === 'unit' ? 'x402 payment required' : 'payment required: x402, or MPP when the 402 carries a Payment challenge'}${t.meter === 'time' ? '; on a line, the meter is off (error meter_off), the line is out of time (error out_of_time) or the channel is withdrawing (error channel_leaving)' : ''}; a refund settling on the channel answers refund_settling` }, 403: { description: `key not admitted${t.meter === 'time' ? '; on a line, no line with that credential (error line_unknown)' : ''}` }, ...(t.meter === 'time' ? { 429: { description: 'too many calls are live on the line (error too_many_calls)' } } : {}), ...(t.route !== true || t.meter === 'time' ? { 499: { description: `the caller hung up or canceled the call, so it was stopped (error client_gone); nothing is charged${t.meter === 'time' ? ' per call, and on a line the line is billed for the time the call ran' : ''}` } } : {}), 500: { description: `the tool failed; nothing is charged per call${t.meter === 'time' ? ', and on a line the call has used the time it ran' : ''}` }, 503: { description: unavailable() } })
 
   const routeTag = (op) => {
     if (op.free === true) return describePrice(null, { free: true, perHour: freeCap(op) })
     if (engine.mode === 'gate') return { usd: '0', per: 'call' }
-    if (typeof op.price === 'function') return describePrice(null, { varies: true })
+    if (typeof op.price === 'function') return op.meter === 'time' ? lineVaries() : describePrice(null, { varies: true })
     const p = routePrice(op.price, null)
     return op.meter === 'time' ? { per: 'time', usd: usd(time.rateMicro), ms: time.rateMs, callUSD: usd(p.micro), callMs: meter.callMs(p.micro) } : describePrice(p)
   }
@@ -1205,15 +1233,15 @@ function bridge(options = {}) {
         if (!METHODS.includes(method)) { out[method] = v; continue }
         const { price, meter: by, free, freeLimit: own, responses = {}, ...op } = v
         const tag = routeTag(v)
-        const ours = answers({ name: path, meter: by, free, freeLimit: own }, tag)
+        const ours = answers({ name: path, meter: by, free, freeLimit: own, route: true }, tag)
         const both = Object.fromEntries(PAYMENT_ANSWERS.filter((code) => ours[code]).map((code) => [code, kind(responses[code]) === 'object' ? { ...responses[code], description: [ours[code].description, responses[code].description].filter((d) => typeof d === 'string' && d !== '').join('; ') } : ours[code]]))
         const key = `${method} ${path}`
         given[key] = op.operationId
         out[method] = { ...op, operationId: key, 'x-price': tag, responses: { ...ours, ...responses, ...both } }
         if (engine.server && engine.mode !== 'gate' && free !== true && typeof price !== 'function') {
-          let offer = null
-          try { offer = await engine.server.mppOffer(routePrice(price, null), null) } catch { offer = null }
-          if (offer !== null) offers[key] = offer
+          let offer = []
+          try { offer = await engine.server.mppOffers(routePrice(price, null), null) } catch { offer = [] }
+          if (offer.length) offers[key] = offer
         }
       }
       const under = root !== '' && path.startsWith(`${root}/`)
@@ -1243,12 +1271,13 @@ function bridge(options = {}) {
     if (engine.server && engine.mode !== 'gate') {
       for (const t of tools.values()) {
         if (isFree(t) || (!ownPrice(t) && typeof o.prices === 'function')) continue
-        let offer = null
-        try { offer = await engine.server.mppOffer(priceFor(t, {}), brief(t)) } catch { offer = null }
-        if (offer !== null) offers[t.name] = offer
+        let offer = []
+        try { offer = await engine.server.mppOffers(priceFor(t, {}), brief(t)) } catch { offer = [] }
+        if (offer.length) offers[t.name] = offer
       }
     }
-    const doc = { openapi: '3.0.3', info: { title: serverName, version, description: `${HOW[engine.mode]}. MCP: ${base}/mcp`, ...reach }, servers: [{ url: base }], paths }
+    const sessions = Object.values(offers).some((list) => list.some((offer) => offer.intent === Sessions.INTENT))
+    const doc = { openapi: '3.0.3', info: { title: serverName, version, description: `${HOW[engine.mode]}${sessions ? SESSIONS_HOW : ''}. MCP: ${base}/mcp`, ...reach }, servers: [{ url: base }], paths }
     const out = discovery(doc, offers, { homepage: site || null, ...(mount === null ? {} : { origin: base.slice(0, base.length - mount.length), mount }) })
     if (!routes.size) return out
     const listed = await routePaths(doc.info, mount === null ? base.slice(0, base.length - root.length) : null, root)
@@ -1260,6 +1289,7 @@ function bridge(options = {}) {
     const h = new Headers(res.headers)
     for (const [k, v] of Object.entries(CORS)) h.set(k, v)
     if (h.has('mcp-session-id')) h.set('access-control-expose-headers', `${CORS['access-control-expose-headers']}, Mcp-Session-Id`)
+    if (h.has(REFUND_TURN)) h.set('access-control-expose-headers', `${CORS['access-control-expose-headers']}, ${REFUND_TURN}`)
     return new Response(res.body, { status: res.status, statusText: res.statusText, headers: h })
   }
 
@@ -1316,7 +1346,7 @@ function bridge(options = {}) {
       ;(async () => {
         const hung = new AbortController()
         res.on?.('close', () => { if (!res.writableEnded) hung.abort() })
-        const response = await h(await toRequest(req, hung.signal), { ip: req.ip ?? req.socket?.remoteAddress })
+        const response = await h(await toRequest(req, hung.signal), { ip: req.ip ?? req.socket?.remoteAddress, signal: hung.signal })
         if (!response) return next()
         await send(res, response)
       })().catch((e) => lost(res, e, req))
@@ -1399,7 +1429,7 @@ function bridge(options = {}) {
         if (free === true) {
           const take = await freeTake(about(u.pathname)?.name ?? u.pathname, rest[0]?.ip, cap)
           if (!take.ok) return json(429, FreeLimit.refusal(cap, take.retryAfter), { 'retry-after': String(take.retryAfter) })
-          return handler(request, { signal: request.signal }, ...rest)
+          return handler(request, { signal: hangupOf(request, rest[0]) }, ...rest)
         }
         const sale = { path: u.pathname + u.search, header: (h) => request.headers.get(h), resource: publicUrl(request.url), tool: about(u.pathname), base }
         if (by === 'time') return timed(request, rest, handler, sale, price, line, sent)
@@ -1415,7 +1445,7 @@ function bridge(options = {}) {
 
   async function timed(request, rest, handler, sale, price, line, sent) {
     const name = sale.tool?.name ?? sale.path
-    const hangup = request.signal ?? null
+    const hangup = hangupOf(request, rest[0])
     const credential = line ? first(line(request)) : lineOf(request)
     const work = async (call) => {
       const r = await handler(request, call, ...rest)
@@ -1428,12 +1458,12 @@ function bridge(options = {}) {
       return sent(l.value.value, reading(l.meta))
     }
     let p
-    try { p = routePrice(price, request) } catch (e) { return json(500, { error: 'price_invalid', tool: name, message: message(e) }) }
+    try { p = onTime(routePrice(price, request)) } catch (e) { return json(500, { error: 'price_invalid', tool: name, message: message(e) }) }
     const bound = meter.callMs(p.micro)
     const g = await gate({ ...sale, price: p }, (ctx) => within(bound, (signal) => work({ ...ctx, signal }), { hangup }), (r) => r.isError === true, hangup)
     if (g.refused) return json(g.refused.status, g.refused.body, g.refused.headers)
     if (g.threw && g.error?.code === 'out_of_time') return json(402, whenCut(g.cut, outOfTime(false, bound)))
-    if (g.threw && quit(hangup)) { const l = hungUp(g.error, false, { tool: name }); return json(l.status, l.body) }
+    if (g.threw && quit(hangup)) { const l = hungUp(g.error, false, { tool: name }); return json(l.status, whenCut(g.cut, l.body)) }
     if (g.threw) return json(500, { error: 'tool_failed', tool: name, message: message(g.error) })
     if (g.failed) return g.value.value ?? json(500, { error: 'tool_failed', tool: name, message: 'the route returned no response' })
     if (!g.settlement.ok) return json(g.settlement.status, g.settlement.body, g.settlement.headers)
@@ -1496,7 +1526,7 @@ function bridge(options = {}) {
       const st = await meter.status(ctx.channelId)
       return { channelId: ctx.channelId, boughtMs: ms, msRemaining: st.msRemaining + ms, paidUSD: usd(timeMicro(time, ms)) }
     }) })
-    tools.set('line', { name: 'line', builtin: 'line', free: true, description: 'A line spends bought time without a payment per call. op: open {channelId} returns a message to sign with the payer key; prove {channelId, nonce, signature} returns the credential; on, off, status, close {credential}.', inputSchema: { type: 'object', properties: { op: { type: 'string', enum: LINE_OPS, description: LINE_ARGUMENTS.op }, channelId: { type: 'string', description: LINE_ARGUMENTS.channelId }, nonce: { type: 'string', description: LINE_ARGUMENTS.nonce }, signature: { type: 'string', description: LINE_ARGUMENTS.signature }, credential: { type: 'string', description: LINE_ARGUMENTS.credential } }, required: ['op'] }, run: guarded(async (args, ctx) => {
+    tools.set('line', { name: 'line', builtin: 'line', free: true, description: 'A line spends bought time without a payment per call. {"op":"open","channelId":"0x…"} returns a message to sign with the payer key; {"op":"prove","channelId":"0x…","nonce":"…","signature":"0x…"} returns the credential; {"op":"on","credential":"…"} and {"op":"off","credential":"…"} switch the channel\'s meter on and off; {"op":"status","credential":"…"} reads the line; {"op":"close","credential":"…"} ends it.', inputSchema: { type: 'object', properties: { op: { type: 'string', enum: LINE_OPS, description: LINE_ARGUMENTS.op }, channelId: { type: 'string', description: LINE_ARGUMENTS.channelId }, nonce: { type: 'string', description: LINE_ARGUMENTS.nonce }, signature: { type: 'string', description: LINE_ARGUMENTS.signature }, credential: { type: 'string', description: LINE_ARGUMENTS.credential } }, required: ['op'] }, run: guarded(async (args, ctx) => {
       const l = await lineOp(args, ctx.line ?? '')
       return l.status === 200 ? l.body : { isError: true, structuredContent: l.body, content: text(l.body) }
     }) })

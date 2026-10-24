@@ -145,6 +145,11 @@ export const Clock = {
     return true
   },
 
+  owe(rec, owed, now, idleMs = 0) {
+    for (const [key, ms] of Object.entries(owed ?? {})) if (Number.isSafeInteger(ms) && ms > 0) Clock.buy(rec, ms, key, now, idleMs)
+    return rec
+  },
+
   unbuy(rec, ms, key, now, idleMs = 0) {
     if (!rec.credited.includes(key)) return 0
     Clock.settle(rec, now, idleMs)
@@ -219,12 +224,13 @@ export function timeText(t, base = '') {
   const idle = t.idleMs > 0 ? ` and ${t.idleMs} ms after each` : ''
   const step = t.rateMs > 1 ? ` in steps of ${t.rateMs} ms` : ''
   const most = t.maxMs ? ` (up to ${t.maxMs} ms a purchase)` : ''
-  return `Line time: ${timeRate(t)}. buy_time {"ms": N}${step}${most}; buying again adds time; the time is credited to the paying channel once the payment settles. Open a line: POST ${base}/line {"op":"open","channelId":"0x…"}, sign the message it returns with the payer key, POST {"op":"prove","channelId":"0x…","nonce":"…","signature":"0x…"}. Send the credential as x-line (MCP: _meta["zeam-pass/line"]). Time burns while a call runs on the line${idle}; a call stops when the time runs out. {"op":"off"}: no new calls on the line; a running call burns to its end. Unburned time comes back with a refund.`
+  return `Line time: ${timeRate(t)}. buy_time {"ms": N}${step}${most}; buying again adds time; the time is credited to the paying channel once the payment settles. Open a line: POST ${base}/line {"op":"open","channelId":"0x…"}, sign the message it returns with the payer key, POST {"op":"prove","channelId":"0x…","nonce":"…","signature":"0x…"}. Send the credential as x-line (MCP: _meta["zeam-pass/line"]). Time burns while a call runs on the line${idle}; a call stops when the time runs out. {"op":"off"}: no new calls on any line of the channel; a running call burns to its end. Unburned time comes back with a refund.`
 }
 
 export class TimeMeter {
-  constructor(dir, t, { now = () => Date.now(), clocks = null, lines = null, alive = null } = {}) {
+  constructor(dir, t, { now = () => Date.now(), clocks = null, lines = null, alive = null, owed = null } = {}) {
     this.t = t
+    this.owed = owed
     this.now = now
     this.clocks = clocks ?? new ChannelFileStore(`${dir}/clocks`)
     this.lines = lines ?? new ChannelFileStore(`${dir}/lines`)
@@ -235,6 +241,7 @@ export class TimeMeter {
     this.marks = new Map()
     this.starts = new Map()
     this.stops = new Map()
+    this.opening = new Set()
   }
 
   async pulse() {
@@ -280,10 +287,15 @@ export class TimeMeter {
     return rec
   }
 
-  running(rec, now) {
+  seen() {
+    return { starts: new Map(this.starts), stops: new Map(this.stops), opening: new Set(this.opening) }
+  }
+
+  running(rec, now, seen = this.seen()) {
     for (const [id, c] of Object.entries(rec.calls ?? {})) {
-      const started = this.starts.get(`${rec.channelId}:${id}`)
-      const stopped = this.stops.get(`${rec.channelId}:${id}`)
+      const key = `${rec.channelId}:${id}`
+      const started = seen.starts.get(key) ?? (seen.opening.has(key) ? now : undefined)
+      const stopped = seen.stops.get(key)
       const ran = stopped === undefined ? now : Math.min(stopped, now)
       if (ran > c.deadline) continue
       if (started !== undefined && started > c.start) c.start = Math.min(started, ran)
@@ -305,20 +317,32 @@ export class TimeMeter {
     return Math.min(mulDiv(priceMicro, this.t.rateMs, this.t.rateMicro), Number.MAX_SAFE_INTEGER)
   }
 
+  async owing(channelId) {
+    if (this.owed === null) return null
+    const o = await this.owed.read(channelId)
+    return o !== null && typeof o === 'object' && Object.keys(o).length > 0 ? o : null
+  }
+
   async change(channelId, fn) {
+    const owed = await this.owing(channelId)
     let out
     await this.clocks.update(channelId, async (current) => {
       const rec = await this.reap(current ?? Clock.fresh(channelId), this.now())
+      if (owed !== null) Clock.owe(rec, owed, this.now(), this.t.idleMs)
       out = fn(rec)
       return rec
     })
+    if (owed !== null) await Promise.resolve(this.owed.paid(channelId, Object.keys(owed))).catch(() => {})
     return out
   }
 
   async status(channelId) {
-    const stored = (await this.clocks.get(channelId)) ?? Clock.fresh(channelId)
+    const owed = await this.owing(channelId)
     const now = this.now()
-    const rec = this.running(await this.reap(structuredClone(stored), now), now)
+    const seen = this.seen()
+    const stored = (await this.clocks.get(channelId)) ?? Clock.fresh(channelId)
+    const rec = this.running(await this.reap(structuredClone(stored), now), now, seen)
+    if (owed !== null) Clock.owe(rec, owed, now, this.t.idleMs)
     return { channelId: rec.channelId, msRemaining: Clock.remaining(rec, now, this.t.idleMs), msSpent: Clock.spent(rec, now, this.t.idleMs), msReturned: rec.returnedMs, metering: rec.on, rateUSD: usd(this.t.rateMicro), rateMs: this.t.rateMs }
   }
 
@@ -336,14 +360,21 @@ export class TimeMeter {
 
   async begin(channelId, id) {
     await this.pulse()
-    const b = await this.change(channelId, (rec) => {
-      const r = Clock.begin(rec, id, this.now(), this.t.idleMs, this.t.maxCalls)
-      if (r.ok) rec.calls[id].by = this.boot
-      return r
-    })
+    const key = `${String(channelId).toLowerCase()}:${id}`
+    this.opening.add(key)
+    let b
+    try {
+      b = await this.change(channelId, (rec) => {
+        const r = Clock.begin(rec, id, this.now(), this.t.idleMs, this.t.maxCalls)
+        if (r.ok) rec.calls[id].by = this.boot
+        return r
+      })
+    } finally {
+      this.opening.delete(key)
+    }
     if (!b.ok) return b
     const started = this.now()
-    this.starts.set(`${String(channelId).toLowerCase()}:${id}`, started)
+    this.starts.set(key, started)
     this.keepAlive()
     return { ...b, started }
   }
@@ -351,7 +382,12 @@ export class TimeMeter {
   async end(channelId, id, started = null, stopped = null) {
     if (stopped !== null) this.stopped(channelId, id, stopped)
     try {
-      return await this.change(channelId, (rec) => { const now = this.now(); return { ...Clock.end(rec, id, now, this.t.idleMs, started, stopped), msRemaining: Clock.left(rec, now, this.t.idleMs) } })
+      return await this.change(channelId, (rec) => {
+        const now = this.now()
+        const seen = this.seen()
+        const out = Clock.end(rec, id, now, this.t.idleMs, started, stopped)
+        return { ...out, msRemaining: Clock.left(this.running(structuredClone(rec), now, seen), now, this.t.idleMs) }
+      })
     } finally {
       this.starts.delete(`${String(channelId).toLowerCase()}:${id}`)
       this.stops.delete(`${String(channelId).toLowerCase()}:${id}`)
@@ -384,8 +420,12 @@ export class TimeMeter {
   }
 
   async unburnedMicro(channelId) {
+    const owed = await this.owing(channelId)
     const stored = await this.clocks.get(channelId)
-    return stored === null ? 0 : Clock.unburnedMicro(await this.reap(stored, this.now()), this.now(), this.t.idleMs, this.t.rateMicro, this.t.rateMs)
+    if (stored === null && owed === null) return 0
+    const rec = await this.reap(stored ?? Clock.fresh(channelId), this.now())
+    if (owed !== null) Clock.owe(rec, owed, this.now(), this.t.idleMs)
+    return Clock.unburnedMicro(rec, this.now(), this.t.idleMs, this.t.rateMicro, this.t.rateMs)
   }
 
   async forget(channelId) {
@@ -409,7 +449,7 @@ export class TimeMeter {
     })
   }
 
-  async prove(channel, nonce, signature, owners = null) {
+  async prove(channel, nonce, signature, owners = null, gate = null) {
     if (nonce === undefined || nonce === null || nonce === '') return { ok: false, status: 400, code: 'bad_request', why: 'nonce is missing: send the nonce the open answer gave, with your signature of its message' }
     if (typeof signature !== 'string' || !signature) return { ok: false, status: 400, code: 'bad_request', why: 'signature is missing or is not a string: sign the message the open answer gave and send it with the nonce' }
     const channelId = String(channel.channelId).toLowerCase()
@@ -429,13 +469,18 @@ export class TimeMeter {
     if (!(owners ?? ESCROWS.default.owners(channel.channelConfig)).some((a) => who === String(a ?? '').toLowerCase())) return { ok: false, status: 403, code: 'not_the_payer', why: `${who} is not this channel's payer` }
     const credential = randomBytes(32).toString('base64url')
     const h = TimeMeter.hash(credential)
-    await this.lines.update(h, () => ({ channelId, at: now }))
-    const msRemaining = await this.change(channelId, (rec) => {
+    const attach = (refusal = null) => this.change(channelId, (rec) => {
+      if (rec.lines.length === 0) {
+        if (refusal !== null) return { refused: refusal }
+        Clock.switch(rec, true, this.now(), this.t.idleMs)
+      }
       rec.lines = [...rec.lines, h]
-      Clock.switch(rec, true, now, this.t.idleMs)
-      return Clock.left(rec, now, this.t.idleMs)
+      return { msRemaining: Clock.left(rec, this.now(), this.t.idleMs), metering: rec.on }
     })
-    return { ok: true, credential, channelId, msRemaining }
+    const opened = gate === null ? await attach() : await gate(attach)
+    if (opened.refused !== undefined) return { ok: false, refused: opened.refused }
+    await this.lines.update(h, () => ({ channelId, at: now }))
+    return { ok: true, credential, channelId, msRemaining: opened.msRemaining, metering: opened.metering }
   }
 
   async line(credential) {

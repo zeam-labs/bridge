@@ -7,7 +7,12 @@ from ..php import is_numeric, php_round, to_float, to_int
 
 class GasQuote:
     QUOTE_TTL = 60
+    RECENT_SECS = 5
     FLOOR_TTL = 86400 * 30
+    RETRY_SECS = 20
+    RETRY_FIRST_MS = 250
+    RETRY_MOST_MS = 4000
+    RETRY_KEY = "zeam_pass_gas_retry"
 
     def __init__(self, cfg, chain, relay=None):
         self.cfg = cfg
@@ -47,36 +52,63 @@ class GasQuote:
             self.cfg.cache.set(key, sender, self.QUOTE_TTL)
         return sender
 
-    def wei_per_gas(self, fresh=False):
+    def wei_per_gas(self, fresh=False, recent=None):
         if self.cfg.gasPriceWei is not None and self.cfg.gasPriceWei != "":
             return str(self.cfg.gasPriceWei)
         key = "zeam_pass_gas_price"
-        hit = None if fresh else self.cfg.cache.get(key)
-        if isinstance(hit, str) and hit.isdigit():
-            return hit
+        near = None if recent is None else self.cfg.cache.get(key + "_recent")
+        if recent is not None and isinstance(near, str) and near.isdigit():
+            return near
+        hit = self.cfg.cache.get(key)
+        last = hit if isinstance(hit, str) and hit.isdigit() else None
+        if last is not None and not fresh and recent is None:
+            return last
+        retry = self.retry_of(self.cfg.cache.get(self.RETRY_KEY))
+        if last is not None and retry is not None and self.cfg.now_ms() < retry["due"]:
+            return last
         try:
             wei = self.chain.gas_price()
         except Exception:
-            return None
+            self.missed(retry)
+            return last
         self.cfg.cache.set(key, wei, self.QUOTE_TTL)
+        if recent is not None:
+            self.cfg.cache.set(key + "_recent", wei, recent)
+        if retry is not None:
+            self.cfg.cache.set(self.RETRY_KEY, "", 1)
         return wei
 
-    def _eth_of(self, units, fresh=False):
-        wei = self.wei_per_gas(fresh)
+    def missed(self, retry):
+        now = self.cfg.now_ms()
+        since = now if retry is None else retry["since"]
+        left = since + self.RETRY_SECS * 1000 - now
+        if left <= 0:
+            self.cfg.cache.set(self.RETRY_KEY, "", 1)
+            return
+        wait = self.RETRY_FIRST_MS if retry is None else min(retry["wait"] * 2, self.RETRY_MOST_MS)
+        self.cfg.cache.set(self.RETRY_KEY, f"{since}:{now + wait}:{wait}", int(math.ceil(left / 1000)))
+
+    @staticmethod
+    def retry_of(v):
+        m = re.fullmatch(r"(\d+):(\d+):(\d+)", v) if isinstance(v, str) else None
+        return None if m is None else {"since": int(m.group(1)), "due": int(m.group(2)), "wait": int(m.group(3))}
+
+    def _eth_of(self, units, fresh=False, recent=None):
+        wei = self.wei_per_gas(fresh, recent)
         eth = None if wei is None else self.eth_usd()
         if wei is None or eth is None or int(wei) <= 0:
             return None
         return float(int(wei) * int(units)) / 1e18, eth, wei
 
-    def micro_usd(self, units):
-        q = self._eth_of(int(php_round(units)))
+    def micro_usd(self, units, recent=None):
+        q = self._eth_of(int(php_round(units)), False, recent)
         return None if q is None else int(math.ceil(q[0] * q[1] * 1e6))
 
     def usd(self, units):
         q = self._eth_of(int(math.ceil(units * self.cfg.gasBuffer)))
         return None if q is None else q[0] * q[1]
 
-    def _priced(self, units, wei, eth, l1_units=0):
+    def priced(self, units, wei, eth, l1_units=0):
         buffered = int(math.ceil(units * self.cfg.gasBuffer))
         in_eth = float(int(wei) * int(math.ceil((units + l1_units) * self.cfg.gasBuffer))) / 1e18
         cost_eth = float(int(wei) * int(units + l1_units)) / 1e18
@@ -93,7 +125,7 @@ class GasQuote:
 
     def quote(self, units, fresh=True):
         at = self._snapshot(fresh)
-        return None if at is None else self._priced(units, at[0], at[1])
+        return None if at is None else self.priced(units, at[0], at[1])
 
     def refund(self, claim_rides, fresh=True, already_paid=0):
         g = self.cfg.gas
@@ -101,9 +133,9 @@ class GasQuote:
         if at is None:
             return None
         cover = g["deposit"] + g["refund"] + (g["refundClaim"] if claim_rides else 0) + already_paid
-        pay = g["refund"] + (g["paidClaim"] if claim_rides else 0) + g["gasPayment"]
+        pay = g["paidRefundLeg"] + (g["paidClaim"] if claim_rides else 0) + g["gasPayment"]
         l1 = g["paidL1"] + (g["paidClaimL1"] if claim_rides else 0)
-        return {"cover": self._priced(cover, at[0], at[1]), "pay": self._priced(pay, at[0], at[1], l1)}
+        return {"cover": self.priced(cover, at[0], at[1]), "pay": self.priced(pay, at[0], at[1], l1)}
 
     def relay_quote(self, call):
         return self.relay.quote(call, True) if self.relay and call else None

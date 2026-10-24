@@ -43,6 +43,11 @@ final class Channels
         return $c !== null && isset($c['refundingJudging']) && $c['refundingJudging'] === true && self::refundingWaitMs($c, $now) > 0;
     }
 
+    public static function checking($c, $now)
+    {
+        return self::judging($c, $now) && ($c['refundingCheck'] ?? null) === true;
+    }
+
     public static function weighed($c, $now)
     {
         if ($c === null || !isset($c['refundsJudged']) || !is_array($c['refundsJudged'])) {
@@ -98,6 +103,19 @@ final class Channels
     public function judgeWaitMs()
     {
         return max(0, (int) ($this->cfg !== null && isset($this->cfg->refundJudgeWaitMs) ? $this->cfg->refundJudgeWaitMs : 5000));
+    }
+
+    public function checked($channelId)
+    {
+        $deadline = $this->nowMs() + $this->judgeWaitMs();
+        for (;;) {
+            $c = $this->get($channelId);
+            $now = $this->nowMs();
+            if (!self::checking($c, $now) || $now >= $deadline) {
+                return $c;
+            }
+            $this->sleepMs(self::JUDGING_POLL_MS);
+        }
     }
 
     public function judged($channelId, $pending = false)
@@ -164,6 +182,9 @@ final class Channels
                         return $r;
                     }
                     $now = $this->nowMs();
+                    if ($sending && isset($r['refundingBy']) && $r['refundingBy'] === $holder && Channels::checking($r, $now)) {
+                        return $r;
+                    }
                     if (Channels::judging($r, $now)) {
                         $out = ['wait' => true];
                     } elseif (Channels::refundingWaitMs($r, $now) > 0) {
@@ -176,6 +197,7 @@ final class Channels
                         $r['refundingUntil'] = $now + Channels::JUDGING_TTL_MS;
                         $r['refundingBy'] = $holder;
                         $r['refundingJudging'] = true;
+                        $r['refundingCheck'] = true;
                     } else {
                         $r['refundingUntil'] = $now + Channels::JUDGING_TTL_MS;
                         $r['refundingBy'] = $holder;
@@ -209,7 +231,7 @@ final class Channels
                 }
                 $r['refundingUntil'] = $now + Channels::REFUNDING_TTL_MS;
                 $r['refundingBy'] = $holder;
-                unset($r['refundingJudging']);
+                unset($r['refundingJudging'], $r['refundingCheck']);
                 return Channels::unweighed($r, $holder, $now);
             });
         } catch (\Throwable $e) {
@@ -226,7 +248,7 @@ final class Channels
                     return $r;
                 }
                 if (isset($r['refundingBy']) && $r['refundingBy'] === $holder) {
-                    unset($r['refundingUntil'], $r['refundingBy'], $r['refundingJudging']);
+                    unset($r['refundingUntil'], $r['refundingBy'], $r['refundingJudging'], $r['refundingCheck']);
                 }
                 return Channels::unweighed($r, $holder, $this->nowMs());
             });
@@ -251,6 +273,55 @@ final class Channels
     public static function max($a, $b)
     {
         return Big::cmp(self::n($a), self::n($b)) >= 0 ? self::n($a) : self::n($b);
+    }
+
+    public function serial($channelId, callable $fn)
+    {
+        return method_exists($this->store, 'serial') ? $this->store->serial(strtolower((string) $channelId), $fn) : $fn();
+    }
+
+    public function serialBusy($channelId)
+    {
+        return method_exists($this->store, 'serialBusy') ? (bool) $this->store->serialBusy(strtolower((string) $channelId)) : false;
+    }
+
+    public function ticket($channelId)
+    {
+        if (!method_exists($this->store, 'ticket')) {
+            return null;
+        }
+        return $this->store->ticket(strtolower((string) $channelId), $this->nowMs() + self::JUDGING_TTL_MS);
+    }
+
+    public function ahead($channelId, $ticket)
+    {
+        if ($ticket === null) {
+            return [];
+        }
+        $id = strtolower((string) $channelId);
+        $now = $this->nowMs();
+        $this->store->renew($id, $ticket, $now + self::JUDGING_TTL_MS);
+        return $this->store->ahead($id, $ticket, $now);
+    }
+
+    public function awaitTicket($channelId, array $earlier, $untilMs)
+    {
+        $now = $this->nowMs();
+        if ($untilMs <= $now) {
+            return false;
+        }
+        return method_exists($this->store, 'awaitTicket') ? $this->store->awaitTicket(strtolower((string) $channelId), $earlier, (int) $untilMs, $now) : null;
+    }
+
+    public function untick($channelId, $ticket)
+    {
+        if ($ticket === null) {
+            return;
+        }
+        try {
+            $this->store->untick(strtolower((string) $channelId), $ticket);
+        } catch (\Throwable $e) {
+        }
     }
 
     public function get($channelId)

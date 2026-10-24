@@ -114,6 +114,11 @@ def pricing(price):
     if price["unitMicro"] is not None:
         return (f"Up to ${usd(price['micro'])} per call, reserved; charged ${usd(price['unitMicro'])} per unit the call reports, "
                 "at most the reserve. A failed call is not charged.")
+    if price.get("rateMicro"):
+        call_ms = min((price["micro"] * price["rateMs"]) // price["rateMicro"], MAX_SAFE)
+        per = "ms" if price["rateMs"] == 1 else f"{price['rateMs']} ms"
+        return (f"${usd(price['micro'])} per call of up to {call_ms} ms without a line; ${usd(price['rateMicro'])} per {per} on a line. "
+                "A failed call without a line is not charged; on a line a call burns the time it runs, failed or not.")
     return f"${usd(price['micro'])} per call. A failed call is not charged."
 
 

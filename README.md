@@ -1,6 +1,6 @@
 # ZEAM :: Bridge
 
-Let agents into your service. Charge per call, admit listed keys, or both, over MCP and HTTP on Base. x402 and MPP clients both pay.
+Let agents into your service. Charge per call, admit listed keys, or both, over MCP and HTTP on Base. x402 clients pay for every tool, and MPP clients for a tool priced per call whose fee covers the gas of its transfer.
 No sign-up and no API key for the agent.
 
 - `node/`: `@zeambridge/bridge` on npm (Node 18+)
@@ -10,7 +10,7 @@ No sign-up and no API key for the agent.
 - `docs/AGENTS.md`: paying a ZEAM :: Bridge seller as an agent: with a pass, with the Pass client, or with any x402 or MPP client
 - `docs/ENGINE.md`: the engine and its constants
 
-Formerly ZEAM :: Pass: `@zeam-labs/pass` and `zeam-pass` keep working and point here. ZEAM :: Pass is now the buyer side: https://zeampass.com/pass
+Formerly ZEAM :: Pass: `@zeam-labs/pass` and `zeam-pass` keep working and point here. ZEAM :: Pass is now the buyer side: https://zeampass.com/
 
 The seller keeps 90.01% of every sale; 9.99% goes to ZEAM. A gate's first 10,000 checks a month are free.
 

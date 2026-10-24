@@ -13,6 +13,7 @@ from ..pricing import exact_usd, pricing
 from .channels import Channels, n
 from .chain import Chain
 from .config import Config
+from ..discovery import percent, refund_rule
 from .gas_quote import GasQuote
 from .jsonx import Json
 from .mpp import Challenge, Credential, EvmCharge, MppError, Problem, Receipt
@@ -29,6 +30,7 @@ SDK_FIELDS = (
 _CHANNEL = re.compile(r"^0x[0-9a-fA-F]{64}$")
 MPP_TTL_SECS = 300
 _MPP_USED_TRIES = 5
+_MPP_SHOWN_RETRY_SECS = 2
 _AUTHORIZATION_USED = Keccak.utf8("AuthorizationUsed(address,bytes32)")
 _DEFAULT_PORTS = {"http": 80, "https": 443, "ws": 80, "wss": 443, "ftp": 21}
 
@@ -149,7 +151,7 @@ class Server:
 
     @staticmethod
     def percent(share):
-        return ("%.2f" % (float(share) * 100)).rstrip("0").rstrip(".")
+        return percent(share)
 
     def _price(self, price):
         return price if isinstance(price, dict) else {"micro": self.micro(price), "unitMicro": None}
@@ -177,10 +179,11 @@ class Server:
             "deposit": "First call on a channel deposits at least $" + Server._usd(floor)
                        + ". Later calls spend it. The unspent balance is refundable.",
             "refund": ("Refund: " + where + " with {channelId, issued, signature} signed by the payer; add channelConfig "
-                       "if the channel has no calls. ZEAM pays the gas when the channel's fees (" + Server.percent(self.cfg.feeShare) + "% of its spend) cover "
-                       "the gas of its deposit, its refund and any calls not yet settled, and of every further deposit and every earlier refund ZEAM paid for on that channel, plus " + str(int(php_round((self.cfg.gasBuffer - 1) * 100))) + "%" + about(cover) + ". Otherwise sign a gasless USDC payment of the refund "
-                       "gas (" + figure + str(margin) + "% margin included); a refund request answers with the figure to sign. An unsettled call adds its claim gas. "
-                       "{\"selfSend\": true}: a signed refund you send at your own gas."),
+                       "if the channel has no calls. " + refund_rule(int(php_round((self.cfg.gasBuffer - 1) * 100)), margin) + " Our fee is " + Server.percent(self.cfg.feeShare) + "% of what the buyer spends, against the gas it must cover with the margin"
+                       + about(cover) + ". When it falls short, sign a gasless USDC payment of the refund gas ("
+                       + figure + str(margin) + "% margin included); a refund request answers with the figure to sign. An unsettled call adds its claim gas. "
+                       "{\"selfSend\": true}: a signed refund you send from any wallet at your own gas."),
+            "split": self.cfg.relay_split(),
         }
 
     def payment_required(self, resource, extensions=None, refund_url=None, more=None, price=None):
@@ -227,7 +230,7 @@ class Server:
                 "tokenDomain": BatchSettlement.token_domain(asset["address"], asset["name"], version, self.cfg.chainId)}
 
     def mpp_floor_micro_usd(self):
-        gas = self.gas_quote.micro_usd(int(math.ceil(self.cfg.gas["charge"] * self.cfg.gasBuffer)))
+        gas = self.gas_quote.micro_usd(int(math.ceil(self.cfg.gas["charge"] * self.cfg.gasBuffer)), GasQuote.RECENT_SECS)
         return None if gas is None else int(math.ceil(gas / self.cfg.feeShare))
 
     def mpp_quote(self, micro):
@@ -267,11 +270,16 @@ class Server:
             description = _shorten(res["description"], 120)
         return Challenge.issue(self.cfg.mpp_secret(), self.mpp_realm(resource), EvmCharge.METHOD, EvmCharge.INTENT, request, expires, description, Challenge.once())
 
-    def mpp_refuse(self, resource, micro, error):
-        q = self.payment_required(resource, None, None, {}, micro)
+    @staticmethod
+    def without_deposit(q):
+        body = {k: v for k, v in q["body"].items() if k != "deposit"}
+        return {**q, "body": body, "headers": {**q["headers"], "PAYMENT-REQUIRED": Json.base64(for_header(body))}}
+
+    def mpp_refuse(self, resource, micro, error, refund_url=None):
+        q = Server.without_deposit(self.payment_required(resource, None, refund_url, {}, micro))
         return Server._refuse(402, {**Problem.of(error), "accepts": q["body"]["accepts"]}, q["headers"])
 
-    def mpp_hold(self, header_value, resource, price=None):
+    def mpp_hold(self, header_value, resource, price=None, refund_url=None):
         micro = self.micro(price)
         asset = self.mpp_asset()
         try:
@@ -286,29 +294,101 @@ class Server:
                 digest = BatchSettlement.transfer_authorization_digest(expect["tokenDomain"], verified["authorization"])
                 if not self.chain.is_valid_signature(verified["payer"], digest, verified["signature"]):
                     raise MppError("verification-failed", "the authorization signature is not valid for its payer")
+            was = self.mpp_held.entry(verified["replayKey"])
+            if was is not None and was.get("sent"):
+                return self._mpp_sent(verified, was, resource, micro, asset["address"], refund_url)
             if self.mpp_used(asset["address"], verified):
                 raise MppError("verification-failed", "this authorization has already been used")
             if int(self.chain.balance_of(asset["address"], verified["payer"])) < int(verified["authorization"]["value"]):
                 raise MppError("verification-failed", "the payer does not hold the amount")
         except MppError as e:
-            return self.mpp_refuse(resource, micro, e)
+            return self.mpp_refuse(resource, micro, e, refund_url)
         if not self.mpp_held.claim(verified["replayKey"], int(verified["authorization"]["validBefore"]) * 1000, self.cfg.now_ms()):
-            return self.mpp_refuse(resource, micro, MppError("verification-failed", "this authorization is already in use"))
-        return {"ok": True, "hold": {"kind": "mpp", "verified": verified, "micro": micro, "resource": Server.resource_info(resource), "asset": asset["address"]}}
+            return self.mpp_refuse(resource, micro, MppError("verification-failed", "this authorization is already in use"), refund_url)
+        return {"ok": True, "hold": {"kind": "mpp", "verified": verified, "micro": micro, "resource": Server.resource_info(resource), "asset": asset["address"], "refundUrl": refund_url}}
 
     def mpp_used(self, token, verified):
         out = self.chain.call(token, Abi.encode_call("authorizationState(address,bytes32)", [verified["payer"], verified["authorization"]["nonce"]]))
         return int(Hex.lower(out)[2:] or "0", 16) != 0
 
+    @staticmethod
+    def _used_in(receipt, token, v):
+        if receipt is None or str(receipt.get("status") if receipt.get("status") is not None else "").lower() != "0x1":
+            return False
+        for entry in receipt.get("logs") or []:
+            topics = entry.get("topics") or []
+            if (Address.equals(entry.get("address"), token) and len(topics) >= 3 and str(topics[0]).lower() == _AUTHORIZATION_USED
+                    and str(topics[1]).lower() == _topic_of(v["payer"]) and str(topics[2]).lower() == v["authorization"]["nonce"]):
+                return True
+        return False
+
+    def _mpp_not_shown(self, resource, micro, tx_hash, refund_url):
+        out = self.mpp_refuse(resource, micro, MppError(
+            "verification-failed",
+            f"the payment was sent in transaction {tx_hash} and the chain this seller reads does not show it yet, so this call was not delivered. Nothing more is sent for it. "
+            f"Send this credential again in {_MPP_SHOWN_RETRY_SECS}s: once the transfer shows, the call is delivered, once; if the transfer did not happen, nothing was charged.",
+            {"code": "sent_not_shown", "txHash": tx_hash, "retry_after_seconds": _MPP_SHOWN_RETRY_SECS}), refund_url)
+        out["headers"] = {**out["headers"], "Retry-After": str(_MPP_SHOWN_RETRY_SECS)}
+        return out
+
+    def _mpp_sent(self, verified, was, resource, micro, asset, refund_url):
+        key = verified["replayKey"]
+        now = self.cfg.now_ms()
+
+        def refuse(detail):
+            return self.mpp_refuse(resource, micro, MppError("verification-failed", detail), refund_url)
+
+        state = was.get("state")
+        gone = state == "sending" and now - int(was.get("at") or 0) > 2000 * self.cfg.receiptTimeoutSecs + 60000
+        if state == "delivered":
+            return refuse("this authorization has already been used")
+        if state != "sent" and not gone:
+            return refuse("this authorization is already in use")
+        try:
+            receipt = self.chain.receipt(was["sent"])
+        except Exception:
+            receipt = None
+        if receipt is None:
+            return self._mpp_not_shown(resource, micro, was["sent"], refund_url)
+        if Server._used_in(receipt, asset, verified):
+            if not self.mpp_held.mark(key, state, {"state": "taken", "at": now}):
+                return refuse("this authorization is already in use")
+            return {"ok": True, "hold": {"kind": "mpp", "verified": verified, "micro": micro, "resource": Server.resource_info(resource), "asset": asset, "refundUrl": refund_url, "landed": was["sent"]}}
+        try:
+            used = self.mpp_used(asset, verified)
+        except Exception:
+            return self._mpp_not_shown(resource, micro, was["sent"], refund_url)
+        if used:
+            return refuse("this authorization has already been used")
+        if not self.mpp_held.mark(key, state, {"state": "settled", "at": now}):
+            return refuse("this authorization is already in use")
+        self.mpp_held.release(key)
+        how = "did not use this authorization" if str(receipt.get("status") or "").lower() == "0x1" else "reverted"
+        return refuse(f"the payment did not settle. Not delivered; nothing was charged. Transaction {was['sent']} {how}.")
+
+    def _mpp_delivered(self, v, tx_hash):
+        at = datetime.fromtimestamp(self.cfg.now_ms() / 1000, timezone.utc)
+        timestamp = at.strftime("%Y-%m-%dT%H:%M:%S.") + "%03dZ" % (at.microsecond // 1000)
+        response = {"success": True, "transaction": Hex.lower(tx_hash), "network": self.cfg.network, "payer": v["payer"], "amount": v["authorization"]["value"],
+                    "extra": {"protocol": "mpp", "method": EvmCharge.METHOD, "intent": EvmCharge.INTENT, "challengeId": v["challenge"]["id"]}}
+        return {"ok": True, "status": 200, "response": response, "headers": {"Payment-Receipt": Receipt.header(EvmCharge.receipt(v, tx_hash, timestamp))}}
+
     def mpp_release(self, hold):
+        if hold.get("landed"):
+            self.mpp_held.mark(hold["verified"]["replayKey"], "taken", {"state": "sent"})
+            return
         self.mpp_held.release(hold["verified"]["replayKey"])
 
     def mpp_settle(self, hold):
         v = hold["verified"]
+        if hold.get("landed"):
+            if not self.mpp_held.mark(v["replayKey"], "taken", {"state": "delivered", "at": self.cfg.now_ms()}):
+                return self.mpp_refuse(hold["resource"], hold["micro"], MppError("verification-failed", "this authorization is already in use"), hold.get("refundUrl"))
+            return self._mpp_delivered(v, hold["landed"])
 
         def fail(detail):
             self.mpp_release(hold)
-            return self.mpp_refuse(hold["resource"], hold["micro"], MppError("verification-failed", "the payment did not settle. Not delivered; nothing was charged. " + str(detail)[:200]))
+            return self.mpp_refuse(hold["resource"], hold["micro"], MppError("verification-failed", "the payment did not settle. Not delivered; nothing was charged. " + str(detail)[:200]), hold.get("refundUrl"))
 
         def lost(detail, sent=False):
             tries = _MPP_USED_TRIES if sent and "revert" in str(detail).lower() else 1
@@ -320,11 +400,16 @@ class Server:
                 except Exception:
                     break
                 if used:
-                    return self.mpp_refuse(hold["resource"], hold["micro"], MppError("verification-failed", "this authorization has already been used"))
+                    return self.mpp_refuse(hold["resource"], hold["micro"], MppError("verification-failed", "this authorization has already been used"), hold.get("refundUrl"))
             return fail(detail)
 
         tx_hash = None
         asked = False
+
+        def not_shown():
+            self.mpp_held.mark(v["replayKey"], "sending", {"state": "sent"})
+            return self._mpp_not_shown(hold["resource"], hold["micro"], tx_hash, hold.get("refundUrl"))
+
         try:
             call = EvmCharge.call(v)
             try:
@@ -336,26 +421,19 @@ class Server:
             tx_hash = sent[0].get("hash") if sent and isinstance(sent[0], dict) else None
             if tx_hash is None:
                 return lost(sent[0].get("error") if sent and isinstance(sent[0], dict) and sent[0].get("error") is not None else "the relay sent nothing", True)
+            tx_hash = Hex.lower(tx_hash)
+            self.mpp_held.mark(v["replayKey"], None, {"sent": tx_hash, "state": "sending", "at": self.cfg.now_ms()})
             receipt = self._wait_for_receipt(tx_hash)
             if receipt is None:
-                return fail(f"no receipt for {tx_hash}")
+                return not_shown()
             if str(receipt.get("status") if receipt.get("status") is not None else "").lower() != "0x1":
                 return lost(f"transaction {tx_hash} reverted")
-            used = False
-            for entry in receipt.get("logs") or []:
-                topics = entry.get("topics") or []
-                if (Address.equals(entry.get("address"), call["to"]) and len(topics) >= 3 and str(topics[0]).lower() == _AUTHORIZATION_USED
-                        and str(topics[1]).lower() == _topic_of(v["payer"]) and str(topics[2]).lower() == v["authorization"]["nonce"]):
-                    used = True
-            if not used:
+            if not Server._used_in(receipt, call["to"], v):
                 return fail(f"transaction {tx_hash} did not use this authorization")
-            at = datetime.fromtimestamp(self.cfg.now_ms() / 1000, timezone.utc)
-            timestamp = at.strftime("%Y-%m-%dT%H:%M:%S.") + "%03dZ" % (at.microsecond // 1000)
-            response = {"success": True, "transaction": Hex.lower(tx_hash), "network": self.cfg.network, "payer": v["payer"], "amount": v["authorization"]["value"],
-                        "extra": {"protocol": "mpp", "method": EvmCharge.METHOD, "intent": EvmCharge.INTENT, "challengeId": v["challenge"]["id"]}}
-            return {"ok": True, "status": 200, "response": response, "headers": {"Payment-Receipt": Receipt.header(EvmCharge.receipt(v, tx_hash, timestamp))}}
+            self.mpp_held.mark(v["replayKey"], "sending", {"state": "delivered", "at": self.cfg.now_ms()})
+            return self._mpp_delivered(v, tx_hash)
         except Exception as e:
-            return lost(str(e), asked) if tx_hash is None else fail(str(e))
+            return lost(str(e), asked) if tx_hash is None else not_shown()
 
     @staticmethod
     def _refuse(status, body, headers=None):
@@ -515,6 +593,7 @@ class Server:
         Verify.normalize(raw)
         kind = raw.get("type") if raw is not None else None
         cid = Server.channel_id_of(payload)
+        judged_by = self.cfg.now_ms() + self.channels.judge_wait_ms()
         ch = None
         if cid is not None:
             try:
@@ -522,11 +601,10 @@ class Server:
             except Exception:
                 ch = None
         if ch is not None:
-            if Channels.held(ch, self.cfg.now_ms(), True):
-                ch = self.channels.judged(cid, True) or ch
-            refund_at = self.cfg.now_ms()
-            if Channels.refunding_wait_ms(ch, refund_at) > 0:
-                secs = Channels.refunding_retry_secs(self.cfg, ch, refund_at)
+            seen = self.channels.until_answered(cid, judged_by, lambda g, r, now, asked: {"wait": self.channels.waiter(g)} if asked and now < judged_by else {"r": r})
+            ch = seen.get("r") or ch
+            if "settling" in seen:
+                secs = seen["settling"]
                 return Server._refuse(402, {"error": "refund_settling", "code": "refund_settling", "message": f"a refund is settling on this channel, retry in {secs}s. Nothing was charged.", "retry_after_seconds": secs})
             if self.channels.leaving(ch):
                 return Server._refuse(402, {"error": "channel_leaving", "code": "channel_leaving", "message": "this channel is withdrawing. Open a new channel. Nothing was charged."})
@@ -562,16 +640,10 @@ class Server:
         if match is None:
             return Server._refuse(402, {"error": "no_matching_requirement", "message": "the payment matches no requirement here", "accepts": accepts})
         ctx = {"snapshot": None}
-        verified = self.verify_payment(payload, match, ctx)
-        again = 0
-        judged_by = self.cfg.now_ms() + self.channels.judge_wait_ms()
-        while verified.get("invalidReason") == Reason.REFUND_SETTLING:
-            judged = self.channels.judged(cid)
-            at = self.cfg.now_ms()
-            if Channels.refunding_wait_ms(judged, at) > 0 or (again >= 3 and at >= judged_by):
-                break
-            verified = self.verify_payment(payload, match, ctx)
-            again += 1
+        verified = self.verify_payment(payload, match, ctx, judged_by)
+        while "held" in verified:
+            self.channels.waited(verified.pop("held"), judged_by)
+            verified = self.verify_payment(payload, match, ctx, judged_by)
         if verified.get("invalidReason") == Reason.REFUND_SETTLING:
             secs = Channels.refunding_retry_secs(self.cfg, self.channels.get(cid), self.cfg.now_ms())
             return Server._refuse(402, {"error": "refund_settling", "code": "refund_settling", "message": f"a refund is settling on this channel, retry in {secs}s. Nothing was charged.", "retry_after_seconds": secs})
@@ -602,10 +674,23 @@ class Server:
             },
         }
 
-    def verify_payment(self, payload, req, ctx):
+    MOVED_TRIES = 2
+
+    @staticmethod
+    def moved_since(seen, current):
+        if seen is None or current is None:
+            return False
+
+        def at(r, k):
+            return "" if r.get(k) is None else php_str(r.get(k))
+
+        return at(seen, "refundNonce") != at(current, "refundNonce") or at(seen, "balance") != at(current, "balance") or php_empty(seen.get("handedOver")) != php_empty(current.get("handedOver"))
+
+    def verify_payment(self, payload, req, ctx, judged_by=0, tries=0):
         raw = payload["payload"]
         local = None
         norm_max = None
+        seen = None
         now = self.cfg.now_ms()
         if Verify.is_voucher_payload(raw) or Verify.is_deposit_payload(raw):
             try:
@@ -618,6 +703,7 @@ class Server:
                     return Verify.invalid(bind)
                 cid = raw["voucher"]["channelId"].lower()
                 snapshot = self.store.get(cid)
+                seen = snapshot
                 if snapshot is not None and snapshot.get("chargedCumulativeAmount") is not None:
                     charged = php_str(snapshot["chargedCumulativeAmount"])
                 else:
@@ -652,6 +738,10 @@ class Server:
                 return current
             if Channels.pending_live(current, now):
                 box["outcome"] = "busy"
+                return current
+            if Server.moved_since(seen, current):
+                box["outcome"] = "moved"
+                box["record"] = current
                 return current
             if current is not None and current.get("chargedCumulativeAmount") is not None:
                 base = php_str(current["chargedCumulativeAmount"])
@@ -691,15 +781,27 @@ class Server:
             box["record"] = nxt
             return nxt
 
+        def section(g):
+            at = self.cfg.now_ms()
+            if Channels.asked(g, at) and at < judged_by:
+                box["outcome"] = "held"
+                box["held"] = self.channels.waiter(g)
+                return None
+            return self.store.update(ctx["channelId"], reserve)
+
         try:
-            self.store.update(ctx["channelId"], reserve)
+            self.channels.serial(ctx["channelId"], section)
         except Exception:
             return Verify.invalid(Reason.VERIFICATION_STATE_UNAVAILABLE)
+        if box["outcome"] == "held":
+            return {**Verify.invalid(Reason.REFUND_SETTLING), "held": box["held"]}
         if box["outcome"] == "refunding":
             return Verify.invalid(Reason.REFUND_SETTLING)
         if box["outcome"] == "busy":
             return Verify.invalid(Reason.CHANNEL_BUSY)
-        if box["outcome"] == "stale":
+        if box["outcome"] == "moved" and tries < Server.MOVED_TRIES:
+            return self.verify_payment(payload, req, ctx, judged_by, tries + 1)
+        if box["outcome"] in ("stale", "moved"):
             ctx["snapshot"] = box["record"]
             return Verify.invalid(MISMATCH)
         ctx["snapshot"] = box["record"]
@@ -736,6 +838,14 @@ class Server:
         if c < 0 or c > reserved:
             raise ValueError(f"a charge of {c} is outside 0 to the reserved {reserved}")
         return c
+
+    @staticmethod
+    def _owe(record, hold):
+        ms = hold.get("owedMs")
+        if not isinstance(ms, int) or isinstance(ms, bool) or ms <= 0:
+            return
+        owed = record.get("timeOwed")
+        record["timeOwed"] = {**(owed if isinstance(owed, dict) else {}), hold["pendingId"]: ms}
 
     @staticmethod
     def charged_extra(hold, charged, extra=None):
@@ -783,11 +893,12 @@ class Server:
             current["signedMaxClaimable"] = php_str(cap)
             current["signature"] = voucher["signature"]
             current["lastRequestTimestamp"] = now
+            Server._owe(current, hold)
             del current["pendingRequest"]
             box["outcome"] = "committed"
             return current
 
-        self.store.update(hold["channelId"], commit)
+        self.channels.serial(hold["channelId"], lambda g: self.store.update(hold["channelId"], commit))
         if box["outcome"] == "missing":
             return self._settle_failed(hold, Reason.MISSING_CHANNEL)
         if box["outcome"] == "cap_exceeded":
@@ -824,16 +935,24 @@ class Server:
         amount = str(Verify.uint(raw["deposit"]["amount"]))
         data = BatchSettlement.encode_deposit(raw["channelConfig"], amount, execution["collector"], execution["collectorData"])
         sent = self.relay.send([{"to": BatchSettlement.ESCROW, "data": data}], self.cfg.relay_split())
-        if "hash" not in sent[0]:
+        tx_hash = sent[0].get("hash")
+        if tx_hash is None:
             short = re.search(r"below break-even: deposit at least \$(\d+(?:\.\d+)?)", php_str(sent[0].get("error") or ""))
             if short is not None:
                 return self._deposit_short(hold, payload, math.ceil(float(short.group(1)) * 1e6), micro)
-            return self._settle_failed(hold, Reason.DEPOSIT_TRANSACTION_FAILED + ": " + (sent[0].get("error") or "no hash"))
-        tx_hash = sent[0]["hash"]
-        receipt = self._wait_for_receipt(tx_hash)
-        if receipt is None:
-            return self._settle_failed(hold, Reason.DEPOSIT_TRANSACTION_FAILED + f": no receipt for {tx_hash}")
-        if php_str(receipt.get("status")).lower() != "0x1":
+        try:
+            return self._deposit_sent(hold, verified, amount, increment, tx_hash, sent[0].get("error"))
+        except Exception as e:
+            if tx_hash is None:
+                raise
+            return self._deposit_unsettled(hold, tx_hash, str(e))
+
+    def _deposit_sent(self, hold, verified, amount, increment, tx_hash, refused):
+        req = hold["requirement"]
+        raw = hold["payload"]["payload"]
+        channel_id = hold["channelId"]
+        receipt = None if tx_hash is None else self._wait_for_receipt(tx_hash)
+        if receipt is not None and php_str(receipt.get("status")).lower() != "0x1":
             return self._settle_failed(hold, Reason.DEPOSIT_TRANSACTION_FAILED + ": transaction reverted (receipt status reverted)")
         ex = verified["extra"]
         state = {
@@ -843,20 +962,11 @@ class Server:
             "withdrawRequestedAt": to_int(ex["withdrawRequestedAt"]),
             "refundNonce": php_str(ex["refundNonce"]),
         }
-        expected = int(state["balance"])
-        deadline = self.cfg.now_ms() + self.cfg.stateCatchUpMs
-        post = None
-        while True:
-            try:
-                post = self.chain.state(channel_id)
-            except Exception:
-                post = None
-            if post is not None and int(post["balance"]) >= expected:
-                break
-            if self.cfg.now_ms() >= deadline:
-                post = None
-                break
-            self.cfg.sleep_ms(150)
+        post = self._deposit_on_chain(channel_id, int(state["balance"]))
+        if receipt is None and post is None:
+            if tx_hash is None:
+                return self._settle_failed(hold, Reason.DEPOSIT_TRANSACTION_FAILED + ": " + (refused or "no hash"))
+            return self._deposit_unsettled(hold, tx_hash, Reason.DEPOSIT_TRANSACTION_FAILED + f": no receipt for {tx_hash}")
         if post is not None:
             state = {
                 "channelId": raw["voucher"]["channelId"],
@@ -890,16 +1000,18 @@ class Server:
                     nxt[k] = v
             held_before = int(php_str(ex["balance"])) > 0 or int(php_str(ex["totalClaimed"])) > 0
             nxt["depositsWePaid"] = to_int(current.get("depositsWePaid", 1 if held_before else 0)) + 1
+            Server._owe(nxt, hold)
             box["record"] = nxt
             return nxt
 
-        self.store.update(channel_id, commit)
+        self.channels.serial(channel_id, lambda g: self.store.update(channel_id, commit))
         if box["record"] is None:
-            return self._settle_failed(hold, f"{Reason.CHANNEL_BUSY}: deposit {tx_hash} landed after the hold expired. Not charged, not delivered.")
+            said = "the deposit" if tx_hash is None else f"deposit {tx_hash}"
+            return self._deposit_late(hold, f"{Reason.CHANNEL_BUSY}: {said} landed after the hold expired")
         extra = Server.charged_extra(hold, increment, {"channelState": dict(state, chargedCumulativeAmount=box["record"]["chargedCumulativeAmount"])})
         response = {
             "success": True,
-            "transaction": tx_hash,
+            "transaction": tx_hash or "",
             "network": req["network"],
             "payer": raw["channelConfig"]["payer"],
             "amount": raw["deposit"]["amount"],
@@ -910,15 +1022,45 @@ class Server:
             response["amount"] = php_str(req["amount"])
         return Server._delivered(response)
 
+    def _deposit_on_chain(self, channel_id, expected):
+        deadline = self.cfg.now_ms() + self.cfg.stateCatchUpMs
+        reads = math.ceil(self.cfg.stateCatchUpMs / 150) + 1
+        read = 0
+        while True:
+            read += 1
+            try:
+                post = self.chain.state(channel_id)
+            except Exception:
+                post = None
+            if post is not None and int(post["balance"]) >= expected:
+                return post
+            if self.cfg.now_ms() >= deadline or read >= reads:
+                return None
+            self.cfg.sleep_ms(150)
+
+    def _deposit_unsettled(self, hold, tx_hash, reason):
+        return self._deposit_answer(hold, reason, f"the deposit was sent ({tx_hash}) and has not landed yet, so this call was not delivered. If it lands, your channel holds it: pay the next call with a voucher.")
+
+    def _deposit_late(self, hold, reason):
+        return self._deposit_answer(hold, reason, "the deposit landed in your channel after this call was given up, so this call was not delivered and not charged. Your channel holds the deposit: pay the next call with a voucher.")
+
+    def _deposit_answer(self, hold, reason, said):
+        out = self._settle_failed(hold, reason)
+        out["body"]["message"] = said
+        return out
+
     def _wait_for_receipt(self, tx_hash):
         deadline = self.cfg.now_ms() + 1000 * self.cfg.receiptTimeoutSecs
+        reads = math.ceil(1000 * self.cfg.receiptTimeoutSecs / max(1, self.cfg.receiptPollMs)) + 1
+        read = 0
         while True:
+            read += 1
             try:
                 r = self.chain.receipt(tx_hash)
             except Exception:
                 r = None
             if r is not None:
                 return r
-            if self.cfg.now_ms() >= deadline:
+            if self.cfg.now_ms() >= deadline or read >= reads:
                 return None
             self.cfg.sleep_ms(self.cfg.receiptPollMs)

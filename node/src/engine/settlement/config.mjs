@@ -5,7 +5,7 @@ import { Pass } from '../core/pass.mjs'
 import { Secp256k1 } from '../core/secp256k1.mjs'
 import { ArrayCache } from './json.mjs'
 
-const GAS = { deposit: 145000, claimBase: 35000, claimEntry: 45000, claimAlone: 80000, payout: 210000, charge: 80000, createSplit: 280000, refund: 97000, refundClaim: 37000, paidClaim: 37700, gasPayment: 58600, paidL1: 13800, paidClaimL1: 4200 }
+const GAS = { deposit: 145000, claimBase: 35000, claimEntry: 45000, claimAlone: 80000, payout: 210000, charge: 105000, createSplit: 280000, refund: 118000, refundClaim: 37000, paidRefundLeg: 97000, paidClaim: 37700, gasPayment: 58600, paidL1: 13800, paidClaimL1: 4200 }
 const GAS_MEASURED = { on: '2026-09-29', how: '35 paid relay refunds, Base blocks 51915440-51949669 (25 alone, 10 with a riding claim); gasUsed + L1 fee in gas', paidRefund: 155625, paidRefundWithClaim: 193332, paidL1: 13830, paidL1WithClaim: 18059 }
 const TUNABLE = [
   'withdrawDelay', 'maxTimeoutSeconds', 'depositFloorMicroUSD', 'wethUSD', 'gasPriceWei', 'feeShare', 'gasBuffer',

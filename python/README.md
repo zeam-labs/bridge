@@ -5,7 +5,7 @@ The Bridge engine runs in your process: keys, channel records, gate usage and se
 the relay (gas for transactions that cover their own gas) and the credit service (gate checks). You keep 90.01% of
 every sale, paid to your own split.
 
-Source: https://github.com/zeam-labs/pass
+Source: https://github.com/zeam-labs/bridge
 
 License: Apache-2.0. Patent pending.
 
@@ -54,7 +54,7 @@ it. `Bridge()` raises `ValueError` on a placeholder. Replace `acme` with your ow
 Routes: `/agents/mcp` (MCP; payment in the tool call's `_meta`), `POST /agents/v1/<tool>` (x402 or MPP headers),
 `/agents/openapi.json` and `/agents/refund`, with CORS. Django mounts `agents.wsgi()` or `agents.asgi()` the same
 way. `examples/server.py` is a whole server on the standard library. `pip install` does not put it on disk: it is in
-the source distribution and at https://github.com/zeam-labs/pass/blob/main/python/examples/server.py
+the source distribution and at https://github.com/zeam-labs/bridge/blob/main/python/examples/server.py
 
 In `openapi.json` each paid operation carries a `402` response and `x-payment-info`: its `price` in dollars,
 `protocols`, and under `offers` the MPP `evm` charge its 402 carries now, where it carries one. Every operation says
@@ -115,8 +115,8 @@ Other keyword arguments to `Bridge(...)`:
 - `on_empty` (default `"refuse"`): gate credit at 0: `"refuse"`, or `"allow"`
   and warn.
 - `contact` (default none): an `http(s)://` URL or a `mailto:` address; goes in
-  every 402, in the 403 `refused` answer (`how` and `contact`) and in
-  `openapi.json` `info.contact`.
+  the 402 an unpaid call gets, in the 403 `refused` answer (`how` and `contact`)
+  and in `openapi.json` `info.contact`.
 - `state_dir` (default `$BRIDGE_STATE_DIR` or `~/.zeam-pass/<name>`): keys,
   channel records, gate usage, line time and free-call counts.
 - `rpc` (default `https://mainnet.base.org`): a Base RPC URL.
@@ -127,14 +127,17 @@ Other keyword arguments to `Bridge(...)`:
 - `tick_seconds` (default `60`): seconds between background runs; `0` turns
   the thread off.
 - `server_name`, `version`: the MCP handshake's server info.
-- `fee_recipient`, `credit_issuer` (default `$BRIDGE_FEE_RECIPIENT`,
-  `$BRIDGE_CREDIT_ISSUER`): development only.
 - `payout_is_fee_recipient` (default `False`): `True` only when `payout` is
   the fee address: the split pays it 100%.
 - `settings`: engine tuning; `gateFreePerMonth` and `gateCreditBlock` set the
   gate's free checks and credit block, for tests.
 
 Settings from the environment are `BRIDGE_…`; the `PASS_…` name of each still works and is read second.
+
+The fee address (`0xc60996007B7657DE2F39fA0577E97d7aAF3b7d1e`) and the credit issuer, the key whose credit notes the
+gate accepts (`0x4202d8042d89cbEFD9D48fE7f7Aa70061CC9Df22`), are ZEAM's, set in the package. No argument, no
+setting and no environment setting changes them: `fee_recipient` or `credit_issuer` is a `TypeError`, and
+`settings={"feeRecipient": …}` a `ValueError`.
 
 The Python plugin does not read `pass.json`.
 
@@ -160,7 +163,9 @@ The Python plugin does not read `pass.json`.
 
 Order: the tool's `price`/`unit`, then `prices`, then `price`. The 402 carries this call's amount in `accepts`,
 `pricing` for this call and `prices` for every tool; `tools/list` entries carry `_meta["zeam-pass/price"]`; `openapi.json`
-operations carry `x-price`. A price the callable cannot give: 500 `price_invalid`. `gate` mode never prices.
+operations carry `x-price`. A tool the callable prices is tagged `{"per":"call","varies":true}`, and a time tool it
+prices `{"per":"time","usd":…,"ms":…,"varies":true}`: the line rate, with its price without a line in each call's
+402. A price the callable cannot give: 500 `price_invalid`. `gate` mode never prices.
 
 ## The gate
 
@@ -224,7 +229,8 @@ earnings, and gate usage. Fields: https://zeambridge.com/docs/sell#status
    `reservedAmount`. The tool raised, returned a dict with `"isError": True`, or returned a value
    that is not valid JSON (a set, a non-finite float, a non-string dict key): the hold is released, nothing is
    charged per call (on a line the call has used the time it ran); the last answers 500 `tool_failed` with the message every engine gives: "the result is not valid JSON (a
-   non-finite number or a non-JSON value); nothing was charged". An `"isError": True` dict is answered over HTTP with
+   non-finite number or a non-JSON value). A failed call is not charged. On a line a call uses the time it runs,
+   whether or not it succeeds." An `"isError": True` dict is answered over HTTP with
    the fields of its `structuredContent`, as MCP carries them; a `status` of 400 to 599 among them, other than 402,
    marks a refusal that is the caller's and is the answer's status, with `Retry-After` from `retry_after_seconds`;
    otherwise 500 `tool_failed`.
@@ -260,11 +266,15 @@ With `time` set, an agent buys time and spends it on a line with no payment per 
 1. `buy_time {"ms": n}` (any number of milliseconds; buying again adds time): a paid call for n ms at the `time` rate; the n ms are credited to the
    paying channel once the payment settles, once per payment.
 2. `POST <base>/line {"op": "open", "channelId"}` (or the free `line` tool): a message to sign with the payer key.
-3. `{"op": "prove", "channelId", "nonce", "signature"}`: the credential; the meter is on. A nonce is one attempt, 300 s.
+3. `{"op": "prove", "channelId", "nonce", "signature"}`: the credential and `metering`. A nonce is one attempt, 300 s.
+   The channel's first open line switches the meter on; a line opened while another is open leaves it as it is.
+   While a refund is being worked out or settling on the channel, a first line is refused 402 `refund_pending` or
+   `refund_settling`, as `on` is, and nothing is opened.
 4. Calls to a `meter="time"` tool with the credential in `x-line` (MCP: `_meta["zeam-pass/line"]` or the request's
    `x-line`) run until the time runs out; answers carry `x-pass-ms-remaining` and `x-pass-ms-elapsed` (MCP:
    `_meta["zeam-pass/meter"]`). Time burns while a call runs, once for calls at the same time, plus `idleMs` after each.
-   Refusals: 403 `line_unknown`, 402 `meter_off`, `out_of_time`, `channel_leaving`, `refund_settling`, 429 `too_many_calls`.
+   Refusals: 403 `line_unknown`, 402 `meter_off`, `out_of_time`, `channel_leaving`, `refund_settling`, 429 `too_many_calls`,
+   499 `client_gone` when the caller hangs up and the seller sees it (below).
 5. `{"op": "off"}`, `"on"`, `"status"`, `"close"` with `credential` or `x-line`.
 
 `zeam_bridge.deadline_ms()` inside a time tool: the epoch ms its call must end by (`None` elsewhere). The call runs in a
@@ -282,10 +292,10 @@ Claims and payouts take what burned; a refund switches the meter off, returns th
 
 The buyer posts `{"channelId", "issued", "signature"}`, signed by the channel's payer over
 `ZEAM Pass refund\nchannel: <id>\nissued: <ISO time>` within 5 minutes, plus `channelConfig` for a channel with no
-calls. The balance goes back through the relay:
+calls. The balance goes back through the relay. Our relay pays the gas of a refund when our fee on what the buyer spent covers the gas of the deposit, of the refund and of settling any calls not yet settled, and of every further deposit and every earlier refund it paid for on that channel, with a 15% margin; otherwise the buyer pays the refund's gas, with a 15% margin, in USDC, quoted before the buyer signs that payment. Our fee is the channel's spend times the fee address's share of your
+split (9.99%; 100% with `payout_is_fee_recipient`), in whole micro-dollars.
 
-- The channel's spend times the fee address's share of your split (9.99%; 100% with `payout_is_fee_recipient`), in
-  whole micro-dollars, ≥ the gas of its deposit, its refund and any calls not yet settled, and of every further deposit and every earlier refund ZEAM paid for on that channel, plus 15%: ZEAM pays the gas. `"op": "refunded"`, `gasMicroUSD: 0`.
+- Our fee covers the gas: `"op": "refunded"`, `gasMicroUSD: 0`.
 - Otherwise: 409 `"op": "refund_quote"` (`gas_payment_needed`), an EIP-3009 `TransferWithAuthorization` of the quoted
   gas (15% margin) for the buyer to sign. The relay prices it; no quote from the relay: the engine prices from `GAS`
   (`quotedBy: "engine"`), with the ETH price and gas wallet it read from the relay's `/health` in the last 60

@@ -243,6 +243,22 @@ export class MppHeldFiles {
     await remove(this.path(key))
   }
 
+  async entry(key) {
+    const had = await readJson(this.path(key))
+    return isRecord(had) ? had : null
+  }
+
+  async mark(key, from, fields) {
+    const path = this.path(key)
+    const out = await withLock(path, async () => {
+      const had = await readJson(path)
+      if (!isRecord(had) || (had.state ?? null) !== from) return false
+      await writeAtomic(path, JSON.stringify({ ...had, ...fields }))
+      return true
+    })
+    return out.value === true
+  }
+
   async names() {
     try {
       return (await fs.readdir(this.dir)).filter((n) => /^[0-9a-f]{64}\.json$/.test(n))

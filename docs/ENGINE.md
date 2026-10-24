@@ -12,7 +12,7 @@ structure, names and behavior, and pass the same shared fixtures.
 | Piece | PHP reference | Job |
 |---|---|---|
 | Config | `Settlement/Config.php` | name, site, mode (gate/paywall/both), price (micro-USD per call), payout; the split (900100/99900 to the ZEAM fee address; with `payoutIsFeeRecipient`, payout = the fee address: 1000000 to it, fee share 1) and its salt (`keccak256("ZEAM Pass seller <name>")`: the text keeps the plugin's former name, since a new one would move every seller's split); the predicted split receiver; the settle key (receiverAuthorizer); relay, credits and RPC URLs; withdraw delay 86400; USDC on Base |
-| Store | `Settlement/Store.php`, `Gate/Store.php` | `get`, atomic `update(id, fn)`, `list`; channel records in the SDK's field layout plus `handedOver`, `depositsWePaid`, `refundGasWePaid`, `repairedAt` |
+| Store | `Settlement/Store.php`, `Gate/Store.php` | `get`, atomic `update(id, fn)`, `list`; channel records in the SDK's field layout plus `handedOver`, `depositsWePaid`, `refundGasWePaid`, `repairedAt`, `timeOwed` |
 | Server | `Settlement/Server.php`, `Verify.php` | `paymentRequired(resource)`, `verifyAndHold(header, resource)`, `settle(hold)`, `release(hold)` |
 | Claims | `Settlement/Claims.php` | periodic: claim at margin with the payout in one relay request; the claim's gas (base and per voucher) counts with the payout's; a withdrawing channel's claim at its own margin |
 | Refunds | `Settlement/Refunds.php` | see [Refunds](#refunds) |
@@ -30,9 +30,10 @@ registry; `settlement/x402.mjs` is the default adapter, the x402 `batch-settleme
 [MPP session](#mpp-session-node)). PHP and Python keep their layout and are held to the same behavior by the shared fixtures.
 
 A channel record names its escrow in `escrow` only when it is not the default one. No record written so far has the
-field: absent means x402 `batch-settlement`. A record naming an escrow the engine does not serve is refused
+field: absent means x402 `batch-settlement`. In the Node engine, a record naming an escrow it does not serve is refused
 (`unknown_escrow`: 402 on a paid call, 409 on a refund or a line), skipped by claims, counted in `errors` by
-withdrawals, and never read as x402.
+withdrawals, and never read as x402. The Python and WordPress engines serve the x402 escrow alone and write only x402
+records, so they never meet another escrow's record and do not check for one.
 
 What an escrow provides (`defineEscrow` refuses an adapter missing any of it):
 
@@ -73,12 +74,13 @@ Outside the adapter: the x402 payment envelope (`payload.type` `voucher` / `depo
 ## MPP session (Node)
 
 Off unless the seller sets `sessions: { escrow, factory }`: the addresses of an `EvmPaymentChannel` escrow and of its
-`SessionPayeeFactory` (repo `zeam-contracts-session`). There is no default address; the pair deployed on Base on 2026-10-13 is in `seller/docs/SELL.md`. Without the
+`SessionPayeeFactory` (repo `zeam-contracts-session`). There is no default address; the pair deployed on Base on 2026-10-13, immutable, is the escrow `0x5e09aD70b644414cD1cD7Df1d9a10fF7899D92B8` and its factory `0xE18fCE1266056becA4a3B0edfc15F8634EA6901B` (`seller/docs/SELL.md` gives the option). Without the
 option the registry is the one object `ESCROWS`, and every answer is the one main gives. With it, and once
 `ready` has read the chain (the factory is bound to that escrow, the escrow holds USDC, its grace period is at least
 600 s), a fixed-price call's 402 carries a second `Payment` challenge in `WWW-Authenticate`, after the `charge` one
 when there is one. An escrow that cannot be read is asked again after 30 s and no session is offered meanwhile.
-Usage-metered and time prices are not offered a session yet. The relay takes the same two addresses
+A price by use (`unitMicro`) and a purchase of line time (`ms`) are not offered a session yet; a time tool called
+without a line is priced per call, at its `callUSD`, and is. The relay takes the same two addresses
 (`PASS_RELAY_SESSION_ESCROW`, `PASS_RELAY_SESSION_FACTORY`); without them it sends nothing to either.
 
 The wire is `draft-evm-session-00`, published at https://paymentauth.org/draft-evm-session-00 and carried over `draft-httpauth-payment-01` and `draft-payment-transport-mcp-00`.
@@ -114,7 +116,7 @@ two checks. No answer has the member when no session challenge is offered.
 
 An `open` or a `voucher` on a call pays that call: the price is reserved (`pendingRequest`, one call in flight per
 channel, as for x402), the tool runs, and `spent` moves by the price only when it succeeds. A failed tool charges
-nothing. `topUp`, `close`, any credential on `HEAD`, and any credential with MCP
+nothing per call. `topUp`, `close`, any credential on `HEAD`, and any credential with MCP
 `_meta["zeam-bridge/payment-only"]: true` are payment-only: 204 with `Payment-Receipt` over HTTP, a result with
 empty `content` and the receipt in `_meta["org.paymentauth/receipt"]` over MCP, and the tool is not run nor its
 arguments read. The MCP result carries the receipt as `structuredContent` too, `{receipt}`, and with sessions on each
@@ -126,13 +128,14 @@ an x402 payment is verified: `open` (the authorization's `from`, or `source`), `
 authorization's `from` when that is another address) and `voucher` (the channel's payer), on a paid call, on `HEAD`
 and with `zeam-bridge/payment-only`. The credential is parsed and its challenge checked first; nothing is
 sent to the relay and nothing is written before the list has answered. A payer that is not admitted gets the 403
-`refused` (or the 402 `bad_grant`) an x402 payment gets, and its authorization is not sent. A `close` is never
+`refused` (or the 402 `bad_grant`) an x402 payment gets, less the terms' `deposit` sentence, and its authorization is not sent. A `close` is never
 asked of the list: a payer the seller no longer admits can always close its channel. The close serves no call,
 settles at most what was spent, and returns the rest of the deposit.
 Mode `gate` takes no `sessions` option and reads no session credential.
 
-**Over MCP** the whole lifecycle is `tools/call` on the paid tool: the challenge arrives as `-32042` (or in the
-tool result's `_meta["org.paymentauth/payment-required"]` for a client that did not declare the capability), a
+**Over MCP** the whole lifecycle is `tools/call` on the paid tool: the challenges arrive as `-32042` (or in the
+tool result's `_meta["org.paymentauth/payment-required"]`, the same object as that error's `data`, for a client that did
+not declare the capability; every challenge of the call's 402, `charge` and `session` alike), a
 credential rides `params._meta`, a paid result carries the receipt, a refusal is `-32043` with a fresh challenge and
 `failure.reason` `session/<type>`, a malformed credential `-32602`. To a client that declared the payment capability,
 the server advertises in `capabilities.experimental.payment.methods.evm.intents` the intents its 402s carry: `session`,
@@ -149,9 +152,10 @@ a signed amount, so the record also keeps `session.settle` (the highest voucher 
 `session.held` (vouchers above `spent`, lowest first, at most 8: the 7 lowest and the highest). A call is paid only
 by the voucher it carries, and only when that voucher is for exactly `spent` + price, so every `spent` a receipt
 states is an amount the seller can settle and a credential pays one call at most; a client that signs previous +
-price, as the draft describes, always carries one. A voucher for less or more, a credential sent again, and a voucher
-for `spent` + price that only an earlier payment-only credential carried pay no call: 402 `insufficient-balance`
-with `requiredCumulative`. The engine never settles or closes above `spent`.
+price, as the draft describes, always carries one. A voucher for less or more, a credential sent again, and a credential
+that carries no voucher of its own for `spent` + price (one that leans on a voucher an earlier payment-only credential
+carried) pay no call: 402 `insufficient-balance` with `requiredCumulative`. A voucher sent ahead in a payment-only
+credential buys nothing then, and pays one call when a later credential carries it. The engine never settles or closes above `spent`.
 
 One large voucher. The draft's balance check is `acceptedCumulative - spent >= cost` (13, 13.1), a procedure it
 states without a MUST; it requires the voucher to be accepted (12.5), and the engine accepts it: `acceptedCumulative`
@@ -233,7 +237,7 @@ own gas by `requestClose`, 15 minutes, `withdraw`.
 
 The contract's two extensions, `requestCloseWithAuthorization` and `withdrawWithAuthorization` under the payer's
 signature, are sent by the relay to anyone who posts them with the seller's split and signer. It pays their gas when
-the fees of what the channel has settled cover the gas of its open, of every top-up the relay sent and of its exit; otherwise it refuses with
+the fees of what the channel has settled cover the gas of its open, of every top-up and close request the relay sent for it, and of its exit, plus 15%; otherwise it refuses with
 `code: "gas_payment_needed"` and takes them paid for by the payer. `POST /quote` with `{"call": {"to", "data"}}`, the
 request, answers in the refund quote's form (`op: "refund_gas_quote"`, `shape: {"session": "exit", "payment": true}`,
 `transactions: 2`, `costMicroUSD`, `quoteMicroUSD` = cost + 15%, `payTo`); a `closeWithAuthorization` or a
@@ -246,13 +250,22 @@ grace period: sign the chain's time when you post plus the grace period plus 30 
 signer), which the request's block falls well within. The withdrawal's deadline and the payment's `validBefore` are
 at least 60 s past that `validAfter`. A payment valid earlier is refused and nothing is sent. The relay sends the
 request at once, answers the second call `{"held": true, "channelId", "sendAfter", "until"}` (`sendAfter` the later
-of the end of the grace period and `validAfter`), keeps it in its state file (`exits`; at most 1000) and sends it
-itself once the chain's time has passed both the request's `closeRequestedAt` plus the grace period and `validAfter`
-(`exitSweepSecs`, 30). Before it holds a call or
+of the end of the grace period and `validAfter`; `until` the last second its transaction can land in, the
+withdrawal's deadline or one second before the payment's `validBefore`, whichever is earlier), keeps it in its state
+file (`exits`; at most 1000) and sends it itself once the latest block's time has reached the request's
+`closeRequestedAt` plus the grace period and is past `validAfter` (`exitSweepSecs`, 30): USDC takes the payment
+only in a block whose time is past `validAfter` and before `validBefore`. Until then a post of the held call answers
+`held` again; a held call whose `until` the latest block has reached is dropped, since no later block can take it.
+A paid close or paid refund whose payment the next block could not take (the chain's time not yet past
+`validAfter`, or `validBefore` not more than a second ahead), and a paid withdrawal past its grace period whose
+payment's `validBefore` is not more than a second ahead, are refused with both times and nothing is sent; one not yet
+valid says `retry in <n>s` and carries `retry_after_seconds`. Before it holds a call or
 sends its request, the relay checks the withdrawal's signature and the payment's signature against the channel's
 payer (strict ECDSA, or ERC-1271 for a contract payer) and that neither nonce is used; a call that fails is refused
 and nothing is sent. The same held call posted again changes nothing before the grace period ends and is sent after
-it. A different withdrawal and payment that pass the same checks and pay what is then owed replace the held one;
+it, once: the relay keys each withdrawal and close by its authorization, and a post of one it is sending or has sent
+answers that send's hash, or its error, and broadcasts nothing. That record is read before anything else is checked,
+so a post after the send has landed, when the channel reads closed, answers the same; the relay keeps it for a day. A different withdrawal and payment that pass the same checks and pay what is then owed replace the held one;
 nothing else does. A withdrawal whose grace period has passed is sent at once with its payment, when the payment is
 valid by then; otherwise it is held until it is. The relay has paid
 for the request before it is paid: that gas is drawn against the seller's unearned allowance and kept as owed for
@@ -262,9 +275,15 @@ when that payment lands, when a close the fees cover lands, and when the relay f
 seller. The held call is dropped, with no payment taken, when the channel was closed by its seller, when what is
 left after a settle is under the payment, when its authorizations have expired, when the payer's own top-up canceled
 a close request the relay paid for (a strike), when the token logged the payer's cancellation of the payment (a
-strike) and when the token shows the payment used with no such log (no strike). A held withdrawal that would cost
-more than its payment waits for the gas price to fall, until its deadline. A paid close or exit is refused for a
-payer with two strikes in 24 hours.
+strike) and when the token shows the payment used with no such log (no strike). The relay reads the settle rule
+again just before it sends: its sender sends one transaction at a time and a held withdrawal never rides in a batch,
+so every transaction the relay sent before it, a settle among them, is mined first; then the relay reads the
+channel at the latest block and sends only when `deposit` less `settled` is not under the payment. A paid close or
+withdrawal sent at once is read the same way (`nothing_to_return` when it fails). The chain has no way to make the
+send itself revert on it: the escrow's withdrawal takes no minimum and Multicall3 compares nothing. What is left is
+a settle sent by another sender that lands after the block the relay read and before its own transaction, about one
+Base block. A held withdrawal that would cost more than its payment waits for the gas price to fall, until its
+deadline. A paid close or exit is refused for a payer with two strikes in 24 hours.
 
 The relay takes no gas payment from a channel whose fees cover the gas. A paid close or withdrawal of such a channel
 is sent without its payment leg and answered `gasPayment: "not_taken"`; a held one is held and sent the same way. The
@@ -277,11 +296,20 @@ Gas already paid for the channel is added to the gas side of both comparisons, b
 [Refunds](#refunds): every top-up the relay sent (`topUp` gas each) and every exit leg it sent earlier
 (`exitRequest`, `exitWithdraw`). With f the fee address's share of the seller's split (0.0999 for most sellers, 1
 for one whose split pays the fee address everything), a close is free when ⌊(settled + what the close settles) × f⌋
-≥ (open + close + already paid) gas; a `requestCloseWithAuthorization` when ⌊settled × f⌋ ≥ (open + exitRequest +
-exitWithdraw + already paid) gas; the `withdrawWithAuthorization` that follows at the same total, its request now among the gas
-already paid, and at (open + exitWithdraw + already paid) when the payer sent the request itself. The relay keeps the
+micro-USD ≥ ⌈(open + close + already paid) gas × 1.15⌉ micro-USD at the gas price read then; a
+`requestCloseWithAuthorization` when ⌊settled × f⌋ ≥ ⌈(open + exitRequest + exitWithdraw + already paid) gas × 1.15⌉;
+the `withdrawWithAuthorization` that follows at the same total, its request now among the gas already paid, and at
+⌈(open + exitWithdraw + already paid) gas × 1.15⌉ when the payer sent the request itself. A request the relay sent
+free fixes the answer for its withdrawal: the relay keeps the request's `closeRequestedAt` for the channel
+(`freeExits` in the state file: the time of the block that mined the request, read from its receipt, and read again
+at the next quote, withdrawal or sweep while the RPC cannot answer it yet), and while the channel shows that request the withdrawal is free and a quote for it
+says `covered: true`, whatever gas the relay pays for the channel after the request (a top-up by another address
+during the grace period, which leaves the request standing). The relay keeps the
 figures per channel in its state file and answers them at `GET /paid?channel=<id>` (`deposits`: opens and top-ups
-it sent; `refundGasUnits`: exit gas; `gasUnits`: top-ups and exits). The engine does not judge a close; it writes
+it sent; `refundGasUnits`: the closes, close requests and withdrawals whose gas it paid, whether sent free, sent free
+although a gas payment was posted with them (`gasPayment: not_taken`), or held and sent by its sweep, and not one
+whose gas payment it took; `settleGasUnits`: the settles it sent for the channel, each paid for by the fee on what it
+settled and so left out of `gasUnits`; `gasUnits`: top-ups and exits). The engine does not judge a close; it writes
 `depositsWePaid` on the record for a relayed open and for each relayed top-up, once each, and a deposit the payer
 sent by its own transaction counts nothing.
 
@@ -311,6 +339,16 @@ built: `permit2` credentials, `Idempotency-Key`, the SSE `payment-need-voucher` 
      seller's key, signature, balance, the token's `authorizationState`), run the tool, then `mppSettle`: one
      `transferWithAuthorization` to the split through the relay, delivered only when its receipt carries
      `AuthorizationUsed` for that payer and nonce (`Payment-Receipt` / MCP `_meta["org.paymentauth/receipt"]`).
+     The hold on the authorization (Node and Python: `<stateDir>/mpp-held/`, WordPress: the `held` table) records
+     the transaction it was sent in and its state (`sending`, `sent`, `taken`, `delivered`), each step taken only from
+     the step before it under the hold's lock. No receipt in `receiptTimeoutSecs` is 402 `verification-failed` with
+     `code: "sent_not_shown"`, `txHash`, `retry_after_seconds` (2) and `Retry-After`; the hold is kept. The same
+     credential sent again is not sent to the relay: once the receipt carries `AuthorizationUsed`, one request takes
+     it, runs the tool and is delivered (a copy at the same time is told `this authorization is already in use`, one
+     after it `this authorization has already been used`; a tool that fails gives it back); once the receipt shows
+     a revert and the token shows the authorization unused, the answer says nothing was charged and the hold is
+     released, so the credential can be paid again; with no receipt yet it is `sent_not_shown` again. A hold left
+     `sending` by a process that stopped is read again after twice `receiptTimeoutSecs` plus 60 s.
      Never for `buy_time` or a unit-metered price.
    - **gate:** `Admission.admit` with PAYMENT-SIGNATURE and `x-grant`, then `Meter.charge`, then run. The proof is a
      zero-value `exact` payment signed by the agent's key: nothing is paid, the key needs no funds, nothing goes on
@@ -328,6 +366,9 @@ tag alone and adds `priceList: { mcp, openapi, how }`, where the rest are; its `
 (tool, client address, clock hour), 429 `free_limit` over it; the count lives in `<stateDir>/free.json` (Node, Python)
 or WordPress transients, so it survives a restart; a host that passes no client address gives one shared count. Usage: the voucher signs charged + reserve; the tool
 reports whole units; settle commits min(reserve, units × unit). Every settle states `extra.chargedAmount` and `extra.reservedAmount`.
+Every 402, in all three engines, carries `split: { receiver, split, salt }`, what the relay is sent with each request;
+the Pass service pays a deposit's gas only when the 0xSplits factory's `isDeployed(split, 0x0, salt)` returns `receiver`
+and the split pays the fee address at least 9.99%.
 No units reported: released, 500 `tool_failed`. Shared: `wordpress/tests/pricing/fixtures.json`.
 
 Time (`time: {usd, ms, idleMs}`: that many dollars buys that many milliseconds, reduced to the rate `rateMicro` per `rateMs`; `maxMs` only if the seller limits one purchase; paywall or both): a clock per channel in `meter/clocks/<channelId>`
@@ -339,9 +380,18 @@ or at its own start if later, the next time its clock is read, so a crash or res
 mark, not the time to the deadline. WordPress ends a call cut off by a fatal error or a time limit in a shutdown
 function, at that moment; a PHP worker killed outright still leaves its call open to its deadline. `buy_time {ms}` is priced ms / rateMs × rateMicro and credits those ms once per hold (a legacy `{blocks}` counts `ms` each),
 only after the settle returns ok: a deposit that verifies and then fails on chain credits no time, so it leaves nothing
-usable and extends no running call; a settle that succeeds but whose credit then cannot be written leaves the payment
-settled with the time unrecorded (500 `tool_failed`). A line: a nonce (300 s, one attempt) signed EIP-191 over `ZEAM Pass line\nchannel:
-<id>\nnonce: <nonce>` by the payer or payerAuthorizer. Burn = the union of the calls' true intervals (each to its deadline =
+usable and extends no running call. The settle writes the ms into the channel record in the write that charges the
+payment (`timeOwed`, the ms keyed by the hold), so a purchase whose time cannot be written is not charged (402
+`settle_failed`). The clock then credits it; a clock that cannot be written at that moment loses nothing: every clock
+write first credits each `timeOwed` entry once by its key, `status` and the unburned time that claims and refunds use
+count it, and an entry leaves the channel record once the clock holds it. Such a purchase is answered 200 with the
+time it bought, and the next clock write (a retry, a line step or call, a refund) credits it. A line: a nonce (300 s, one attempt) signed EIP-191 over `ZEAM Pass line\nchannel:
+<id>\nnonce: <nonce>` by the payer or payerAuthorizer. Prove switches the meter on (`on`) only when the clock's `lines` is
+empty, a channel's first line or the first after every line was closed or a refund closed them; with a line open it
+leaves `on` as it is, so only `on` and `off` switch a channel that has lines, and the `opened` answer's `metering` is
+the clock's `on`. A prove that would switch the meter on takes the channel's refund serializer, as `on` does (on
+WordPress, the channel's lock and its refund mark): while a refund is settling it answers 402 `refund_settling`, and
+while one is being worked out 402 `refund_pending`, and it opens nothing (its nonce is spent). Burn = the union of the calls' true intervals (each to its deadline =
 start + what is left) and `idleMs` after the last activity, while on. A call's true interval runs from its start being
 written to its handler returning (`end` gets both); the store's time before and after is not burned, for one call or
 for many at once. To do that the record holds the last 2000 ms provisionally: finished intervals wait in `done` and
@@ -350,10 +400,11 @@ running calls count up to now, and time is made final (`spentMs`, `since`) only 
 plus at most its own start write. Claims, payouts and refunds use earned = max(charged −
 ceil(unburned ms × rateMicro / rateMs), claimed); a refund switches the meter off first, is refused while a line call
 runs (`request_open`), and zeroes the clock and closes its lines once sent or handed over. A time tool without a
-line: a paid call bounded to price × rateMs / rateMicro ms. A cut (the caller hangs up, or sends MCP
+line: a paid call bounded to price × rateMs / rateMicro ms. Its 402's `pricing` states both prices and what a failed call costs on each, from the price and the rate (Node `pricing`, Python `pricing`, PHP `Pricing::pricing`, given the price with `rateMicro` and `rateMs`): `$0.00025 per call of up to 250 ms without a line; $0.000001 per ms on a line. A failed call without a line is not charged; on a line a call burns the time it runs, failed or not.` A tool priced per call or per unit, and `buy_time`, keep their own sentences. A cut (the caller hangs up, or sends MCP
 `notifications/cancelled` for the call's id with its line credential or on the `Mcp-Session-Id` it was sent on, never by
 address) ends the call's interval at the cut and answers 499 `client_gone`; a call priced per call is released, not
-charged. Node and Python hold live calls in memory and stop the handler's wait (Node `signal`, Python
+charged. Node and Python hold live calls in memory and stop the handler's wait (Node `signal`, the hang-up being the
+host's `signal` passed beside the request, else `request.signal`; Python
 `stopped()`; ASGI `http.disconnect` is the hang-up, WSGI has none). WordPress keeps live MCP calls in the meter table
 (`call:` records: the hashed line and session, the channel and the call's start): the cancel's request ends the
 interval at once, the call's own request ends it again for nothing, and PHP learns of a hang-up only when it writes,
@@ -367,16 +418,19 @@ A failed call answers over HTTP with every field the failure carries over MCP (N
 `structuredContent`; WordPress: the `WP_Error`'s code, message and data), `error`, `tool` and `message` added where
 it has none. A failure that carries a `status` of 400 to 599, other than 402, is a refusal the tool marks as the
 caller's: HTTP answers that status, with `Retry-After` when it carries `retry_after_seconds`; any other failure is
-500. Paid or free, it is not charged per call.
+500. Paid or free, it is not charged per call; on a line it has used the time it ran.
 
 A seller's `contact` (an `https://` URL or a `mailto:` address; WordPress defaults to the site's address) goes in
-every 402 (body and PAYMENT-REQUIRED), in the 403 `refused` body and its `how`, and in `openapi.json` as
-`info.contact`. Unset: none of these change.
+the 402 an unpaid call gets (body and PAYMENT-REQUIRED), in the 403 `refused` body and its `how`, and in
+`openapi.json` as `info.contact`; other refusals, the 402s of a line or a refund among them, do not carry it. Unset:
+none of these change.
 
 ## Refunds
 
+Our relay pays the gas of a refund when our fee on what the buyer spent covers the gas of the deposit, of the refund and of settling any calls not yet settled, and of every further deposit and every earlier refund it paid for on that channel, with a 15% margin; otherwise the buyer pays the refund's gas, with a 15% margin, in USDC, quoted before the buyer signs that payment.
+
 - Proof: payer-signed; always sent through the relay.
-- Free when ⌊(on-chain claimed + bundled claim) × 0.0999⌋ micro-USD ≥ ⌈(deposit + refund + riding claim) gas ×
+- In numbers, free when ⌊(on-chain claimed + bundled claim) × 0.0999⌋ micro-USD ≥ ⌈(deposit + refund + riding claim) gas ×
   1.15⌉ micro-USD, both at the gas price read for the refund. The relay applies the same comparison.
 - Gas already paid for the channel is added to that gas, inside the × 1.15: the larger of the record's
   (`depositsWePaid` − 1) × deposit + `refundGasWePaid` and the `gasUnits` the relay answers at `GET /paid?channel=<id>`,
@@ -406,6 +460,32 @@ every 402 (body and PAYMENT-REQUIRED), in the 403 `refused` body and its `how`, 
   `receiverAuthorizer` or `token`.
 - The gas payment's typed data is `transferAuthorizationTypedData`, the same bytes in every engine
   (`wordpress/tests/vectors.json`).
+- Serializer: every step that reads a channel's state and then changes it runs inside one critical section per
+  channel: a refund's arrival, the result of its first chain read, its turn to be judged, its decision (refuse, judge
+  again, or write the sending mark) and the end of its send; a paid call's reservation and its charge; line `on`,
+  `off` and `close`; a line call's admission; and, in Node, every MPP session record change. Node uses a
+  promise-chain mutex per channel id (`Channels.serial`), Python a `threading.Lock` per channel, WordPress the
+  channel's database lock (`GET_LOCK`), held by a refund from its arrival (its proof is checked inside it) to its
+  sending mark. Chain reads and relay
+  sends never run inside the section in Node and Python: they run under a flag the section sets (requests arriving,
+  refunds held, the one being judged, the sending mark in the record), and a request that must wait is woken when a
+  flag changes and decides again inside the section, so no request answers from a snapshot taken before another
+  request changed the channel. A paid call's voucher is verified against the channel's record before the section;
+  inside it the call is reserved only if that record has not moved since (its refund nonce, its balance, an unsent
+  signed refund). If it has, the call is verified again on the record as it now is, so a call verified before a
+  refund landed is judged on the channel the refund left (402 `payment_invalid` with that `channelState`), never
+  served against money the refund returned. Refunds on a channel are judged one at a time, in the order they reached
+  the refund handler: in Node and Python each request takes a place in the channel's order before its proof is
+  checked, and no request is judged or given a kept answer while one that arrived before it is still being checked,
+  reading the chain or waiting for its turn; in WordPress each request takes a numbered ticket before its proof is
+  checked, written one at a time under the channel's ticket lock, and waits for every earlier live ticket on its
+  channel. A request that arrives while a refund that arrived first is still being checked is answered after it
+  (`refund_settling` once that refund is sent). The place is the request's turn: counted per channel from 1, it
+  starts again only after `TURN_KEPT_MS` (ten minutes) with no refund request on the channel, never while one holds a
+  place, and on a Node or Python restart (WordPress keeps the count in its `turns` table). Every answer the refund
+  route gives for the channel carries it, as `turn` last in the body and in the `Zeam-Refund-Turn` header (exposed
+  to browsers), so the order a seller judged in can be read from its answers. The relay send always runs after the
+  section, under the sending mark.
 
 ## Constants
 
@@ -415,18 +495,20 @@ every 402 (body and PAYMENT-REQUIRED), in the 403 `refused` body and its `how`, 
 | Relay rule | sends only for an owner-less split paying the ZEAM fee address ≥ 99900 of 1000000, no distribution incentive; break-even at that split's fee share |
 | Split | 900100 seller / 99900 ZEAM |
 | Deposit floor | max(price, ceil(gas(145,000) × 1.25 / 0.0999), ceil(the gas of a paid refund × 1.25)), from `eth_gasPrice` and the relay's `/health` `wethUSD`; it never falls as the price rises |
-| Gas estimates | deposit 145k; claim 35k + 45k per voucher; payout 210k per asset (settle 60k, distribute 90k, withdraw 60k) + 280k when the split is created; refund 97k; a claim riding a refund 37k (37.7k in a paid refund); Multicall3 wrapping + `transferWithAuthorization` of a gas payment 58.6k; L1 data fee of a paid refund, in gas at the measured gas price, 13.8k, + 4.2k with a riding claim. The refund-payment units apply only when the relay's `/quote` does not answer |
+| Gas estimates | deposit 145k; claim 35k + 45k per voucher; payout 210k per asset (settle 60k, distribute 90k, withdraw 60k) + 280k when the split is created; refund 118k (the row below; 97k as the refund leg of a paid refund, `paidRefundLeg`); a claim riding a refund 37k (37.7k in a paid refund); Multicall3 wrapping + `transferWithAuthorization` of a gas payment 58.6k; L1 data fee of a paid refund, in gas at the measured gas price, 13.8k, + 4.2k with a riding claim. The refund-payment units apply only when the relay's `/quote` does not answer |
 | Refund gas, measured | calibrated 2026-09-29 from the receipts of the relay's 35 paid refunds (`0xB3ED726D24AF7C3ffbf04219A78506170155641b` to Multicall3, Base blocks 51915440 to 51949669; `seller/test/fixtures/paid-refunds-2026-09-29.json`). Refund + payment, 25 sends of 1,252 bytes: 155,101–156,013 gas (median 155,625). With a riding claim, 10 sends of 2,212 bytes: 193,256–194,092 (median 193,332). `eth_estimateGas` of the refund leg alone at each parent block: medians 96,187 and 133,294; a payment adds 59,430 and 60,035. The refund leg's gasUsed by `eth_simulateV1` (71 paid refunds to block 51957700, 3 of them whole-balance refunds from the audit of 2026-09-29, where `eth_estimateGas` reads 100,136 for a leg that uses 94,690): a payment adds 60,367–60,411 (60,391) alone and 61,111–61,155 (61,135) with a claim, the relay's `paymentOverUsed` defaults; its POSTed quotes come to 1.15–1.18 × the send cost on all 38 fixture receipts. L1 data fee: 8% of the cost (medians 13,830 and 18,059 gas at each send's gas price). The relay keeps its own medians from its receipts; engines and relay keep the calibration as `GAS_MEASURED` beside `GAS` |
-| MPP charge | gas 80k, an estimate not yet measured; offered when price ≥ ceil(gas(80,000 × 1.15) / fee share) |
+| Refund gas, a payer holding nothing | gas 118k (`refund` in every engine's gas table and the relay's), measured on a Base fork on 2026-10-22 (`REFUND_GAS_MEASURED` in the relay): a `refundWithSignature` to a payer that deposited all it held writes the payer's USDC balance slot from zero and needs 117,421 gas (`eth_estimateGas`), using 111,802; after a claim it needs 113,529 and uses 112,710, and with a riding claim 151,022 and 150,085. To a payer that still holds USDC it needs 99,774 and uses 94,702 (after a claim 95,882 and 95,610; with a riding claim 133,071 and 132,961). The refund is priced for the payer holding nothing, and the relay sends a free refund with 118,000 × 1.15 = 135,700 gas (97k sent 111,550, so such a refund reverted in the relay's dry run and was not sent free). The relay's break-even and every engine's refund cover count ceil((145,000 + 118,000 + 37,000 per riding claim + the gas ZEAM already paid on the channel) × 1.15). A paid refund keeps its own calibration, `paidRefundLeg` 97,000, from the relay's real paid refunds (the row above), so its table quote stays 1.10–1.25 × what those sends cost. On the same fork a paid refund (refund, then the payer's gas payment, in one Multicall3) to a payer holding nothing needs 173,571 (`eth_estimateGas`), and 211,216 with a riding claim, against 156,447 and 194,104 for a payer that still holds USDC; the relay prices each paid refund it sends by `eth_estimateGas` of the whole transaction and sends it with a gas limit that counts the refund at 118,000 and the payment at 58,600, × 1.15. A seller's first claim riding a refund also writes the seller's claimed total from zero (168,098 `eth_estimateGas`, over the 155,000 a refund and its riding claim are priced at); the relay sends a riding claim inside the claim's own gas (35k + 45k per voucher) as well, so it is sent |
+| MPP charge | gas 105k (`charge` in every engine's gas table and the relay's), measured on a Base fork on 2026-10-22: a USDC `transferWithAuthorization` to a split that has never held USDC writes its balance slot from zero and needs 104,365 gas (`eth_estimateGas`), using 103,264; to a split that holds USDC it needs 86,982 and uses 86,152. A 402 is priced before the buyer signs and cannot know which split it pays, so the charge is priced for the fresh one, and the relay sends it with 105,000 × 1.15 = 120,750 gas (80k sent 92,000, and a new seller's first charge reverted in the relay's dry run); offered when price ≥ ceil(gas(105,000 × 1.15) / fee share), judged at each 402 on `eth_gasPrice` read at most 5 s before (`GasQuote.RECENT_SECS`); when that read fails, on the last gas price the engine read while it is under 60 s old (`GasQuote.QUOTE_TTL`), with the 1.15 still applied; a 402 with no gas price under 60 s old offers no charge, over HTTP and MCP alike. The relay judges a charge on the lowest gas price it read in the last 90 s (`CHARGE_GAS_SECS`: the 60 s an engine may price on, the 20 s the relay may spend asking its node again, and 10 s for the payer to sign and post), reading `eth_gasPrice` every 2 s to keep those prices, so a charge a 402 offered on a price from the same node in that time is not refused as below break-even |
+| A node that does not answer | Engines: a failed `eth_gasPrice` is tried again 0.25 s later, the wait doubling to 4 s, for 20 s from the first failure (`GasQuote.RETRY_SECS`); the schedule is kept in the engine's cache, so every request and process shares it. Until a retry is due, a gas figure that has a price under 60 s old to stand on uses it without asking the node; one without asks the node, as it does when the node answers. Every gas figure an engine states falls back the same way (charge floor, refund cover and refund gas); the deposit floor with no price under 60 s old keeps the last floor it stated. The relay: a read that meets a refused connection, a reset or a timeout is asked again 0.25 s later, the wait doubling to 4 s, for up to 20 s; a send the node does not answer (a refused connection, a reset or a timeout) is sent again as the same signed transaction, the same hash, on the same schedule; a node that already took it says so, and that answer, like any other error from the node, is looked up by its hash for 6 s, as before. The relay has one node and never sends to another |
 | MPP session gas, measured | 2026-10-12, forge snapshot of `zeam-contracts-session` a6d54d1 on a Base fork: open by authorization 216,801; top-up 132,091; relayed settle to the payee 131,113; relayed close 144,577; signed exit 84,615 + 115,531; payee deploy 369,567; payout 355,604 (sweep 72,311, distribute 199,230, withdraw 84,063). Engine `SESSION_GAS`, relay `SESSION_GAS`; a seller overrides rows with `sessions.gas` |
 | Buffer | 1.15 |
 | `stateCatchUpMs` | 2000: how long an answer waits for the engine's node to show a transaction whose receipt it has (a deposit, a session open, top-up or close) |
-| `refundJudgeWaitMs` | 5000: how long a paid call and a line call wait while a line `on` holds the channel to switch the line on, or while a refund that will be sent checks the channel again; then `refund_settling`. It is also how long a paid call waits for the answer to a refund being worked out on its channel (then it goes on, and the check below keeps the refund from returning what it spends), and how long a refund whose chain shows a balance waits for a line `on`'s hold to end before it switches the meter off. A refund that will be sent waits for a line `on`'s hold to end. A refund is judged without the channel's mark (its proof, the chain, its nonce, its gas), and one that ends refused (`nothing_to_return`, a gas quote, a gas payment that fails a check, `request_open`) never takes it. Until the chain shows the channel holds a balance, calls and line ops go on as usual. From then the judgment records itself in the channel's record (`refundsJudged`, one entry per request, each lapsing after 30 s, so a request that stopped holds nothing longer) and switches the line's meter off before it works out the amount (`request_open` if a call is running on the line), and the meter stays off whatever the answer. Until that refund is answered (refused, or handed to the relay), a line `on` is told 402 `refund_pending` at once and changes nothing, a line call is told `meter_off`, and a paid call waits for the answer; a refused answer lets `on` work again. A refund that will be sent then holds the channel to check it (the hold lapses after 30 s, and a refund whose hold lapsed sends nothing: 503 `refund_unavailable`) and checks it again as it is now (spent, balance, settled, the voucher, the refund nonce, an open call, the line, which it switches off again); if any of it moved since its judgment it is judged again under the hold, so it never returns what a call spent meanwhile. While it checks, a paid call, a line `on` and a line call wait for the check, and a refund asked for then is judged on its own and never told `refund_settling`; a refund that ends refused at the check lets the channel go at once. From when it hands the refund to the relay (or signs it for `selfSend`) until the send is resolved, a paid call, a line `on` and a line call are told `refund_settling` at once, and so is a refund asked for then (or `nothing_to_return` if the chain shows the channel empty). A refused refund's answer is kept in the channel's record (`refundVerdict`) for 5 s with the channel and its line as they were (on or off, the time left, a call running): a refund with the same request on a channel and line unchanged since is given it without reading the chain. A seller works out at most four refund requests on one channel at once. Another waits up to `refundJudgeWaitMs` for one of them to finish (WordPress does not wait, since a waiting request holds a PHP worker; how many it answers at the same moment is how many PHP workers the web server has free, and Apache's KeepAlive holds a worker idle after each answer, so the image `wordpress/Dockerfile` builds turns it off), answered from the channel's record without reading the chain as soon as the record answers it: `refund_settling` while a refund is being sent, the kept answer to its request, `request_open` while a call is open; past the wait, 503 `refund_unavailable` with `retry_after_seconds` 1. A burst of refunds on a channel never runs more than four judgments, so it does not slow the judgment of the refund that is sent or the seller's other channels |
+| `refundJudgeWaitMs` | 5000: how long a paid call waits for the answer to a refund being worked out on its channel before it goes on (a refund judged meanwhile then checks the channel again and never returns what that call spends); how long a line `on`, a `prove` that would open a channel's first line and a line call wait for a refund's first chain read; and how long a refund request that arrived after four still being worked out on its channel waits for a place (counted by arrival, so a later request never takes an earlier one's place), answered meanwhile from the channel's record without reading the chain (`refund_settling` while a refund is being sent, the kept answer to its request while no other request holds the channel, `request_open` while a call is open), then 503 `refund_unavailable` with `retry_after_seconds` 1. A refund holds its channel from its verified proof, in the order refunds arrived (the serializer, under [Refunds](#refunds)): its first chain read is shared by the requests that arrive with it, and while that read runs a line `on`, a line call and a paid call wait for it. A channel that holds nothing ends the request there with `nothing_to_return` and the meter as it was. One that holds a balance stays held until every request whose read showed it is answered (each entry lapses after 30 s, so a request that stopped holds nothing longer): the line's meter is switched off before the amount is worked out (`request_open` if a call is running on the line) and stays off whatever the answer; a line `on` is told 402 `refund_pending` and changes nothing, a line call is told `meter_off`, and a paid call waits. A refused refund (`nothing_to_return`, a gas quote, a gas payment that fails a check, `request_open`) lets `on` work again; if the channel moved while it was judged it is judged again (up to three times), so a quote never counts what a call spent. A refund that will be sent (a gas payment that passes every check, channel fees that cover the gas, or `selfSend`) checks the channel again and writes its sending mark in the same step; from then until the send is resolved a paid call, a line `on`, a line call and every other refund request are told `refund_settling` at once (a refund `nothing_to_return` if the chain shows the channel empty). A refused refund's answer is kept in the record (`refundVerdict`) for 5 s with the channel and its line as they were; a refund with the same request on a channel and line unchanged since, while no other request holds the channel, is given it without reading the chain. WordPress takes the channel's database lock for the same steps instead, so a paid call, a line `on` and a line call that arrive while a refund is judged wait for the lock (up to 15 s) and are answered as the channel is when it is let go (a paid call that reaches a PHP worker only after the refund was sent finds the channel refunded and is answered 402 `payment_invalid` with its `channelState`), and it does not wait for a place: a request beyond the four is answered from the record at once (`nothing_to_return` when the record shows the channel empty and one read of the chain agrees), a waiting request holds a PHP worker, Apache's KeepAlive holds a worker idle after each answer (the image `wordpress/Dockerfile` builds turns it off), and on WordPress every request of a burst takes one of the site's PHP workers while WordPress loads and answers it, so until the burst is answered every other request to the site, on any channel or page, waits for a free worker. In Node and Python a burst of refunds on a channel does not slow the seller's other channels |
 | Relay strikes | two reverts the payer caused (an authorization it canceled, or more than it held) in 24 h. The relay then answers 402 `deposits for this payer are paused until <ISO time>: two of its authorizations reverted on chain in 24h (canceled, or more than it held). It can send its own; retry in <n>s` (`charges for this payer …` for a charge), with `retry_after_seconds` |
 | Idle before claiming | 20 s |
 | Hold lifetime | the payment's maxTimeoutSeconds (240) |
-| ZEAM fee address | `0xc60996007B7657DE2F39fA0577E97d7aAF3b7d1e` (development override allowed) |
-| Credit issuer | `0x4202d8042d89cbEFD9D48fE7f7Aa70061CC9Df22` (development override allowed) |
+| ZEAM fee address | `0xc60996007B7657DE2F39fA0577E97d7aAF3b7d1e`, set in each engine; no option or setting changes it |
+| Credit issuer | `0x4202d8042d89cbEFD9D48fE7f7Aa70061CC9Df22`, set in each engine; no option or setting changes it |
 | Relay | `https://api.zeampass.com/relay` |
 | Credit service | `https://api.zeampass.com/credits` |
 | Gate credit | Gate mode: 2,000 checks at a time for $1 USDC ($0.50 per 1,000), bought after the month's 10,000 free checks are used and again below 200 remaining. Keep $1 USDC on Base in the credit wallet. `both` mode needs no USDC in the credit wallet: paid calls are not gate checks. |
@@ -444,7 +526,7 @@ every 402 (body and PAYMENT-REQUIRED), in the 403 `refused` body and its `how`, 
 - `wordpress/tests/floor/fixtures.json`: the deposit floor and the 402 lines that state it, with the gas quote present,
   absent and failing. Node and Python read it over a socket with their own HTTP client, from an edge that refuses the
   User-Agents the default RPC refuses; PHP reads it through its transport.
-- `wordpress/tests/discovery/fixtures.json`: the OpenAPI document's `x-payment-info` (price, protocols, the MPP offer),
+- `wordpress/tests/discovery/fixtures.json`: the OpenAPI document's `x-payment-info` (price, protocols, the MPP offers),
   `security`, `x-guidance`, the 402 description where there is an offer, and the document for the origin root.
 
 Every engine passes all eight.

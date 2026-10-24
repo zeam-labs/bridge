@@ -7,7 +7,18 @@ final class Discovery
     const CACHE_CONTROL = 'max-age=300';
     const GUIDANCE = 'Call a tool: POST its path with the arguments as a JSON object. A tool that is not free answers 402 with what to send when it is called without it. A call that fails is not charged.';
     const ON_A_LINE = ' On a line a call uses the time it runs, whether or not it succeeds.';
-    const MPP_402 = '; the 402 carries an MPP Payment challenge now, in WWW-Authenticate (method evm, intent charge); a refused MPP credential answers 402 with a fresh challenge and a problem';
+    const FAILED_CALL = 'A failed call is not charged.' . self::ON_A_LINE;
+
+    public static function percent($share)
+    {
+        return rtrim(rtrim(sprintf('%.2f', (float) $share * 100), '0'), '.');
+    }
+
+    public static function refundRule($cover, $pay = null)
+    {
+        return 'Our relay pays the gas of a refund when our fee on what the buyer spent covers the gas of the deposit, of the refund and of settling any calls not yet settled, and of every further deposit and every earlier refund it paid for on that channel, with a ' . $cover
+            . "% margin; otherwise the buyer pays the refund's gas, with a " . ($pay === null ? $cover : $pay) . '% margin, in USDC, quoted before the buyer signs that payment.';
+    }
 
     private static function text($v)
     {
@@ -17,6 +28,29 @@ final class Discovery
     private static function field($a, $k)
     {
         return is_array($a) && array_key_exists($k, $a) ? $a[$k] : null;
+    }
+
+    private static function mpp402(array $offers)
+    {
+        $pairs = [];
+        $charge = true;
+        foreach ($offers as $o) {
+            $pairs[] = 'method ' . $o['method'] . ', intent ' . $o['intent'];
+            $charge = $charge && $o['intent'] === 'charge';
+        }
+        return '; the 402 carries ' . (count($offers) === 1 ? 'an MPP Payment challenge' : 'MPP Payment challenges') . ' now, in WWW-Authenticate (' . implode('; ', $pairs) . '); a refused MPP credential answers ' . ($charge ? '402 ' : '') . 'with a fresh challenge and a problem';
+    }
+
+    private static function offered($mpp)
+    {
+        $amount = self::field($mpp, 'amount');
+        return is_string($amount) && preg_match('/^(0|[1-9][0-9]*)$/D', $amount) === 1
+            && self::text(self::field($mpp, 'currency')) && self::text(self::field($mpp, 'method')) && self::text(self::field($mpp, 'intent'));
+    }
+
+    private static function isList($v)
+    {
+        return is_array($v) && ($v === [] || array_keys($v) === range(0, count($v) - 1));
     }
 
     public static function price($tag)
@@ -44,19 +78,26 @@ final class Discovery
         if ($p === null) {
             return null;
         }
-        $amount = self::field($mpp, 'amount');
-        $charge = $p['mode'] === 'fixed' && is_string($amount) && preg_match('/^(0|[1-9][0-9]*)$/D', $amount) === 1
-            && self::text(self::field($mpp, 'currency')) && self::text(self::field($mpp, 'method')) && self::text(self::field($mpp, 'intent'));
-        if (!$charge) {
+        $given = $p['mode'] === 'fixed' ? array_values(array_filter(self::isList($mpp) ? $mpp : [$mpp], static function ($m) {
+            return self::offered($m);
+        })) : [];
+        if (!$given) {
             return ['price' => $p, 'protocols' => [['x402' => new \stdClass()]]];
         }
-        $offer = ['amount' => $amount, 'currency' => $mpp['currency']];
-        if (self::text(self::field($mpp, 'description'))) {
-            $offer['description'] = $mpp['description'];
+        $offers = [];
+        $protocols = [];
+        foreach ($given as $m) {
+            $offer = ['amount' => $m['amount'], 'currency' => $m['currency']];
+            if (self::text(self::field($m, 'description'))) {
+                $offer['description'] = $m['description'];
+            }
+            $offer['intent'] = $m['intent'];
+            $offer['method'] = $m['method'];
+            $offers[] = $offer;
+            $protocols[] = ['mpp' => ['method' => $m['method'], 'intent' => $m['intent'], 'currency' => $m['currency']]];
         }
-        $offer['intent'] = $mpp['intent'];
-        $offer['method'] = $mpp['method'];
-        return ['offers' => [$offer], 'price' => $p, 'protocols' => [['mpp' => ['method' => $mpp['method'], 'intent' => $mpp['intent'], 'currency' => $mpp['currency']]], ['x402' => new \stdClass()]]];
+        $protocols[] = ['x402' => new \stdClass()];
+        return ['offers' => $offers, 'price' => $p, 'protocols' => $protocols];
     }
 
     public static function document(array $doc, $offers = [], $homepage = null, $origin = null, $mount = '')
@@ -84,7 +125,7 @@ final class Discovery
                     $next['x-payment-info'] = $info;
                     $required = self::field(self::field($op, 'responses'), 402);
                     if (isset($info['offers']) && self::text(self::field($required, 'description'))) {
-                        $next['responses'][402]['description'] = $required['description'] . self::MPP_402;
+                        $next['responses'][402]['description'] = $required['description'] . self::mpp402($info['offers']);
                     }
                 }
                 $out[$method] = $next;

@@ -8,7 +8,12 @@ use ZeamPass\Big;
 final class GasQuote
 {
     const QUOTE_TTL = 60;
+    const RECENT_SECS = 5;
     const FLOOR_TTL = 86400 * 30;
+    const RETRY_SECS = 20;
+    const RETRY_FIRST_MS = 250;
+    const RETRY_MOST_MS = 4000;
+    const RETRY_KEY = 'zeam_pass_gas_retry';
 
     private $cfg;
     private $chain;
@@ -65,28 +70,65 @@ final class GasQuote
         return $sender;
     }
 
-    public function weiPerGas($fresh = false)
+    public function weiPerGas($fresh = false, $recent = null)
     {
         if ($this->cfg->gasPriceWei !== null && $this->cfg->gasPriceWei !== '') {
             return (string) $this->cfg->gasPriceWei;
         }
         $key = 'zeam_pass_gas_price';
-        $hit = $fresh ? null : $this->cfg->cache->get($key);
-        if (is_string($hit) && ctype_digit($hit)) {
-            return $hit;
+        $near = $recent === null ? null : $this->cfg->cache->get($key . '_recent');
+        if ($recent !== null && is_string($near) && ctype_digit($near)) {
+            return $near;
+        }
+        $hit = $this->cfg->cache->get($key);
+        $last = is_string($hit) && ctype_digit($hit) ? $hit : null;
+        if ($last !== null && !$fresh && $recent === null) {
+            return $last;
+        }
+        $retry = self::retryOf($this->cfg->cache->get(self::RETRY_KEY));
+        if ($last !== null && $retry !== null && $this->cfg->nowMs() < $retry['due']) {
+            return $last;
         }
         try {
             $wei = $this->chain->gasPrice();
         } catch (\Throwable $e) {
-            return null;
+            $this->missed($retry);
+            return $last;
         }
         $this->cfg->cache->set($key, $wei, self::QUOTE_TTL);
+        if ($recent !== null) {
+            $this->cfg->cache->set($key . '_recent', $wei, $recent);
+        }
+        if ($retry !== null) {
+            $this->cfg->cache->set(self::RETRY_KEY, '', 1);
+        }
         return $wei;
     }
 
-    private function ethOf($units, $fresh = false)
+    private function missed($retry)
     {
-        $wei = $this->weiPerGas($fresh);
+        $now = $this->cfg->nowMs();
+        $since = $retry === null ? $now : $retry['since'];
+        $left = $since + self::RETRY_SECS * 1000 - $now;
+        if ($left <= 0) {
+            $this->cfg->cache->set(self::RETRY_KEY, '', 1);
+            return;
+        }
+        $wait = $retry === null ? self::RETRY_FIRST_MS : min($retry['wait'] * 2, self::RETRY_MOST_MS);
+        $this->cfg->cache->set(self::RETRY_KEY, $since . ':' . ($now + $wait) . ':' . $wait, (int) ceil($left / 1000));
+    }
+
+    private static function retryOf($v)
+    {
+        if (!is_string($v) || !preg_match('/^(\d+):(\d+):(\d+)$/', $v, $m)) {
+            return null;
+        }
+        return ['since' => (int) $m[1], 'due' => (int) $m[2], 'wait' => (int) $m[3]];
+    }
+
+    private function ethOf($units, $fresh = false, $recent = null)
+    {
+        $wei = $this->weiPerGas($fresh, $recent);
         $eth = $wei === null ? null : $this->ethUSD();
         if ($wei === null || $eth === null || Big::sign(Big::init($wei, 10)) <= 0) {
             return null;
@@ -94,9 +136,9 @@ final class GasQuote
         return [(float) Big::strval(Big::mul(Big::init($wei, 10), Big::init((string) $units, 10))) / 1e18, $eth, (string) $wei];
     }
 
-    public function microUSD($units)
+    public function microUSD($units, $recent = null)
     {
-        $q = $this->ethOf((int) round($units));
+        $q = $this->ethOf((int) round($units), false, $recent);
         return $q === null ? null : (int) ceil($q[0] * $q[1] * 1e6);
     }
 
@@ -106,7 +148,7 @@ final class GasQuote
         return $q === null ? null : $q[0] * $q[1];
     }
 
-    private function priced($units, $wei, $eth, $l1Units = 0)
+    public function priced($units, $wei, $eth, $l1Units = 0)
     {
         $buffered = (int) ceil($units * $this->cfg->gasBuffer);
         $inEth = (float) Big::strval(Big::mul(Big::init((string) $wei, 10), Big::init((string) (int) ceil(($units + $l1Units) * $this->cfg->gasBuffer), 10))) / 1e18;
@@ -148,7 +190,7 @@ final class GasQuote
             return null;
         }
         $cover = $g['deposit'] + $g['refund'] + ($claimRides ? $g['refundClaim'] : 0) + $alreadyPaid;
-        $pay = $g['refund'] + ($claimRides ? $g['paidClaim'] : 0) + $g['gasPayment'];
+        $pay = $g['paidRefundLeg'] + ($claimRides ? $g['paidClaim'] : 0) + $g['gasPayment'];
         $l1 = $g['paidL1'] + ($claimRides ? $g['paidClaimL1'] : 0);
         return ['cover' => $this->priced($cover, $at[0], $at[1]), 'pay' => $this->priced($pay, $at[0], $at[1], $l1)];
     }

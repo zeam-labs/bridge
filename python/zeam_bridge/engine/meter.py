@@ -165,6 +165,13 @@ class Clock:
         return True
 
     @staticmethod
+    def owe(rec, owed, now, idle_ms=0):
+        for key, ms in (owed or {}).items():
+            if isinstance(ms, int) and not isinstance(ms, bool) and 0 < ms <= MAX_SAFE:
+                Clock.buy(rec, ms, str(key), now, idle_ms)
+        return rec
+
+    @staticmethod
     def unbuy(rec, ms, key, now, idle_ms=0):
         if key not in rec["credited"]:
             return 0
@@ -286,14 +293,15 @@ def time_text(t, base=""):
             "the time is credited to the paying channel once the payment settles. "
             f'Open a line: POST {base}/line {{"op":"open","channelId":"0x…"}}, sign the message it returns with the payer key, '
             'POST {"op":"prove","channelId":"0x…","nonce":"…","signature":"0x…"}. Send the credential as x-line (MCP: _meta["zeam-pass/line"]). '
-            f'Time burns while a call runs on the line{idle}; a call stops when the time runs out. {{"op":"off"}}: no new calls on the line; a running call burns to its end. '
+            f'Time burns while a call runs on the line{idle}; a call stops when the time runs out. {{"op":"off"}}: no new calls on any line of the channel; a running call burns to its end. '
             "Unburned time comes back with a refund.")
 
 
 class TimeMeter:
 
-    def __init__(self, directory, t, now=None, clocks=None, lines=None, alive=None):
+    def __init__(self, directory, t, now=None, clocks=None, lines=None, alive=None, owed=None):
         self.t = t
+        self.owed = owed
         self.now = now if callable(now) else (lambda: int(time.time() * 1000))
         self.clocks = clocks if clocks is not None else FileStore(os.path.join(directory, "clocks"))
         self.lines = lines if lines is not None else FileStore(os.path.join(directory, "lines"))
@@ -305,6 +313,8 @@ class TimeMeter:
         self._beat = threading.Lock()
         self.starts = {}
         self.stops = {}
+        self.opening = set()
+        self._seen = threading.Lock()
 
     def pulse(self):
         now = self._now()
@@ -371,21 +381,40 @@ class TimeMeter:
     def _now(self):
         return int(self.now())
 
+    def _owing(self, channel_id):
+        if self.owed is None:
+            return None
+        o = self.owed["read"](str(channel_id).lower())
+        return o if isinstance(o, dict) and o else None
+
     def change(self, channel_id, fn):
+        owed = self._owing(channel_id)
         box = {}
 
         def apply(current):
             rec = self.reap(current if current is not None else Clock.fresh(channel_id), self._now())
+            if owed is not None:
+                Clock.owe(rec, owed, self._now(), self.t["idleMs"])
             box["out"] = fn(rec)
             return rec
 
         self.clocks.update(str(channel_id).lower(), apply)
+        if owed is not None:
+            try:
+                self.owed["paid"](str(channel_id).lower(), list(owed))
+            except Exception:
+                pass
         return box.get("out")
 
-    def running(self, rec, now):
+    def seen(self):
+        return {"starts": dict(self.starts), "stops": dict(self.stops), "opening": set(self.opening)}
+
+    def running(self, rec, now, seen=None):
+        seen = self.seen() if seen is None else seen
         for ident, c in rec.get("calls", {}).items():
-            started = self.starts.get((rec["channelId"], ident))
-            stopped = self.stops.get((rec["channelId"], ident))
+            key = (rec["channelId"], ident)
+            started = seen["starts"].get(key, now if key in seen["opening"] else None)
+            stopped = seen["stops"].get(key)
             ran = now if stopped is None else min(stopped, now)
             if ran > c["deadline"]:
                 continue
@@ -395,14 +424,20 @@ class TimeMeter:
                 c["deadline"] = max(c["start"], ran)
         return rec
 
-    def stopped(self, channel_id, ident, at):
-        self.stops.setdefault((str(channel_id).lower(), ident), at)
+    def stopped(self, channel_id, ident, at=None):
+        with self._seen:
+            return self.stops.setdefault((str(channel_id).lower(), ident), self._now() if at is None else at)
 
     def status(self, channel_id):
+        owed = self._owing(channel_id)
+        with self._seen:
+            now = self._now()
+            seen = self.seen()
         stored = self.clocks.get(channel_id) or Clock.fresh(channel_id)
-        now = self._now()
-        rec = self.running(self.reap(copy.deepcopy(stored), now), now)
+        rec = self.running(self.reap(copy.deepcopy(stored), now), now, seen)
         idle = self.t["idleMs"]
+        if owed is not None:
+            Clock.owe(rec, owed, now, idle)
         return {"channelId": rec["channelId"], "msRemaining": Clock.remaining(rec, now, idle),
                 "msSpent": Clock.spent(rec, now, idle), "msReturned": rec["returnedMs"],
                 "metering": rec["on"], "rateUSD": usd(self.t["rateMicro"]), "rateMs": self.t["rateMs"]}
@@ -427,19 +462,30 @@ class TimeMeter:
                 rec["calls"][ident]["by"] = self.boot
             return r
         self.pulse()
-        b = self.change(channel_id, start)
+        key = (str(channel_id).lower(), ident)
+        with self._seen:
+            self.opening.add(key)
+        b = {"ok": False}
+        try:
+            b = self.change(channel_id, start)
+        finally:
+            with self._seen:
+                if b["ok"]:
+                    started = self._now()
+                    self.starts[key] = started
+                self.opening.discard(key)
         if not b["ok"]:
             return b
-        started = self._now()
-        self.starts[(str(channel_id).lower(), ident)] = started
         self.keep_alive()
         return {**b, "started": started}
 
     def end(self, channel_id, ident, started=None, stopped=None):
         def stop(rec):
-            now = self._now()
+            with self._seen:
+                now = self._now()
+                seen = self.seen()
             out = Clock.end(rec, ident, now, self.t["idleMs"], started, stopped)
-            return {**out, "msRemaining": Clock.left(rec, now, self.t["idleMs"])}
+            return {**out, "msRemaining": Clock.left(self.running(copy.deepcopy(rec), now, seen), now, self.t["idleMs"])}
         if stopped is not None:
             self.stopped(channel_id, ident, stopped)
         try:
@@ -473,10 +519,14 @@ class TimeMeter:
         return rec is not None and any(c["deadline"] > now for c in (rec.get("calls") or {}).values())
 
     def unburned_micro(self, channel_id):
+        owed = self._owing(channel_id)
         rec = self.clocks.get(channel_id)
-        if rec is None:
+        if rec is None and owed is None:
             return 0
-        return Clock.unburned_micro(self.reap(rec, self._now()), self._now(), self.t["idleMs"], self.t["rateMicro"], self.t["rateMs"])
+        rec = self.reap(rec if rec is not None else Clock.fresh(channel_id), self._now())
+        if owed is not None:
+            Clock.owe(rec, owed, self._now(), self.t["idleMs"])
+        return Clock.unburned_micro(rec, self._now(), self.t["idleMs"], self.t["rateMicro"], self.t["rateMs"])
 
     def _drop(self, h):
         try:
@@ -508,7 +558,7 @@ class TimeMeter:
 
         return self.change(channel_id, ask)
 
-    def prove(self, channel, nonce, signature):
+    def prove(self, channel, nonce, signature, gate=None):
         if nonce is None or nonce == "":
             return {"ok": False, "status": 400, "code": "bad_request", "why": "nonce is missing: send the nonce the open answer gave, with your signature of its message"}
         if not isinstance(signature, str) or not signature:
@@ -533,15 +583,24 @@ class TimeMeter:
             return {"ok": False, "status": 403, "code": "not_the_payer", "why": f"{who} is not this channel's payer"}
         credential = base64.urlsafe_b64encode(secrets.token_bytes(32)).decode().rstrip("=")
         h = TimeMeter.hash(credential)
+
+        def attach(refusal=None):
+            def keep(rec):
+                at = self._now()
+                if not rec["lines"]:
+                    if refusal is not None:
+                        return {"refused": refusal}
+                    Clock.switch(rec, True, at, self.t["idleMs"])
+                rec["lines"] = rec["lines"] + [h]
+                return {"msRemaining": Clock.left(rec, at, self.t["idleMs"]), "metering": bool(rec["on"])}
+
+            return self.change(channel_id, keep)
+
+        opened = attach() if gate is None else gate(attach)
+        if "refused" in opened:
+            return {"ok": False, "refused": opened["refused"]}
         self.lines.update(h, lambda _c: {"channelId": channel_id, "at": now})
-
-        def keep(rec):
-            rec["lines"] = rec["lines"] + [h]
-            Clock.switch(rec, True, now, self.t["idleMs"])
-            return Clock.left(rec, now, self.t["idleMs"])
-
-        ms_remaining = self.change(channel_id, keep)
-        return {"ok": True, "credential": credential, "channelId": channel_id, "msRemaining": ms_remaining}
+        return {"ok": True, "credential": credential, "channelId": channel_id, "msRemaining": opened["msRemaining"], "metering": opened["metering"]}
 
     def line(self, credential):
         if not isinstance(credential, str) or credential == "":

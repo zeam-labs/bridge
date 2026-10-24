@@ -216,6 +216,16 @@ final class Clock
         return true;
     }
 
+    public static function owe(array &$rec, $owed, $now, $idleMs = 0)
+    {
+        foreach (is_array($owed) ? $owed : [] as $key => $ms) {
+            if (is_int($ms) && $ms > 0 && $ms <= 9007199254740991) {
+                self::buy($rec, $ms, (string) $key, $now, $idleMs);
+            }
+        }
+        return $rec;
+    }
+
     public static function unbuy(array &$rec, $ms, $key, $now, $idleMs = 0)
     {
         $key = (string) $key;

@@ -1,6 +1,6 @@
 [project]
 name = "zeambridge"
-version = "2.0.0"
+version = "2.1.0"
 license = "Apache-2.0"
 license-files = ["LICENSE", "NOTICE"]
 authors = [{name = "ZEAM Labs, LLC", email = "info@zeamlabs.com"}]
@@ -28,7 +28,7 @@ dependencies = [
 
 [project.urls]
 Homepage = "https://zeambridge.com"
-Source = "https://github.com/zeam-labs/pass"
+Source = "https://github.com/zeam-labs/bridge"
 
 [build-system]
 requires = ["setuptools>=77"]

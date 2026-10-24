@@ -79,7 +79,7 @@ export class Sessions {
   static GAS_PAYMENT_MARGIN_SECS = 30
   static GAS_SIGNATURE_MAX = 2 + 2 * 4096
   static GAS_QUOTES_KEPT = 8
-  static OWN_GAS = 'Or leave at your own gas: requestClose on the escrow, and withdraw after its grace period.'
+  static OWN_GAS = "Or leave at your own gas from the channel's payer: requestClose on the escrow, and withdraw after its grace period."
   static PROBLEMS = Object.freeze(Object.keys(KINDS))
 
   constructor(server, escrow, { sent = null, report = null } = {}) {
@@ -194,8 +194,8 @@ export class Sessions {
     return { receiver, signer: this.cfg.receiverAuthorizer, split, salt }
   }
 
-  async refuse(resource, micro, error) {
-    const q = await this.server.paymentRequired(resource, null, null, {}, micro)
+  async refuse(resource, micro, error, refundUrl = null) {
+    const q = this.server.constructor.forSession(await this.server.paymentRequired(resource, null, refundUrl, {}, micro))
     const retry = Sessions.count(error.more?.retry_after_seconds)
     return this.server.constructor.refuse(error.status, { ...error.body(), accepts: q.body.accepts, ...(q.body.session !== undefined ? { session: q.body.session } : {}) }, retry > 0 ? { ...q.headers, 'Retry-After': String(retry) } : q.headers)
   }
@@ -522,6 +522,10 @@ export class Sessions {
     if (live.closeRequestedAt > 0) throw problem('channel-finalized', 'a close has been requested on this channel; it takes no more vouchers')
   }
 
+  serially(id, fn) {
+    return this.server.channels.serial(id, () => this.store.update(id, fn))
+  }
+
   mine(record) {
     return record !== null && record !== undefined && this.server.escrows.find(record) === this.escrow
   }
@@ -586,7 +590,7 @@ export class Sessions {
     if (cumulative > big(live.deposit)) throw problem('amount-exceeds-deposit', 'the voucher is for more than the deposit', { deposit: live.deposit })
     await this.signed(EvmSession.signerOf(config), digest, voucher, 'voucher')
     const now = this.cfg.nowMs()
-    const record = await this.store.update(ctx.id, (current) => {
+    const record = await this.serially(ctx.id, (current) => {
       if (current !== null && !this.mine(current)) return current
       const r = current ?? { channelId: ctx.id, channelConfig: config, chargedCumulativeAmount: '0', signedMaxClaimable: '0', signature: '', balance: live.deposit, totalClaimed: live.settled, withdrawRequestedAt: 0, refundNonce: 0, lastRequestTimestamp: now, escrow: this.escrow.kind, session: { settle: SessionBook.NONE, held: [], openedAt: now } }
       if (opened !== null && r.session.opened === undefined) {
@@ -646,7 +650,7 @@ export class Sessions {
           await this.funded(ctx.asset, a, p.signature)
         }
         const sent = await this.once(ctx.asset, a, about, async () => {
-          await this.store.update(ctx.id, (r) => (r === null ? null : SessionBook.topUpSent(r, key, before.deposit)))
+          await this.serially(ctx.id, (r) => (r === null ? null : SessionBook.topUpSent(r, key, before.deposit)))
           return this.send([this.escrow.topUpCall({ channelId: ctx.id, additionalDeposit: add.toString(), topUpSalt: p.salt, authorization: a, signature: p.signature })])
         })
         const book = SessionBook.topUp(await this.store.get(ctx.id), key)
@@ -667,7 +671,7 @@ export class Sessions {
       ctx.transaction = lower(p.hash)
       landed = { key: lower(p.hash), relayed: false }
     }
-    return this.store.update(ctx.id, (r) => {
+    return this.serially(ctx.id, (r) => {
       if (r === null) return null
       r.balance = after.finalized ? after.settled : after.deposit
       if (after.closeRequestedAt === 0) r.withdrawRequestedAt = 0
@@ -692,7 +696,7 @@ export class Sessions {
     this.usable(live, record.channelConfig)
     await this.signed(EvmSession.signerOf(record.channelConfig), EvmSession.voucherDigest(this.escrow.address, this.cfg.chainId, ctx.id, cumulative), p.signature, 'voucher')
     if (cumulative > SessionBook.accepted(record) && cumulative > big(live.deposit)) throw problem('amount-exceeds-deposit', 'the voucher is for more than the channel holds', { deposit: live.deposit, acceptedCumulative: String(record.signedMaxClaimable) })
-    return this.store.update(ctx.id, (r) => {
+    return this.serially(ctx.id, (r) => {
       if (r === null) return null
       r.balance = live.deposit
       if (big(live.settled) > big(r.totalClaimed ?? '0')) r.totalClaimed = live.settled
@@ -745,14 +749,14 @@ export class Sessions {
     const units = this.cfg.unitsOfMicroUSD(asset, quoted)
     const gasMicroUSD = this.cfg.microUSDOf(asset, units)
     const earned = this.cfg.microUSDOf(asset, (big(live.deposit) - left).toString())
-    const cover = await quotes.quote(this.gas().deposit + this.gas().refund + ((await quotes.relayPaid(ctx.id)) ?? 0), false)
-    const numbers = { channelId: ctx.id, leftMicroUSD, returnedMicroUSD: leftMicroUSD, gasMicroUSD, feeMicroUSD: GasQuote.feeMicroUSD(earned, this.cfg.feeShare), ...(cover === null ? {} : { coverMicroUSD: cover.microUSD }), gasUnits: gas.gasUnits, gasUnitsWithMargin: gas.gasUnitsWithMargin, gasPriceWei: gas.gasPriceWei, ethUSD: gas.ethUSD, l1FeeWei: gas.l1FeeWei, marginPercent: gas.marginPercent, quotedBy: gas.quotedBy, ...extra }
+    const cover = quotes.priced(this.gas().deposit + this.gas().refund + ((await quotes.relayPaid(ctx.id)) ?? 0), gas.gasPriceWei, gas.ethUSD)
+    const numbers = { channelId: ctx.id, leftMicroUSD, returnedMicroUSD: leftMicroUSD, gasMicroUSD, feeMicroUSD: GasQuote.feeMicroUSD(earned, this.cfg.feeShare), coverMicroUSD: cover.microUSD, gasUnits: gas.gasUnits, gasUnitsWithMargin: gas.gasUnitsWithMargin, gasPriceWei: gas.gasPriceWei, ethUSD: gas.ethUSD, l1FeeWei: gas.l1FeeWei, marginPercent: gas.marginPercent, quotedBy: gas.quotedBy, ...extra }
     const said = typeof why === 'function' ? why(gas) : why
     const lead = said === null ? '' : `${said}. `
     if (big(units) >= left) return problem('verification-failed', `${lead}Nothing to return: the close's gas, $${usd(gasMicroUSD)}, is not less than the $${usd(leftMicroUSD)} it would return, and the channel's fees do not cover it. Nothing was sent. ${Sessions.OWN_GAS}`, { code: Sessions.NOTHING_TO_RETURN, ...numbers, returnedMicroUSD: 0 })
     const secs = Math.trunc(Number(this.cfg.gasPaymentSecs))
     const authorization = { from: Address.checksum(record.channelConfig.payer), to: Address.checksum(payTo), value: String(units), validAfter: '0', validBefore: String(Math.floor(this.cfg.nowMs() / 1000) + secs), nonce: '0x' + randomBytes(32).toString('hex') }
-    await this.store.update(ctx.id, (r) => (r === null ? null : Sessions.quoted(r, authorization, ctx.nowSecs)))
+    await this.serially(ctx.id, (r) => (r === null ? null : Sessions.quoted(r, authorization, ctx.nowSecs)))
     return problem('verification-failed', `${lead}The channel's fees do not cover the gas of its open, of the top-ups and close request the relay sent, and of its close. Close gas: $${usd(gasMicroUSD)} USDC, no ETH (${gas.gasUnits} gas, L1 fee ${gas.l1FeeWei} wei, ${gas.gasPriceWei} wei per gas, $${gas.ethUSD} per ETH, ${gas.marginPercent}% margin; ${gas.quotedBy === 'relay' ? 'priced by the relay' : 'priced from measured closes'}). Sign authorization (EIP-3009 TransferWithAuthorization; typed data in sign) and send the close again with gasPayment: {authorization, signature} in its payload within ${secs}s. The close and the gas payment go in one transaction: $${usd(leftMicroUSD)} returns and $${usd(leftMicroUSD - gasMicroUSD)} is net to you. ${Sessions.OWN_GAS}`, { code: Sessions.GAS_PAYMENT_NEEDED, ...numbers, payTo: authorization.to, authorization, sign: Token.transferTypedData(this.tokenDomain(asset), authorization) })
   }
 
@@ -807,7 +811,7 @@ export class Sessions {
     if (cumulative > big(live.deposit)) throw problem('amount-exceeds-deposit', 'the voucher is for more than the channel holds', { deposit: live.deposit })
     const pendingId = '0x' + randomBytes(32).toString('hex')
     let busy = false
-    record = await this.store.update(ctx.id, (r) => {
+    record = await this.serially(ctx.id, (r) => {
       if (r === null) return null
       if (Channels.pendingLive(r, now)) {
         busy = true
@@ -842,7 +846,7 @@ export class Sessions {
           gasPaid = paying
         }
         if (sent.hash !== null && !sent.reverted) {
-          await this.store.update(ctx.id, (r) => {
+          await this.serially(ctx.id, (r) => {
             if (r === null) return null
             r.session = { ...(r.session ?? {}), closing: { transaction: sent.hash, at: now } }
             return r
@@ -879,7 +883,7 @@ export class Sessions {
   }
 
   closed(id, live, transaction, now) {
-    return this.store.update(id, (r) => {
+    return this.serially(id, (r) => {
       if (r === null) return null
       delete r.pendingRequest
       r.balance = live.settled
@@ -899,7 +903,7 @@ export class Sessions {
     const now = this.cfg.nowMs()
     const pendingId = '0x' + randomBytes(32).toString('hex')
     let outcome = null
-    const next = await this.store.update(ctx.id, (r) => {
+    const next = await this.serially(ctx.id, (r) => {
       if (r === null) return null
       if (Channels.pendingLive(r, now)) {
         outcome = 'busy'
@@ -926,7 +930,7 @@ export class Sessions {
     return { ok: true, hold: { kind: 'session', channelId: ctx.id, pendingId, cost: ctx.cost.toString(), challengeId: ctx.challenge.id, payer: lower(r.channelConfig.payer), transaction: ctx.transaction } }
   }
 
-  async hold(headerValue, resource, price = null, { paymentOnly = false, admit = null } = {}) {
+  async hold(headerValue, resource, price = null, { paymentOnly = false, admit = null, refundUrl = null } = {}) {
     const micro = price === null || price === undefined ? null : this.server.micro(price)
     try {
       const ctx = await this.verified(headerValue, resource, paymentOnly ? null : micro)
@@ -939,11 +943,12 @@ export class Sessions {
       const held = await this.reserve(ctx, record)
       held.hold.resource = this.server.constructor.resourceInfo(resource)
       held.hold.micro = micro
+      held.hold.refundUrl = refundUrl
       held.admitted = ctx.gate.seen.get(held.hold.payer) ?? null
       return held
     } catch (e) {
       if (e instanceof Unadmitted) return { ok: false, unadmitted: e.answer }
-      if (e instanceof SessionProblem) return this.refuse(resource, micro, e)
+      if (e instanceof SessionProblem) return this.refuse(resource, micro, e, refundUrl)
       throw e
     }
   }
@@ -955,14 +960,14 @@ export class Sessions {
   async settle(hold) {
     const now = this.cfg.nowMs()
     let charged = false
-    const record = await this.store.update(hold.channelId, (r) => {
+    const record = await this.serially(hold.channelId, (r) => {
       if (r === null || r.pendingRequest === undefined || r.pendingRequest === null || r.pendingRequest.pendingId !== hold.pendingId) return r
       delete r.pendingRequest
       r.lastRequestTimestamp = now
       charged = true
       return SessionBook.charge(r, hold.cost)
     })
-    if (!charged) return this.refuse(hold.resource, hold.micro, problem('verification-failed', 'the hold on this channel ended before the call did. Not delivered; nothing was charged.'))
+    if (!charged) return this.refuse(hold.resource, hold.micro, problem('verification-failed', 'the hold on this channel ended before the call did. Not delivered; nothing was charged.'), hold.refundUrl ?? null)
     const receipt = this.receipt(record, hold.challengeId, { units: 1, ...(hold.transaction ? { txHash: hold.transaction } : {}) })
     return { ok: true, status: 200, response: { success: true, network: this.cfg.network, payer: hold.payer, amount: hold.cost, extra: { protocol: 'mpp', method: Sessions.METHOD, intent: Sessions.INTENT, challengeId: hold.challengeId, channelId: hold.channelId } }, headers: { 'Payment-Receipt': Receipt.header(receipt) } }
   }

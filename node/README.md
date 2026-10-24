@@ -5,7 +5,7 @@ The Bridge engine runs in your process. Your settle key, channel records and set
 90.01% of every sale, paid to your wallet through a split contract with no owner. ZEAM's relay sends the transactions your Bridge signs and
 pays their gas when the transaction covers its gas at the 9.99% fee.
 
-Source: https://github.com/zeam-labs/pass
+Source: https://github.com/zeam-labs/bridge
 
 License: Apache-2.0. Patent pending.
 
@@ -57,6 +57,11 @@ Express:
 app.use(agents.express('/agents'))
 ```
 
+On `node:http`, pass the hang-up as `signal`: `handle(request, { ip, signal })`, with a signal that aborts when the
+response closes before it ends, as `examples/server.mjs` does. A `Request` built on `node:http` does not carry the
+hang-up, and without one a call whose caller hung up runs, and burns line time, until it ends. `agents.express()` and
+`agents.serve()` pass it for you.
+
 `payout` must be a real address; `bridge()` throws on a placeholder. Replace `0xYourWalletAddress` with a wallet
 address on Base that you control: your earnings are paid to it. Replace `name` and `site` with your own as well: `name` fixes your split's address, and `site` goes in the 402's resource and refund URL.
 
@@ -85,13 +90,15 @@ With no `name`, `bridge()` reads ./bridge.json, or ./pass.json where there is no
 Routes:
 
 - `/agents/mcp` (and `/agents/mcp/`): MCP. Tools are listed free. A call carries the x402 PaymentPayload as a JSON object (not base64) in
-  `_meta["x402/payment"]`, or an MPP credential in `_meta["org.paymentauth/credential"]`; an unpaid call answers with the x402 terms and, where MPP is offered, its challenge.
-  A client that declared `capabilities.experimental.payment` is answered JSON-RPC error `-32042` with the challenge in `error.data.challenges` instead (`-32043` for a refused credential), as the MPP MCP transport draft writes it; docs/AGENTS.md section 7.
+  `_meta["x402/payment"]`, or an MPP credential in `_meta["org.paymentauth/credential"]`; an unpaid call answers with the x402 terms and, where MPP is offered, every challenge its HTTP 402 carries, in `result._meta["org.paymentauth/payment-required"]`.
+  A client that declared `capabilities.experimental.payment` is answered JSON-RPC error `-32042` with the same challenges in `error.data.challenges` instead (`-32043` for a refused credential), as the MPP MCP transport draft writes it; docs/AGENTS.md section 7.
   Revisions, streams, resources and what the server says about itself: see MCP.
 - `POST /agents/v1/<tool>`: the same tools over HTTP, with the x402 `PAYMENT-SIGNATURE` header or an MPP `Authorization: Payment` credential.
 - `/agents/openapi.json`: the tools as OpenAPI. Each paid operation carries a `402` response and `x-payment-info`:
-  its `price` in dollars, `protocols`, and under `offers` the MPP `evm` charge its 402 carries now, where it carries
-  one. Every operation says `security: []`: no API key; a paid tool is opened by the payment.
+  its `price` in dollars, `protocols`, and under `offers` each MPP challenge its 402 carries now, at the amount the
+  challenge states: the `evm` charge where it carries one, and the `evm` session where `sessions` is on. With
+  sessions on, `info.description` names them. Every operation says `security: []`: no API key; a paid tool is opened
+  by the payment.
 - `GET /openapi.json` at the root of your origin, which is where MPP directories and validators look, is yours to
   switch on: `agents.handle('/agents', { discovery: true })` or `agents.express('/agents', { discovery: true })`. It is
   the same document with each path written in full (`/agents/v1/<tool>`). It is off unless you ask, so Bridge never
@@ -138,8 +145,8 @@ The agent side: https://zeampass.com/docs/agents
   are not audited: nobody outside their authors has reviewed them. What it changes for you:
   https://zeambridge.com/docs/sell#mpp-sessions
 - `contact` (default none): an `http(s)://` URL or a `mailto:` address; goes in
-  every 402, in the 403 `refused` answer (`how` and `contact`) and in
-  `openapi.json` `info.contact`.
+  the 402 an unpaid call gets, in the 403 `refused` answer (`how` and `contact`)
+  and in `openapi.json` `info.contact`.
 - `stateDir` (default `$BRIDGE_STATE_DIR` or `./.pass`): keys, channel records,
   gate usage, line time and free-call counts.
 - `rpc` (default `https://mainnet.base.org`): a Base RPC URL, or an object
@@ -153,12 +160,8 @@ The agent side: https://zeampass.com/docs/agents
   `stateDir`.
 - `keySecret` (default `$BRIDGE_KEY_SECRET`): seals `keys.json` (see Keys).
 - `refundUrl` (default `<site>/<base>/refund`): the refund URL the 402 names.
-- `feeRecipient` (default `$BRIDGE_FEE_RECIPIENT` or ZEAM's fee address):
-  development only.
 - `payoutIsFeeRecipient` (default `false`): `true` only when `payout` is the
   fee address: the split pays it 100%.
-- `creditIssuer` (default `$BRIDGE_CREDIT_ISSUER` or ZEAM's issuer): development
-  only: the key whose credit notes the gate accepts.
 - `stores` (default file stores): `{ channels, gate }` in your own database
   (see State).
 - `timeouts` (default `{ rpc: 10000, relay: 120000, credits: 20000 }`):
@@ -187,12 +190,18 @@ The agent side: https://zeampass.com/docs/agents
   `internal error`): what went wrong inside your server is not put in the answer. `path` is the path alone: it never
   carries the query string, so a `?line=<credential>` does not reach your log. A tool of yours that throws is not
   this: it answers `tool_failed` with the message it threw. The built-in `line` and `buy_time` are the plugin's: one
-  that fails inside is told to `onError` and answered `internal error`, over HTTP and MCP, and nothing is charged.
+  that fails inside is told to `onError` and answered `internal error`, over HTTP and MCP, and nothing is charged
+  per call.
 
 Settings from the environment are `BRIDGE_…`; the `PASS_…` name of each still works and is read second.
 `setting('BRIDGE_NAME')` (package export) reads one that way.
 
-A bad `name` or `payout`, or a paywall without a price, throws when `bridge()` is called.
+The fee address (`0xc60996007B7657DE2F39fA0577E97d7aAF3b7d1e`) and the credit issuer, the key whose credit notes the
+gate accepts (`0x4202d8042d89cbEFD9D48fE7f7Aa70061CC9Df22`), are ZEAM's, set in the package. No option and no
+environment setting changes them.
+
+A bad `name` or `payout`, a paywall without a price, or a `feeRecipient` or `creditIssuer` option throws when
+`bridge()` is called.
 
 ## Prices per tool
 
@@ -227,10 +236,12 @@ $0.05.
 - Tags: `{"usd":"0.02","per":"call"}`, `{"usd":"0.0001","per":"unit","upTo":"0.05"}`,
   `{"usd":"0","per":"call","free":true,"perHour":60}`, `{"per":"call","varies":true}` (a `prices` function);
   with `time`: `buy_time` `{"usd":"0.000001","per":"ms","ms":1}` and each time tool
-  `{"per":"time","usd":…,"ms":…,"callUSD":…,"callMs":…}`.
+  `{"per":"time","usd":…,"ms":…,"callUSD":…,"callMs":…}`, or `{"per":"time","usd":…,"ms":…,"varies":true}` for one
+  a `prices` function prices.
 - Usage: `meter.units(n)`, n a whole number ≥ 0. Charge = n × `unit`, at most the reserve; the rest of the reserve
   stays in the buyer's channel. `PAYMENT-RESPONSE` `extra` carries `chargedAmount` and `reservedAmount`, on every settled call. No units
-  reported, or a bad n: the call fails, released, nothing charged.
+  reported, or a bad n: the call fails, released, nothing charged per call (on a line the call has used the time it
+  ran).
 - Free: validated, no payment header, 429 `free_limit` with `retry_after_seconds` past `freeLimit`. `handle()` counts
   per `info.ip` (`handle(base)(request, { ip })`); `express()` passes `req.ip`; no `ip`: one count shared by all
   callers. The count is kept in `stateDir/free.json`, so a restart does not reset the hour.
@@ -295,14 +306,17 @@ lets the call go on. An unpaid call with no arguments is still told the price fi
 
 ## Your words in an unpaid answer
 
-`bridge({ unpaid: ({ tool, base, via, body }) => ({ fields, text }) })`. It is asked each time the plugin is about to
+`bridge({ unpaid: ({ tool, base, via, body, args }) => ({ fields, text }) })`. It is asked each time the plugin is about to
 answer 402 with the price (the terms, no error): for a tool over HTTP and MCP, and for a route behind `paywall` or
 `paid()`. `fields` is an object added to the 402's body (MCP: its `structuredContent`); a name the plugin uses
 (`accepts`, `prices`, `pricing`, `time`, …) stays the plugin's. `text` is a string for a reader, added as a second
 text block of the MCP result. `tool` is the tool's name (a route: its `tool.name`, else its path), `base` the public
-address your routes are mounted at, `via` is `'http'` or `'mcp'`, `body` the 402 as it stands. It may be async.
-`null`, a throw, or fields that are not valid JSON leave the answer as it was. The `PAYMENT-REQUIRED` header and the
-MPP challenge are not changed, nothing is charged or held, and `offers().body` carries the fields too.
+address your routes are mounted at, `via` is `'http'` or `'mcp'`, `body` the 402 as it stands, `args` the arguments of
+the tool call it answers (`null` for a route and for `offers()`), so your words can fit the call. It may be async.
+`null`, a throw, or fields that are not valid JSON leave the answer as it was. The fields are in the `PAYMENT-REQUIRED`
+header too, so the header is still the body: when they would take it past 12,288 characters, the header leaves out
+`extensions.bazaar` and keeps the fields. The MPP challenge is not changed, nothing is charged or held, and `offers()`
+carries the fields in its body and its header.
 
 ## What a cut call had
 
@@ -310,9 +324,12 @@ A time tool that runs out of time answers 402 `out_of_time`, and whatever it had
 `run: async (args, { ifCut, signal }) => ...`. `ifCut(fields)` leaves an object for that answer. Call it as often as
 you like: the latest wins, and `null` takes it back. If the call is cut, the fields are added to the `out_of_time`
 body, over HTTP and MCP, on a line (the line's time is spent, as for any cut call) and for a call sold without a line
-(nothing is charged). The names are yours (`snapshot`, `needsMs`, `note`); `error`, `message`, `msRemaining`,
-`elapsedMs`, `tool`, `accepts` and `x402Version` stay the plugin's. A call that ends in time drops them, and fields
-that are not valid JSON are left out. `signal` aborts at the deadline as before: stop your work there.
+(nothing is charged). A call stopped because its caller hung up or canceled it (`client_gone`), or because the plugin
+is stopping (`restarting`), carries them the same way. The names are yours (`snapshot`, `needsMs`, `note`); `error`,
+`message`, `msRemaining`, `elapsedMs`, `tool`, `accepts` and `x402Version` stay the plugin's. A call that ends in time
+drops them, and fields that are not valid JSON are left out. `signal` aborts at the deadline as before: stop your work
+there. Its `reason.code` says why it stopped (`out_of_time`, `client_gone` or `restarting`), so the fields can fit the
+answer they go into.
 
 ## A call
 
@@ -342,7 +359,8 @@ that are not valid JSON are left out. `signal` aborts at the deadline as before:
    with `Retry-After` from `retry_after_seconds`. A result that is not valid JSON answers 500 `tool_failed` too (a
    non-finite number, a BigInt, a circular object, an empty array slot, a `Date`, a class instance, anything
    `JSON.stringify` changes or drops, or no result), with the message every engine gives: "the result is not valid
-   JSON (a non-finite number or a non-JSON value); nothing was charged".
+   JSON (a non-finite number or a non-JSON value). A failed call is not charged. On a line a call uses the time it
+   runs, whether or not it succeeds."
 
 Settlement fails: the result is withheld; the buyer gets a 402 with the terms and the reason. Chain unreadable: the
 payment is refused.
@@ -562,8 +580,8 @@ A route priced by time: `agents.paywall.wrap(handler, { meter: 'time' })` sells 
 `meter: 'time'` tool is sold (it needs the `time` option). A request with a line credential in `x-line` rides the
 line: no payment per request, time burns while your handler runs, and the response carries `X-Pass-Ms-Remaining` and
 `X-Pass-Ms-Elapsed`. A request with no line is one payment (`price`, else the seller's `price`) for the ms that buys.
-The refusals are a time tool's: 402 with the terms, 402 `out_of_time` or `meter_off`, 403 `line_unknown`, 429
-`too_many_calls`, 499 `client_gone`, each a JSON `{ error, message }`.
+The refusals are a time tool's: 402 with the terms, 402 `out_of_time`, `meter_off`, `refund_settling` or
+`channel_leaving`, 403 `line_unknown`, 429 `too_many_calls`, 499 `client_gone`, each a JSON `{ error, message }`.
 
 ```js
 const rpc = agents.paywall.wrap(async (request, call) => {
@@ -574,7 +592,7 @@ app.post('/rpc', agents.serve(rpc))
 ```
 
 - The handler is called `(request, call, ...rest)`. `call` is `{ signal, ifCut, channelId }` and, on a line,
-  `deadline` and `renew`. `signal` aborts when the time runs out or the caller hangs up (`request.signal`); `ifCut` is
+  `deadline` and `renew`. `signal` aborts when the time runs out or the caller hangs up (the host's `signal`, else `request.signal`); `ifCut` is
   the one a tool has (see What a cut call had).
 - A response of 400 or above is sent as yours and is not charged per call; a throw answers 500 `tool_failed`; on a
   line both have used the time they ran. The call is settled when your handler returns its `Response`.
@@ -618,7 +636,7 @@ path is written as your server serves it, from the origin. An operation is an Op
 method, plus the two keys `paywall.wrap()` takes: `price` (else the seller's `price`; a function is a price that
 varies) and `meter: 'time'`. Give them as you gave them to the route: the plugin takes them out and writes what a
 tool's operation carries, so you write no payment text: `x-price`, `security: []`, `x-payment-info` with the MPP
-offer where the route's 402 carries one, and the answers 200, 400, 402, 403, 429 on a time route, 500 and 503. Your
+offers the route's 402 carries, and the answers 200, 400, 402, 403, 429 on a time route, 500 and 503. Your
 own `responses` are kept; for 402, 403, 429 and 503 the plugin's sentence comes first and yours follows it.
 Everything else in a path item (`parameters`, `summary`) is passed through. In `<base>/openapi.json` a path under
 the mount is written from the mount, as a tool's is, and a path outside it carries `servers: [{ url: <origin> }]`;
@@ -676,7 +694,7 @@ Prices per tool, as `tools/list` and the 402 carry them.
 A route you wrapped with a name is in it too (Node engine): after
 `agents.paywall.wrap(handler, { tool: { name: 'rpc' }, meter: 'time' })`, `agents.prices().rpc` is the tag
 `paths()` writes as that route's `x-price`: `{ usd, per: 'call' }`, the time tag, `{ per: 'call', varies: true }`
-for a price that is a function, or a free tool's tag for a free route, with its `perHour`. A route has an entry
+for a price that is a function (`{ per: 'time', usd, ms, varies: true }` when the route meters time), or a free tool's tag for a free route, with its `perHour`. A route has an entry
 from the moment it is wrapped; wrapped again under the same name it has one entry, the later one. A tool of that
 name keeps the name, and a route with no name is not listed. The routes are in `prices()` only: `tools/list`,
 `openapi.json` and the price list of a 402 are the tools, as before.
@@ -748,11 +766,10 @@ URL the 402 names is `site` + the mount path when `site` is set, else the reques
 
 The buyer posts `{ channelId, issued, signature }`, signed by the channel's payer over
 `ZEAM Pass refund\nchannel: <id>\nissued: <ISO time>` within 5 minutes, plus `channelConfig` for a channel with no
-calls. The balance goes back through the relay:
+calls. The balance goes back through the relay. Our relay pays the gas of a refund when our fee on what the buyer spent covers the gas of the deposit, of the refund and of settling any calls not yet settled, and of every further deposit and every earlier refund it paid for on that channel, with a 15% margin; otherwise the buyer pays the refund's gas, with a 15% margin, in USDC, quoted before the buyer signs that payment. Our fee is the channel's spend times the fee address's share of your
+split (9.99%; 100% with `payoutIsFeeRecipient`), rounded down; the gas, with its margin, is rounded up.
 
-- The channel's spend times the fee address's share of your split (9.99%; 100% with `payoutIsFeeRecipient`),
-  rounded down, ≥ the gas of its deposit, its refund and any calls not yet settled, and of every further deposit and every earlier refund ZEAM paid for on that channel, plus 15%, rounded up: ZEAM
-  pays the gas. `op: "refunded"`, `gasMicroUSD: 0`.
+- Our fee covers the gas: `op: "refunded"`, `gasMicroUSD: 0`.
 - Otherwise: 409 `op: "refund_quote"` (`gas_payment_needed`), an EIP-3009 `TransferWithAuthorization` of the quoted
   gas (15% margin) for the buyer to sign. The relay prices it (`quotedBy: "relay"`); no quote from the relay: the engine
   prices from `Config.GAS` and the measured L1 fee (`quotedBy: "engine"`), with the ETH price and gas wallet it read

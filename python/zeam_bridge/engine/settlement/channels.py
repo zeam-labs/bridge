@@ -1,5 +1,6 @@
-import copy
 import re
+import threading
+import weakref
 
 from ..php import is_int, php_empty, php_str, to_int
 from .config import Config
@@ -18,6 +19,24 @@ def n(value):
     return int(text)
 
 
+class Gate:
+    def __init__(self, ident):
+        self.id = ident
+        self.lock = threading.Lock()
+        self.woke = threading.Condition(threading.Lock())
+        self.version = 0
+        self.queued = 0
+        self.waiting = set()
+        self.seq = 0
+        self.order = {}
+        self.checking = {}
+        self.arriving = {}
+        self.held = {}
+        self.judge = None
+        self.reading = None
+        self.last_read = None
+
+
 def bigger(a, b):
     return n(a) if n(a) >= n(b) else n(b)
 
@@ -27,7 +46,6 @@ class Channels:
     max = staticmethod(bigger)
     REFUNDING_TTL_MS = 180000
     JUDGING_TTL_MS = 30000
-    JUDGING_POLL_MS = 20
 
     @staticmethod
     def refunding_wait_ms(c, now):
@@ -43,40 +61,6 @@ class Channels:
         look = max(1, to_int(getattr(cfg, "drainWaitMs", Config.DRAIN_WAIT_MS)))
         return max(1, -(-min(left if left > 0 else look, look) // 1000))
 
-    @staticmethod
-    def judging(c, now):
-        return c is not None and c.get("refundingJudging") is True and Channels.refunding_wait_ms(c, now) > 0
-
-    @staticmethod
-    def weighed(c, now):
-        everyone = c.get("refundsJudged") if c is not None else None
-        if not isinstance(everyone, dict):
-            return {}
-        return {k: v for k, v in everyone.items() if to_int(v) > now}
-
-    @staticmethod
-    def being_judged(c, now):
-        return len(Channels.weighed(c, now)) > 0
-
-    @staticmethod
-    def judged_retry_secs(cfg, c, now):
-        until = max([0] + [to_int(v) for v in Channels.weighed(c, now).values()])
-        return Channels.retry_secs(cfg, until - now if until > now else 0)
-
-    @staticmethod
-    def held(c, now, pending=False):
-        return Channels.judging(c, now) or (pending and Channels.being_judged(c, now) and Channels.refunding_wait_ms(c, now) == 0)
-
-    @staticmethod
-    def unweighed(r, holder, now):
-        rest = Channels.weighed(r, now)
-        rest.pop(holder, None)
-        if rest:
-            r["refundsJudged"] = rest
-        else:
-            r.pop("refundsJudged", None)
-        return r
-
     def __init__(self, cfg, store, chain):
         self.cfg = cfg
         self.store = store
@@ -91,122 +75,158 @@ class Channels:
     def judge_wait_ms(self):
         return max(0, to_int(getattr(self.cfg, "refundJudgeWaitMs", 5000)))
 
-    def judged(self, channel_id, pending=False):
-        deadline = self.cfg.now_ms() + self.judge_wait_ms()
-        while True:
-            c = self.get(channel_id)
-            now = self.cfg.now_ms()
-            if not Channels.held(c, now, pending) or now >= deadline:
-                return c
-            self.cfg.sleep_ms(Channels.JUDGING_POLL_MS)
+    _GATES = weakref.WeakKeyDictionary()
+    _GATES_LOCK = threading.Lock()
 
-    def weigh(self, channel_id, holder):
-        deadline = self.cfg.now_ms() + self.judge_wait_ms()
-        while True:
-            wait = []
+    def _gates(self):
+        return Channels._GATES.setdefault(self.store, {})
 
-            def enter(r):
-                if r is None:
-                    return r
-                now = self.cfg.now_ms()
-                weighed = Channels.weighed(r, now)
-                if now < deadline and Channels.judging(r, now) and str(r.get("refundingBy")) not in weighed:
-                    wait.append(True)
-                    return r
-                weighed[holder] = now + Channels.JUDGING_TTL_MS
-                r["refundsJudged"] = weighed
-                return r
+    def gate(self, channel_id):
+        ident = php_str(channel_id).lower()
+        with Channels._GATES_LOCK:
+            g = self._gates().get(ident)
+            if g is None:
+                g = Gate(ident)
+                self._gates()[ident] = g
+            return g
 
-            try:
-                self.update(channel_id, enter)
-            except Exception:
-                return False
-            if not wait:
-                return True
-            self.cfg.sleep_ms(Channels.JUDGING_POLL_MS)
+    def _enter(self, channel_id):
+        ident = php_str(channel_id).lower()
+        with Channels._GATES_LOCK:
+            g = self._gates().get(ident)
+            if g is None:
+                g = Gate(ident)
+                self._gates()[ident] = g
+            g.queued += 1
+            return g
 
-    def unweigh(self, channel_id, holder):
+    def idle(self, g):
+        with Channels._GATES_LOCK:
+            if g.queued == 0 and not g.order and not g.checking and not g.arriving and not g.held and g.judge is None and g.reading is None and not g.waiting and self._gates().get(g.id) is g:
+                del self._gates()[g.id]
+
+    def serial(self, channel_id, fn):
+        g = self._enter(channel_id)
         try:
-            self.update(channel_id, lambda r: r if r is None else Channels.unweighed(r, holder, self.cfg.now_ms()))
-        except Exception:
-            pass
+            with g.lock:
+                return fn(g)
+        finally:
+            with Channels._GATES_LOCK:
+                g.queued -= 1
+            self.idle(g)
 
-    def mark(self, channel_id, holder, refuse_open=True, sending=False):
+    @staticmethod
+    def live(entries, now):
+        for k in [k for k, until in entries.items() if until <= now]:
+            del entries[k]
+        return len(entries)
+
+    TURN_KEPT_MS = 600000
+    _TURNS = weakref.WeakKeyDictionary()
+    _TURNS_LOCK = threading.Lock()
+
+    def _turn(self, g, now):
+        with Channels._TURNS_LOCK:
+            turns = Channels._TURNS.setdefault(self.store, {})
+            last = turns.pop(g.id, None)
+            g.seq = max(g.seq, last[0] if last is not None and now - last[1] < Channels.TURN_KEPT_MS else 0) + 1
+            turns[g.id] = (g.seq, now)
+            while turns:
+                first = next(iter(turns))
+                if now - turns[first][1] < Channels.TURN_KEPT_MS:
+                    break
+                del turns[first]
+            return g.seq
+
+    def ticket(self, channel_id, holder):
+        def take(g):
+            now = self.cfg.now_ms()
+            turn = self._turn(g, now)
+            g.order[holder] = turn
+            g.checking[holder] = now + Channels.JUDGING_TTL_MS
+            return turn
+
+        return self.serial(channel_id, take)
+
+    @staticmethod
+    def _earlier(g, holder, entries, now):
+        mine = g.order.get(holder, float("inf"))
+        Channels.live(entries, now)
+        return sum(1 for k in entries if k != holder and g.order.get(k, float("inf")) < mine)
+
+    @staticmethod
+    def ahead(g, holder, now):
+        return Channels._earlier(g, holder, g.checking, now) + Channels._earlier(g, holder, g.arriving, now) > 0
+
+    @staticmethod
+    def place(g, holder, now):
+        return Channels._earlier(g, holder, g.held, now)
+
+    @staticmethod
+    def seat(g, holder, entries, until):
+        g.checking.pop(holder, None)
+        entries[holder] = until
+
+    @staticmethod
+    def judge_of(g, now):
+        if g.judge is not None and g.judge["until"] <= now:
+            g.judge = None
+        return g.judge
+
+    @staticmethod
+    def arriving(g, now):
+        return Channels.live(g.arriving, now) > 0
+
+    @staticmethod
+    def holding(g, now):
+        return Channels.live(g.held, now) > 0
+
+    @staticmethod
+    def asked(g, now):
+        return Channels.arriving(g, now) or Channels.holding(g, now)
+
+    def waiter(self, g):
+        token = object()
+        with g.woke:
+            g.waiting.add(token)
+            return {"g": g, "seen": g.version, "token": token}
+
+    def wake(self, g):
+        with g.woke:
+            g.version += 1
+            g.waiting.clear()
+            g.woke.notify_all()
+
+    def waited(self, w, deadline):
+        g = w["g"]
+        try:
+            with g.woke:
+                while g.version == w["seen"]:
+                    left = deadline - self.cfg.now_ms()
+                    if left <= 0:
+                        break
+                    g.woke.wait(min(left, 2147483) / 1000)
+        finally:
+            with g.woke:
+                g.waiting.discard(w["token"])
+            self.idle(g)
+
+    def until_answered(self, channel_id, deadline, decide):
         while True:
-            out = {"ok": True}
-
-            def take(r):
-                if r is None:
-                    return r
+            def look(g):
                 now = self.cfg.now_ms()
-                if Channels.judging(r, now):
-                    out.clear()
-                    out["wait"] = True
-                elif Channels.refunding_wait_ms(r, now) > 0:
-                    out.clear()
-                    out["settling"] = Channels.refunding_retry_secs(self.cfg, r, now)
-                elif not sending and Channels.being_judged(r, now):
-                    out.clear()
-                    out["judged"] = Channels.judged_retry_secs(self.cfg, r, now)
-                elif refuse_open and Channels.pending_live(r, now):
-                    out.clear()
-                    out["open"] = copy.deepcopy(r)
-                    out["at"] = now
-                elif sending:
-                    r["refundingUntil"] = now + Channels.JUDGING_TTL_MS
-                    r["refundingBy"] = holder
-                    r["refundingJudging"] = True
-                else:
-                    r["refundingUntil"] = now + Channels.JUDGING_TTL_MS
-                    r["refundingBy"] = holder
-                    r["refundingJudging"] = True
-                return r
+                r = self.get(channel_id)
+                if Channels.refunding_wait_ms(r, now) > 0:
+                    return {"settling": Channels.refunding_retry_secs(self.cfg, r, now), "r": r}
+                asked = Channels.asked(g, now)
+                if asked and Channels.arriving(g, now) and now < deadline:
+                    return {"wait": self.waiter(g)}
+                return decide(g, r, now, asked)
 
-            try:
-                self.update(channel_id, take)
-            except Exception:
-                return {"unavailable": True}
-            if out.get("wait") is not True:
+            out = self.serial(channel_id, look)
+            if not isinstance(out, dict) or "wait" not in out:
                 return out
-            self.cfg.sleep_ms(Channels.JUDGING_POLL_MS)
-
-    def sending(self, channel_id, holder):
-        other = []
-
-        def extend(r):
-            if r is None:
-                return r
-            now = self.cfg.now_ms()
-            if r.get("refundingBy") != holder or Channels.refunding_wait_ms(r, now) == 0:
-                other.append(Channels.refunding_retry_secs(self.cfg, r, now) if Channels.refunding_wait_ms(r, now) > 0 else None)
-                return r
-            r["refundingUntil"] = now + Channels.REFUNDING_TTL_MS
-            r["refundingBy"] = holder
-            r.pop("refundingJudging", None)
-            return Channels.unweighed(r, holder, now)
-
-        try:
-            self.update(channel_id, extend)
-        except Exception:
-            return {"unavailable": True}
-        if not other:
-            return None
-        return {"settling": other[-1]} if other[-1] is not None else {"unavailable": True}
-
-    def unmark(self, channel_id, holder):
-        def drop(r):
-            if r is None:
-                return r
-            if r.get("refundingBy") == holder:
-                r.pop("refundingUntil", None)
-                r.pop("refundingBy", None)
-                r.pop("refundingJudging", None)
-            return Channels.unweighed(r, holder, self.cfg.now_ms())
-
-        try:
-            self.update(channel_id, drop)
-        except Exception:
-            pass
+            self.waited(out["wait"], deadline)
 
     def repaired(self, channel_id):
         channel = self.get(channel_id)
@@ -282,7 +302,7 @@ class Channels:
             return c
 
         try:
-            self.update(channel_id, drop)
+            self.serial(channel_id, lambda g: self.update(channel_id, drop))
         except Exception:
             return False
         return had[0]

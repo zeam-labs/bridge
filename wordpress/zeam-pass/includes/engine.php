@@ -83,8 +83,7 @@ function zeam_pass_gated_mode()
 
 function zeam_pass_fee_recipient()
 {
-    $set = zeam_pass_defined('FEE_RECIPIENT');
-    return is_string($set) && $set !== '' ? $set : ZEAM_PASS_DEFAULT_FEE_RECIPIENT;
+    return ZEAM_PASS_DEFAULT_FEE_RECIPIENT;
 }
 
 function zeam_pass_payout_is_fee_recipient()
@@ -94,8 +93,7 @@ function zeam_pass_payout_is_fee_recipient()
 
 function zeam_pass_credit_issuer()
 {
-    $set = zeam_pass_defined('CREDIT_ISSUER');
-    return is_string($set) && $set !== '' ? $set : ZEAM_PASS_DEFAULT_CREDIT_ISSUER;
+    return ZEAM_PASS_DEFAULT_CREDIT_ISSUER;
 }
 
 function zeam_pass_url_opt($key, $default)
@@ -452,6 +450,7 @@ function zeam_pass_serve_paid($tool, $resource, array $args, $payment, $grant, $
         return zeam_pass_refusal($q['status'], $q['body'], $q['headers']);
     }
     $grantedBy = null;
+    $nobody = false;
     if ($both) {
         $payload = \ZeamPass\Settlement\Json::decodeHeader($payment);
         if ($payload !== null) {
@@ -460,15 +459,18 @@ function zeam_pass_serve_paid($tool, $resource, array $args, $payment, $grant, $
             if ($bad !== null) {
                 return zeam_pass_refusal($bad['status'], $bad['body'], $bad['headers']);
             }
-            $a = zeam_pass_admits_payer($who, $grant, $tool);
-            if (!$a['ok'] && $a['code'] === 'bad_grant') {
-                return zeam_pass_bad_grant($server, $resource, $a['why'], $price, $listing, $extensions);
-            }
-            if (!$a['ok']) {
-                return zeam_pass_refusal(403, ['error' => 'refused', 'message' => $a['why'], 'how' => zeam_pass_refused_how(), 'contact' => zeam_pass_contact()]);
-            }
-            if ($a['root'] !== $who) {
-                $grantedBy = $a['root'];
+            $nobody = $who === null;
+            if (!$nobody) {
+                $a = zeam_pass_admits_payer($who, $grant, $tool);
+                if (!$a['ok'] && $a['code'] === 'bad_grant') {
+                    return zeam_pass_bad_grant($server, $resource, $a['why'], $price, $listing, $extensions);
+                }
+                if (!$a['ok']) {
+                    return zeam_pass_refusal(403, ['error' => 'refused', 'message' => $a['why'], 'how' => zeam_pass_refused_how(), 'contact' => zeam_pass_contact()]);
+                }
+                if ($a['root'] !== $who) {
+                    $grantedBy = $a['root'];
+                }
             }
         }
     }
@@ -476,6 +478,11 @@ function zeam_pass_serve_paid($tool, $resource, array $args, $payment, $grant, $
     $held = $server->verifyAndHold($payment, $resource, is_array($price) ? $price['micro'] : null);
     if (!$held['ok']) {
         return zeam_pass_refusal($held['status'], $held['body'], $held['headers']);
+    }
+    if ($nobody) {
+        $server->release($held['hold']);
+        $a = zeam_pass_admits_payer(null, $grant, $tool);
+        return zeam_pass_refusal(403, ['error' => 'refused', 'message' => $a['why'], 'how' => zeam_pass_refused_how(), 'contact' => zeam_pass_contact()]);
     }
     $hold = $held['hold'];
     $started = zeam_pass_now_ms();
@@ -506,6 +513,9 @@ function zeam_pass_serve_paid($tool, $resource, array $args, $payment, $grant, $
     $bought = ((zeam_pass_tools()[$tool]['builtin'] ?? null) === 'buy_time')
         ? ['channelId' => $hold['channelId'], 'ms' => zeam_pass_bought_ms($args), 'key' => $hold['pendingId']]
         : null;
+    if ($bought !== null) {
+        $hold['owedMs'] = $bought['ms'];
+    }
     $settled = $server->settle($hold, $metered ? zeam_pass_charge_units($e, $hold, $price, $meter->reported()) : null);
     if (!$settled['ok']) {
         return zeam_pass_refusal($settled['status'], $settled['body'], $settled['headers']);
@@ -514,7 +524,6 @@ function zeam_pass_serve_paid($tool, $resource, array $args, $payment, $grant, $
         try {
             zeam_pass_time_meter()->credit($bought['channelId'], $bought['ms'], $bought['key']);
         } catch (Throwable $ex) {
-            return zeam_pass_refusal(500, ['error' => 'tool_failed', 'message' => 'the payment settled but the time could not be recorded: ' . \ZeamPass\message($ex), 'tool' => $tool]);
         }
         if (is_array($out) && array_key_exists('msRemaining', $out)) {
             try {
@@ -532,7 +541,7 @@ function zeam_pass_serve_paid($tool, $resource, array $args, $payment, $grant, $
 
 function zeam_pass_out_of_time($onLine, $ms = null)
 {
-    return ['error' => 'out_of_time', 'message' => $onLine ? 'the line ran out of time during the call. Its time is spent. Buy time: buy_time.' : "the call ran past the {$ms} ms its price buys. Nothing was charged. Buy time and call on a line."];
+    return ['error' => 'out_of_time', 'message' => $onLine ? 'the line ran out of time during the call. Its time is spent. Buy time: buy_time.' : "the call needs more than the {$ms} ms its price buys, so it was cut. Nothing was charged. Buy time and call on a line."];
 }
 
 function zeam_pass_hung_up($onLine)
@@ -678,22 +687,29 @@ function zeam_pass_serve_on_line($tool, array $args, $credential)
     if ($channelId === null) {
         return zeam_pass_refusal(403, ['error' => 'line_unknown', 'message' => 'no open line with that credential. Open one: POST {"op":"open","channelId":"0x…"} to this seller\'s line route, the address its 402 time line names.']);
     }
-    $ch = zeam_pass_channels()->judged($channelId);
-    if ($ch === null) {
-        return zeam_pass_refusal(403, ['error' => 'line_unknown', 'message' => 'no channel for this line.']);
-    }
-    if ((int) ($ch['withdrawRequestedAt'] ?? 0) > 0) {
-        return zeam_pass_refusal(402, ['error' => 'channel_leaving', 'message' => 'this channel is withdrawing. Open a new channel.']);
-    }
-    if (\ZeamPass\Settlement\Channels::refundingWaitMs($ch, $meter->nowMs()) > 0) {
-        $secs = \ZeamPass\Settlement\Channels::refundingRetrySecs(null, $ch, $meter->nowMs());
-        return zeam_pass_refusal(402, ['error' => 'refund_settling', 'message' => "a refund is settling on this channel, retry in {$secs}s.", 'retry_after_seconds' => $secs]);
-    }
-    if (zeam_pass_caller_gone()) {
-        return zeam_pass_refusal(499, zeam_pass_hung_up(true));
-    }
     $id = bin2hex(random_bytes(8));
-    $b = $meter->begin($channelId, $id);
+    $channels = zeam_pass_channels();
+    $seated = $channels->serial($channelId, function () use ($channels, $channelId, $meter, $id) {
+        $ch = $channels->judged($channelId);
+        if ($ch === null) {
+            return ['refused' => zeam_pass_refusal(403, ['error' => 'line_unknown', 'message' => 'no channel for this line.'])];
+        }
+        if ((int) ($ch['withdrawRequestedAt'] ?? 0) > 0) {
+            return ['refused' => zeam_pass_refusal(402, ['error' => 'channel_leaving', 'message' => 'this channel is withdrawing. Open a new channel.'])];
+        }
+        if (\ZeamPass\Settlement\Channels::refundingWaitMs($ch, $meter->nowMs()) > 0) {
+            $secs = \ZeamPass\Settlement\Channels::refundingRetrySecs(null, $ch, $meter->nowMs());
+            return ['refused' => zeam_pass_refusal(402, ['error' => 'refund_settling', 'message' => "a refund is settling on this channel, retry in {$secs}s.", 'retry_after_seconds' => $secs])];
+        }
+        if (zeam_pass_caller_gone()) {
+            return ['refused' => zeam_pass_refusal(499, zeam_pass_hung_up(true))];
+        }
+        return ['b' => $meter->begin($channelId, $id)];
+    });
+    if (isset($seated['refused'])) {
+        return $seated['refused'];
+    }
+    $b = $seated['b'];
     if (!$b['ok']) {
         $msRemaining = $meter->status($channelId)['msRemaining'];
         if ($b['code'] === 'too_many_calls') {
@@ -788,11 +804,39 @@ function zeam_pass_line_op($args, $headerCredential = '')
             $c = $meter->challenge($id);
             return ['status' => 200, 'body' => ['op' => 'challenge', 'channelId' => $id, 'nonce' => $c['nonce'], 'sign' => $c['message'], 'expiresInSeconds' => $c['expiresInSeconds']]];
         }
-        $r = $meter->prove($ch, $args['nonce'] ?? null, $args['signature'] ?? null);
+        $channels = zeam_pass_channels();
+        $r = $meter->prove($ch, $args['nonce'] ?? null, $args['signature'] ?? null, function ($attach) use ($channels, $id) {
+            $holder = '0x' . bin2hex(random_bytes(16));
+            return $channels->serial($id, function () use ($channels, $id, $holder, $attach) {
+                $marked = $channels->mark($id, $holder, false);
+                if (isset($marked['unavailable'])) {
+                    return ['refused' => $marked];
+                }
+                if (isset($marked['settling']) || isset($marked['judged'])) {
+                    return $attach($marked);
+                }
+                try {
+                    return $attach();
+                } finally {
+                    $channels->unmark($id, $holder);
+                }
+            });
+        });
+        if (isset($r['refused']['unavailable'])) {
+            return ['status' => 503, 'body' => ['op' => 'line_failed', 'code' => 'line_unavailable', 'why' => 'the line could not be read right now. Retry.']];
+        }
+        if (isset($r['refused']['settling'])) {
+            $secs = $r['refused']['settling'];
+            return ['status' => 402, 'body' => ['op' => 'line_failed', 'code' => 'refund_settling', 'why' => "a refund is settling on this channel, and a first line would switch its meter on. Nothing was opened: send {\"op\":\"open\"} again in {$secs}s.", 'retry_after_seconds' => $secs]];
+        }
+        if (isset($r['refused']['judged'])) {
+            $secs = $r['refused']['judged'];
+            return ['status' => 402, 'body' => ['op' => 'line_failed', 'code' => 'refund_pending', 'why' => "a refund asked for on this channel is being worked out, and the meter stays off until it is answered. Nothing was opened: send {\"op\":\"open\"} again in {$secs}s.", 'retry_after_seconds' => $secs]];
+        }
         if (!$r['ok']) {
             return $fail($r['status'], $r['code'], $r['why']);
         }
-        return ['status' => 200, 'body' => ['op' => 'opened', 'credential' => $r['credential'], 'channelId' => $id, 'msRemaining' => $r['msRemaining'], 'metering' => true]];
+        return ['status' => 200, 'body' => ['op' => 'opened', 'credential' => $r['credential'], 'channelId' => $id, 'msRemaining' => $r['msRemaining'], 'metering' => $r['metering']]];
     }
     $credential = isset($args['credential']) && is_string($args['credential']) && $args['credential'] !== '' ? $args['credential'] : (string) $headerCredential;
     if ($credential === '') {
@@ -802,14 +846,27 @@ function zeam_pass_line_op($args, $headerCredential = '')
     if ($id === null) {
         return $fail(403, 'line_unknown', 'no open line with that credential');
     }
+    $channels = zeam_pass_channels();
     if ($op === 'close') {
-        $meter->close($credential);
+        $channels->serial($id, function () use ($meter, $credential) {
+            return $meter->close($credential);
+        });
         return ['status' => 200, 'body' => ['op' => 'closed', 'channelId' => $id]];
     }
     if ($op === 'on') {
         $holder = '0x' . bin2hex(random_bytes(16));
-        $channels = zeam_pass_channels();
-        $marked = $channels->mark($id, $holder, false);
+        $marked = $channels->serial($id, function () use ($channels, $meter, $id, $holder) {
+            $marked = $channels->mark($id, $holder, false);
+            if (isset($marked['unavailable']) || isset($marked['settling']) || isset($marked['judged'])) {
+                return $marked;
+            }
+            try {
+                $meter->switch($id, true);
+            } finally {
+                $channels->unmark($id, $holder);
+            }
+            return $marked;
+        });
         if (isset($marked['unavailable'])) {
             return ['status' => 503, 'body' => ['op' => 'line_failed', 'code' => 'line_unavailable', 'why' => 'the line could not be read right now. Retry.']];
         }
@@ -821,13 +878,10 @@ function zeam_pass_line_op($args, $headerCredential = '')
             $secs = $marked['judged'];
             return ['status' => 402, 'body' => ['op' => 'line_failed', 'code' => 'refund_pending', 'why' => "a refund asked for on this channel is being worked out, and the meter stays off until it is answered. Retry in {$secs}s.", 'retry_after_seconds' => $secs]];
         }
-        try {
-            $meter->switch($id, true);
-        } finally {
-            $channels->unmark($id, $holder);
-        }
     } elseif ($op !== 'status') {
-        $meter->switch($id, false);
+        $channels->serial($id, function () use ($meter, $id) {
+            return $meter->switch($id, false);
+        });
     }
     return ['status' => 200, 'body' => ['op' => $op] + $meter->status($id)];
 }

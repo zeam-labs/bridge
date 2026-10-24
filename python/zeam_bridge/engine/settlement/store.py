@@ -99,16 +99,29 @@ class MppHeldMemory:
 
     def claim(self, key, until_ms, now_ms):
         with self._lock:
-            for k in [k for k, until in self._held.items() if until <= now_ms]:
+            for k in [k for k, e in self._held.items() if e["until"] <= now_ms]:
                 del self._held[k]
             if key in self._held:
                 return False
-            self._held[key] = until_ms
+            self._held[key] = {"key": str(key), "until": until_ms}
             return True
 
     def release(self, key):
         with self._lock:
             self._held.pop(key, None)
+
+    def entry(self, key):
+        with self._lock:
+            e = self._held.get(key)
+            return None if e is None else dict(e)
+
+    def mark(self, key, from_state, fields):
+        with self._lock:
+            e = self._held.get(key)
+            if e is None or e.get("state") != from_state:
+                return False
+            self._held[key] = {**e, **fields}
+            return True
 
     def clear(self):
         with self._lock:
@@ -163,6 +176,19 @@ class MppHeldFiles:
     def release(self, key):
         with contextlib.suppress(FileNotFoundError):
             os.unlink(self.path(key))
+
+    def entry(self, key):
+        had = read_json(self.path(key))
+        return had if isinstance(had, dict) else None
+
+    def mark(self, key, from_state, fields):
+        path = self.path(key)
+        with locked(path + ".lock"):
+            had = read_json(path)
+            if not isinstance(had, dict) or had.get("state") != from_state:
+                return False
+            atomic_write(path, json.dumps({**had, **fields}))
+            return True
 
     def _names(self):
         try:

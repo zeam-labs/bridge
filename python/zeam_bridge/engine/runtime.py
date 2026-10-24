@@ -8,6 +8,7 @@ import time
 from .abi import Abi
 from .batch_settlement import BatchSettlement, Erc20
 from .core import Address
+from .discovery import FAILED_CALL
 from .env import setting
 from .files import ensure_dir, locked
 from .gate import Admission, Credits, Exact, Meter
@@ -61,11 +62,39 @@ def refused_how(contact=None):
 
 
 GRANTED_BY = "X-Pass-Granted-By"
-NO_UNITS = "the tool reported no units. Nothing was charged."
+NO_UNITS = "the tool reported no units. " + FAILED_CALL
 
 
 def refusal(status, body, headers=None):
     return {"delivered": False, "status": status, "headers": headers or {}, "body": body}
+
+
+def _owed_time(directory):
+    box = {}
+
+    def store():
+        if "store" not in box:
+            box["store"] = FileStore(directory)
+        return box["store"]
+
+    def read(channel_id):
+        rec = store().get(channel_id)
+        return rec.get("timeOwed") if isinstance(rec, dict) else None
+
+    def paid(channel_id, keys):
+        def drop(r):
+            if not isinstance(r, dict) or not isinstance(r.get("timeOwed"), dict):
+                return r
+            left = {k: v for k, v in r["timeOwed"].items() if k not in keys}
+            if left:
+                r["timeOwed"] = left
+            else:
+                del r["timeOwed"]
+            return r
+
+        store().update(channel_id, drop)
+
+    return {"read": read, "paid": paid}
 
 
 def _url(value, default):
@@ -76,7 +105,7 @@ def _url(value, default):
 class Engine:
 
     def __init__(self, name, payout, mode="paywall", price=None, site=None, admit=None, relay=None, credits=None, rpc=None,
-                 state_dir=None, fee_recipient=None, credit_issuer=None, on_empty="refuse", refund_url=None,
+                 state_dir=None, on_empty="refuse", refund_url=None,
                  relay_transport=None, credits_http=None, settings=None, tick_seconds=60, contact=None, payout_is_fee_recipient=False,
                  prices=None, free=None, free_limit=None, time=None):
         if not isinstance(name, str) or not _NAME.match(name):
@@ -109,16 +138,18 @@ class Engine:
         self.relay_url = _url(relay, DEFAULT_RELAY)
         self.credits_url = _url(credits, DEFAULT_CREDITS)
         self.rpc = rpc if rpc is not None and not isinstance(rpc, str) else _url(rpc, DEFAULT_RPC)
-        self.fee_recipient = fee_recipient or setting("BRIDGE_FEE_RECIPIENT") or DEFAULT_FEE_RECIPIENT
+        self.fee_recipient = DEFAULT_FEE_RECIPIENT
         self.payout_is_fee_recipient = payout_is_fee_recipient is True
         if _ADDRESS.match(str(self.fee_recipient)) and (self.payout.lower() == str(self.fee_recipient).lower()) != self.payout_is_fee_recipient:
             raise ValueError("bridge: payout_is_fee_recipient needs payout to be the fee recipient" if self.payout_is_fee_recipient
                              else "bridge: payout is the fee recipient; set payout_is_fee_recipient=True to pay it 100%")
-        self.credit_issuer = credit_issuer or setting("BRIDGE_CREDIT_ISSUER") or DEFAULT_CREDIT_ISSUER
+        self.credit_issuer = DEFAULT_CREDIT_ISSUER
         self.refund_url = refund_url
         self.relay_transport = relay_transport
         self.credits_http = credits_http
         self.settings = dict(settings or {})
+        if "feeRecipient" in self.settings:
+            raise ValueError("bridge: the fee address is ZEAM's, set in the package; settings do not set feeRecipient")
         self.tick_seconds = tick_seconds
         self.state_dir = ensure_dir(str(state_dir or setting("BRIDGE_STATE_DIR") or os.path.join(os.path.expanduser("~"), ".zeam-pass", name)))
         self.keys = KeyFile(self.state_dir)
@@ -126,7 +157,7 @@ class Engine:
         if self.gated():
             self.keys.ensure("credit")
         self.meta = GateStore(os.path.join(self.state_dir, "meta"))
-        self.meter = TimeMeter(os.path.join(self.state_dir, "meter"), self.time, now=self._now_ms) if self.time else None
+        self.meter = TimeMeter(os.path.join(self.state_dir, "meter"), self.time, now=self._now_ms, owed=_owed_time(os.path.join(self.state_dir, "channels"))) if self.time else None
         self._parts = None
         self._gate = None
         self._build = threading.Lock()
@@ -261,7 +292,7 @@ class Engine:
         return refusal(402, {**q["body"], "message": why, "how": BAD_GRANT_HOW}, q["headers"])
 
     def _serve_mpp(self, server, tool, resource, credential, grant, run, both, price, refund_url=None, listing=None, extensions=None):
-        held = server.mpp_hold(credential, resource, price["micro"] if price else None)
+        held = server.mpp_hold(credential, resource, price["micro"] if price else None, refund_url)
         if not held["ok"]:
             return refusal(held["status"], held["body"], held["headers"])
         hold = held["hold"]
@@ -301,6 +332,7 @@ class Engine:
             q = server.payment_required(resource, extensions, refund_url, {"admission": ADMISSION, **self.reach, **listing} if both else {**self.reach, **listing}, price)
             return refusal(q["status"], q["body"], q["headers"])
         granted_by = None
+        nobody = False
         if both:
             payload = Json.decode_header(payment)
             if payload is not None:
@@ -308,16 +340,21 @@ class Engine:
                 bad = server.malformed(payment, refund_url) if who is None else None
                 if bad is not None:
                     return refusal(bad["status"], bad["body"], bad["headers"])
-                a = self.admits_payer(who, grant, tool)
-                if not a["ok"] and a["code"] == "bad_grant":
-                    return self._bad_grant(server, resource, a["why"], refund_url, price, listing, extensions)
-                if not a["ok"]:
-                    return refusal(403, {"error": "refused", "message": a["why"], "how": self.refused_how, **self.reach})
-                if a["root"] != who:
-                    granted_by = a["root"]
+                nobody = who is None
+                if not nobody:
+                    a = self.admits_payer(who, grant, tool)
+                    if not a["ok"] and a["code"] == "bad_grant":
+                        return self._bad_grant(server, resource, a["why"], refund_url, price, listing, extensions)
+                    if not a["ok"]:
+                        return refusal(403, {"error": "refused", "message": a["why"], "how": self.refused_how, **self.reach})
+                    if a["root"] != who:
+                        granted_by = a["root"]
         held = server.verify_and_hold(payment, resource, price["micro"] if price else None, refund_url)
         if not held["ok"]:
             return refusal(held["status"], held["body"], held["headers"])
+        if nobody:
+            server.release(held["hold"])
+            return refusal(403, {"error": "refused", "message": self.admits_payer(None, grant, tool)["why"], "how": self.refused_how, **self.reach})
         hold = held["hold"]
         try:
             (ok, value, status), units = Engine._run(run, hold["channelId"])
@@ -336,14 +373,16 @@ class Engine:
             micro = charge_for(price, units)
             cfg = self.parts()["cfg"]
             charge = "0" if micro == 0 else cfg.units_of_micro_usd(cfg.asset_of(hold["requirement"]["asset"]), micro)
+        if bought is not None:
+            hold["owedMs"] = bought["ms"]
         settled = server.settle(hold, charge)
         if not settled["ok"]:
             return refusal(settled["status"], settled["body"], settled["headers"])
         if bought is not None:
             try:
                 bought["credit"](hold)
-            except Exception as e:
-                return {"delivered": False, "failed": True, "status": 500, "headers": {}, "body": f"the payment settled but the time could not be recorded: {e}"}
+            except Exception:
+                pass
             if bought.get("stated") is not None:
                 value = bought["stated"](hold, value)
         headers = {"PAYMENT-RESPONSE": settled["headers"]["PAYMENT-RESPONSE"]}

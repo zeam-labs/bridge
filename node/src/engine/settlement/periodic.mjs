@@ -10,6 +10,7 @@ import { GasQuote, Payout, Relay } from './relay.mjs'
 import { Verify } from './verify.mjs'
 import { ESCROWS } from './x402.mjs'
 import { usd as usdOf } from '../pricing.mjs'
+import { percent, refundRule } from '../discovery.mjs'
 
 const n = Channels.n
 const message = (e) => String(e?.message ?? e)
@@ -337,13 +338,23 @@ export class Refunds {
     const window = 1000 * Math.trunc(Number(this.cfg.refundWindowSecs))
     if (now - t > window || t - now > Refunds.FUTURE_SKEW_MS) return { ok: false, why: `issued ${issued} is outside the ${Math.trunc(Number(this.cfg.refundWindowSecs))}s window` }
     if (typeof signature !== 'string' || !/^(0x)?[0-9a-fA-F]{130}$/.test(signature)) return { ok: false, why: 'signature is missing or is not 65 bytes of hex' }
-    let who
-    try {
-      who = await Secp256k1.recoverPersonal(Refunds.message(channelId, issued), signature)
-    } catch {
-      return { ok: false, why: 'signature does not recover to an address' }
+    const who = await Refunds.recovered(Refunds.message(channelId, issued), signature)
+    if (who === null) return { ok: false, why: 'signature does not recover to an address' }
+    return { ok: true, address: who }
+  }
+
+  static PROOFS = new Map()
+  static PROOFS_KEPT = 256
+
+  static recovered(message, signature) {
+    const key = `${message}\n${signature}`
+    let who = Refunds.PROOFS.get(key)
+    if (who === undefined) {
+      who = Secp256k1.recoverPersonal(message, signature).then((a) => a.toLowerCase(), () => null)
+      Refunds.PROOFS.set(key, who)
+      while (Refunds.PROOFS.size > Refunds.PROOFS_KEPT) Refunds.PROOFS.delete(Refunds.PROOFS.keys().next().value)
     }
-    return { ok: true, address: who.toLowerCase() }
+    return who
   }
 
   static owns(channel, address, escrow = ESCROWS.default) {
@@ -359,6 +370,16 @@ export class Refunds {
   async handle(channelId, issued, signature, ask = {}) {
     const cid = String(channelId ?? '').toLowerCase()
     if (!Verify.isCanonicalChannelId(cid)) return Refunds.failed(400, 'invalid_request', 'channelId is missing or is not 0x and 64 hex characters: send {channelId, issued, signature}')
+    const holder = '0x' + randomBytes(16).toString('hex')
+    const turn = this.channels.ticket(cid, holder, this.cfg.nowMs())
+    try {
+      return { ...(await this.checked(cid, issued, signature, ask, holder)), turn }
+    } finally {
+      await this.channels.serial(cid, (g) => this.left(g, holder))
+    }
+  }
+
+  async checked(cid, issued, signature, ask, holder) {
     let ch
     try {
       ch = await this.channels.get(cid)
@@ -377,111 +398,202 @@ export class Refunds {
     const escrow = ch === null ? own.escrow : this.escrows.of(ch)
     if (escrow.closes === 'whole') return Refunds.failed(409, 'session_channel', 'this channel is an MPP session: it is closed whole, by a close credential on the paid resource, or by requestClose and withdraw on its escrow. Nothing was sent.')
     if (!Refunds.owns(ch ?? { channelConfig: config }, proof.address, escrow)) return Refunds.failed(403, 'not_the_payer', `${proof.address} is not this channel's payer`)
-    const entered = await this.enter(cid, Refunds.askKey(ask ?? {}))
-    if (entered.answer !== undefined) return entered.answer
-    try {
-      if (ch === null) {
-        const adopted = await this.adopt(cid, config, escrow)
-        if (adopted.failed) return adopted.failed
-        ch = adopted.channel
-      } else {
-        const before = await this.sent(ch)
-        if (before !== null) return before
-        ch = (await this.channels.repaired(cid)) ?? ch
-      }
-      return await this.markedRefund(ch, ask ?? {})
-    } finally {
-      entered.leave()
+    if (ch === null) {
+      const adopted = await this.adopt(cid, config, escrow)
+      if (adopted.failed) return adopted.failed
+      ch = adopted.channel
     }
+    return this.worked(cid, ch, ask ?? {}, holder)
   }
 
   static WORKERS = 4
-  static WAIT_POLL_MS = 50
   static BUSY_RETRY_SECS = 1
-  static SLOTS = new WeakMap()
+  static TURN_LOOK_MS = 1000
+  static JUDGE_TRIES = 3
 
-  slot(id) {
-    let held = Refunds.SLOTS.get(this.store)
-    if (held === undefined) {
-      held = new Map()
-      Refunds.SLOTS.set(this.store, held)
-    }
-    const count = held.get(id) ?? 0
-    if (count >= Refunds.WORKERS) return null
-    held.set(id, count + 1)
-    let left = false
-    return () => {
-      if (left) return
-      left = true
-      const rest = (held.get(id) ?? 1) - 1
-      if (rest > 0) held.set(id, rest)
-      else held.delete(id)
-    }
-  }
-
-  async enter(id, key) {
+  async worked(id, ch, ask, holder) {
+    const key = Refunds.askKey(ask)
     const deadline = this.cfg.nowMs() + this.channels.judgeWaitMs()
-    for (;;) {
-      const leave = this.slot(id)
-      if (leave !== null) return { leave }
-      const known = await this.crowded(id, key)
-      if (known !== null) return { answer: known }
-      if (this.cfg.nowMs() >= deadline) return { answer: Refunds.busy() }
-      await this.cfg.sleepMs(Refunds.WAIT_POLL_MS)
+    try {
+      for (;;) {
+        let step = await this.channels.serial(id, (g) => this.arrive(g, id, ch, key, holder, deadline))
+        if (step.wait !== undefined) {
+          await this.channels.waited(step.wait, deadline)
+          continue
+        }
+        if (step.read !== undefined) {
+          const live = await step.read.live
+          step.read.readers -= 1
+          step = await this.channels.serial(id, (g) => this.arrived(g, id, ch, holder, live))
+        }
+        if (step.answer?.body?.code === 'nothing_to_return' && !empty((await this.channels.get(id))?.handedOver)) await this.channels.repaired(id)
+        if (step.answer !== undefined) return await this.told(ch, step)
+        break
+      }
+      return await this.turns(id, ch, ask, key, holder, deadline)
+    } finally {
+      await this.channels.serial(id, (g) => this.left(g, holder))
     }
   }
 
-  async crowded(id, key) {
-    const r = await this.channels.get(id)
+  static seat(g, holder, map, until) {
+    g.checking.delete(holder)
+    map.set(holder, until)
+  }
+
+  static READ_SHARED_MS = 100
+
+  async arrive(g, id, ch, key, holder, deadline) {
     const now = this.cfg.nowMs()
-    if (Channels.refundingWaitMs(r, now) > 0 && !Channels.judging(r, now)) return Refunds.settling(Channels.refundingRetrySecs(this.cfg, r, now))
-    const kept = Refunds.kept(r, key, now, await this.lineOf(id))
-    if (kept !== null) return kept
-    if (Channels.pendingLive(r, now)) return Refunds.callOpen(r, now)
-    if (this.cfg.meter && (await this.cfg.meter.busy(id))) return Refunds.lineBusy()
-    return null
+    const r = await this.channels.get(id)
+    if (Channels.refundingWaitMs(r, now) > 0) return { answer: Refunds.settling(Channels.refundingRetrySecs(this.cfg, r, now)), settling: Channels.live(g.held, now) + Channels.live(g.arriving, now) < Refunds.WORKERS }
+    if (Channels.pendingLive(r, now)) return { answer: Refunds.callOpen(r, now) }
+    if (this.cfg.meter && (await this.cfg.meter.busy(id))) return { answer: Refunds.lineBusy() }
+    if (Channels.holding(g, now)) {
+      Refunds.seat(g, holder, g.held, now + Channels.JUDGING_TTL_MS)
+      return { joined: true }
+    }
+    if (!Channels.arriving(g, now) && !Channels.ahead(g, holder, now)) {
+      const kept = Refunds.kept(r, key, now, await this.lineOf(id))
+      if (kept !== null) return { answer: kept }
+    }
+    const seen = g.lastRead
+    if (seen !== null && now >= seen.at && now - seen.at < Refunds.READ_SHARED_MS) return this.arrived(g, id, ch, holder, seen.live)
+    if (Channels.earlier(g, holder, g.arriving, now) >= Refunds.WORKERS) return now >= deadline ? { answer: Refunds.busy() } : { wait: this.channels.waiter(g) }
+    Refunds.seat(g, holder, g.arriving, now + Channels.JUDGING_TTL_MS)
+    if (g.reading === null) {
+      const read = { readers: 0, live: this.chain.live(id, this.escrows.of(r ?? ch)).catch(() => null) }
+      g.reading = read
+      read.live.then(() => { if (g.reading === read) g.reading = null })
+    }
+    g.reading.readers += 1
+    return { read: g.reading }
+  }
+
+  async arrived(g, id, ch, holder, live) {
+    const now = this.cfg.nowMs()
+    g.arriving.delete(holder)
+    try {
+      const r = await this.channels.get(id)
+      if (Channels.refundingWaitMs(r, now) > 0) return { answer: Refunds.settling(Channels.refundingRetrySecs(this.cfg, r, now)), settling: Channels.live(g.held, now) < Refunds.WORKERS }
+      if (!Channels.holding(g, now)) {
+        if (live === null) return { answer: Refunds.failed(409, 'chain_unreadable', 'could not read the channel on chain', { retry_after_seconds: Refunds.RETRY_SECS }) }
+        g.lastRead = { at: now, live }
+        const raw = r ?? ch
+        if (n(Channels.refundable(await Channels.earned(this.cfg, raw, this.escrows.of(raw)), live)) <= 0n) return { answer: Refunds.nothing() }
+        if (Channels.pendingLive(r, now)) return { answer: Refunds.callOpen(r, now) }
+        if (this.cfg.meter && !(await this.cfg.meter.stop(id))) return { answer: Refunds.lineBusy() }
+      }
+      Refunds.seat(g, holder, g.held, now + Channels.JUDGING_TTL_MS)
+      return { joined: true }
+    } finally {
+      this.channels.wake(g)
+    }
+  }
+
+  async turns(id, ch, ask, key, holder, deadline) {
+    for (let tries = 1; ; tries++) {
+      const step = await this.channels.serial(id, (g) => this.turn(g, id, key, holder, deadline))
+      if (step.answer !== undefined) return await this.told(ch, step)
+      if (step.wait !== undefined) {
+        tries -= 1
+        await this.channels.waited(step.wait, step.until)
+        continue
+      }
+      const judged = await this.judge(ch, ask)
+      const decided = await this.channels.serial(id, (g) => this.decide(g, id, key, holder, judged, tries))
+      if (decided.again) continue
+      if (decided.answer !== undefined) return decided.answer
+      try {
+        return await this.send(decided.plan)
+      } finally {
+        await this.channels.serial(id, (g) => this.unsend(g, id, holder))
+      }
+    }
+  }
+
+  async turn(g, id, key, holder, deadline) {
+    const now = this.cfg.nowMs()
+    const r = await this.channels.get(id)
+    if (Channels.refundingWaitMs(r, now) > 0) return { answer: Refunds.settling(Channels.refundingRetrySecs(this.cfg, r, now)), settling: [...g.held.keys()].indexOf(holder) < Refunds.WORKERS }
+    const judge = Channels.judgeOf(g, now)
+    if (judge?.holder === holder) {
+      judge.until = now + Channels.JUDGING_TTL_MS
+      return { judge: true }
+    }
+    Refunds.seat(g, holder, g.held, now + Channels.JUDGING_TTL_MS)
+    const place = Channels.place(g, holder, now)
+    const slot = place
+    if (judge === null && place === 0 && !Channels.before(g, holder, now).ahead) {
+      if (Channels.pendingLive(r, now)) return { answer: Refunds.callOpen(r, now) }
+      const kept = Refunds.kept(r, key, now, await this.lineOf(id))
+      if (kept !== null) return { answer: kept }
+      g.judge = { holder, until: now + Channels.JUDGING_TTL_MS }
+      return { judge: true }
+    }
+    if (slot >= Refunds.WORKERS && now >= deadline) return { answer: Channels.pendingLive(r, now) ? Refunds.callOpen(r, now) : Refunds.busy() }
+    return { wait: this.channels.waiter(g), until: Math.min(slot >= Refunds.WORKERS ? deadline : Infinity, now + Refunds.TURN_LOOK_MS) }
+  }
+
+  async decide(g, id, key, holder, judged, tries) {
+    const now = this.cfg.nowMs()
+    const r = await this.channels.get(id)
+    const moved = r !== null && Refunds.stateOf(r) !== judged.state
+    if (judged.answer !== undefined) {
+      if (moved && judged.final !== true && tries < Refunds.JUDGE_TRIES && !Channels.pendingLive(r, now)) return { again: true }
+      const answer = Channels.pendingLive(r, now) ? Refunds.callOpen(r, now) : judged.answer
+      this.done(g, holder)
+      return { answer: await this.keep(id, key, judged.state, judged.line, answer) }
+    }
+    if (!(await this.unchanged(id, judged))) {
+      if (tries < Refunds.JUDGE_TRIES && !Channels.pendingLive(r, now)) return { again: true }
+      this.done(g, holder)
+      return { answer: Channels.pendingLive(r, now) ? Refunds.callOpen(r, now) : Refunds.unheld() }
+    }
+    try {
+      await this.channels.update(id, (c) => {
+        if (c === null) return c
+        c.refundingUntil = now + Channels.REFUNDING_TTL_MS
+        c.refundingBy = holder
+        return c
+      })
+    } catch {
+      this.done(g, holder)
+      return { answer: Refunds.unheld() }
+    }
+    this.done(g, holder)
+    return { plan: judged }
+  }
+
+  done(g, holder) {
+    if (g.judge?.holder === holder) g.judge = null
+    g.held.delete(holder)
+    this.channels.wake(g)
+  }
+
+  left(g, holder) {
+    g.checking.delete(holder)
+    g.order.delete(holder)
+    g.arriving.delete(holder)
+    this.done(g, holder)
+  }
+
+  async unsend(g, id, holder) {
+    await this.channels.update(id, (r) => {
+      if (r === null || r.refundingBy !== holder) return r
+      delete r.refundingUntil
+      delete r.refundingBy
+      return r
+    }).catch(() => {})
+    this.channels.wake(g)
+  }
+
+  async told(ch, step) {
+    return step.settling === true ? ((await this.emptied(ch)) ?? step.answer) : step.answer
   }
 
   static busy() {
     return Refunds.failed(503, 'refund_unavailable', `refund requests on this channel are already being worked out. Nothing was sent for this one. Retry in ${Refunds.BUSY_RETRY_SECS}s.`, { retry_after_seconds: Refunds.BUSY_RETRY_SECS })
-  }
-
-  async markedRefund(ch, ask) {
-    const id = String(ch.channelId).toLowerCase()
-    const key = Refunds.askKey(ask)
-    const before = await this.sent(ch)
-    if (before !== null) return before
-    const kept = Refunds.kept(await this.channels.get(id), key, this.cfg.nowMs(), await this.lineOf(id))
-    if (kept !== null) return kept
-    const holder = '0x' + randomBytes(16).toString('hex')
-    try {
-      return await this.verdict(ch, ask, id, key, holder)
-    } finally {
-      await this.channels.unweigh(id, holder)
-    }
-  }
-
-  async verdict(ch, ask, id, key, holder) {
-    const judged = await this.judge(ch, ask, holder)
-    if (judged.answer !== undefined) return (await this.sent(ch)) ?? this.keep(id, key, judged.state, judged.line, judged.answer)
-    const marked = await this.channels.mark(id, holder, true, true)
-    if (marked.unavailable) return Refunds.unheld()
-    if (marked.settling !== undefined) return (await this.emptied(ch)) ?? Refunds.settling(marked.settling)
-    if (marked.open !== undefined) return this.keep(id, key, Refunds.stateOf(marked.open), await this.lineOf(id), Refunds.callOpen(marked.open, marked.at))
-    let out
-    try {
-      out = await this.underMark(ch, ask, judged, holder)
-    } finally {
-      await this.release(id, holder)
-    }
-    return this.keep(id, key, out.state, out.line, out.answer)
-  }
-
-  async sent(ch) {
-    const r = await this.channels.get(ch.channelId)
-    const now = this.cfg.nowMs()
-    if (Channels.refundingWaitMs(r, now) === 0 || Channels.judging(r, now)) return null
-    return (await this.emptied(ch)) ?? Refunds.settling(Channels.refundingRetrySecs(this.cfg, r, now))
   }
 
   static kept(r, key, now, line) {
@@ -500,14 +612,6 @@ export class Refunds {
       return r
     }).catch(() => null)
     return answer
-  }
-
-  async underMark(ch, ask, judged, holder) {
-    const id = String(ch.channelId).toLowerCase()
-    const meter = this.cfg.meter
-    if (meter && !(await meter.stop(id))) return { state: judged.state, line: await this.lineOf(id), answer: Refunds.lineBusy() }
-    const plan = (await this.unchanged(id, judged)) ? judged : await this.judge(ch, ask, holder)
-    return { state: plan.state, line: plan.line, answer: plan.answer ?? await this.send(plan, holder) }
   }
 
   async lineOf(id) {
@@ -551,10 +655,6 @@ export class Refunds {
 
   static settling(secs) {
     return Refunds.failed(409, 'refund_settling', `a refund is already settling on this channel. Nothing more was sent. Retry in ${secs}s.`, { retry_after_seconds: secs })
-  }
-
-  release(id, holder) {
-    return this.channels.unmark(id, holder)
   }
 
   ownConfig(cid, config) {
@@ -631,9 +731,9 @@ export class Refunds {
     return this.cfg.microUSDOf(this.escrows.of(ch).token(ch.channelConfig), units)
   }
 
-  async judge(incoming, ask, holder) {
+  async judge(incoming, ask) {
     const id = String(incoming.channelId).toLowerCase()
-    const raw = (await this.channels.get(id)) ?? incoming
+    const raw = (await this.channels.repaired(id)) ?? incoming
     const state = Refunds.stateOf(raw)
     let line = await this.lineOf(id)
     const refused = (answer) => ({ state, line, answer })
@@ -649,7 +749,6 @@ export class Refunds {
     if (n(left) <= 0n) return refused(Refunds.nothing())
     const now = this.cfg.nowMs()
     if (Channels.pendingLive(ch, now)) return refused(Refunds.callOpen(ch, now))
-    if (!(await this.channels.weigh(id, holder))) return refused(Refunds.unheld())
     const f = await this.frozen(raw, live, ch, left)
     line = f.line ?? line
     if (f.failed) return refused(f.failed)
@@ -675,9 +774,9 @@ export class Refunds {
     const amounts = { leftMicroUSD, returnedMicroUSD: leftMicroUSD, gasMicroUSD: gas.gasMicroUSD, feeMicroUSD: gas.feeMicroUSD, coverMicroUSD: gas.coverMicroUSD }
     if (gas.covered) return { ...plan, call, gas, amounts, payment: null }
     const asset = this.cfg.assetOf(escrow.token(ch.channelConfig))
-    const rule = `channel fees $${Refunds.usd(gas.feeMicroUSD)} < the gas of ${Refunds.gasOf(gas)} and any calls not yet settled, plus ${Math.round((this.cfg.gasBuffer - 1) * 100)}%, $${Refunds.usd(gas.coverMicroUSD)}`
-    if (asset === null || !asset.eip3009) return refused(Refunds.failed(409, 'nothing_to_return', `${rule}; this token has no gasless payment for the $${Refunds.usd(gas.gasMicroUSD)} refund gas. Send ${Refunds.SELF_SEND} for a signed refund of the full balance, sent at your own gas.`, { ...amounts, returnedMicroUSD: 0, ...gas.detail }))
-    if (gas.gasMicroUSD >= leftMicroUSD) return refused(Refunds.failed(409, 'nothing_to_return', `${rule}; refund gas $${Refunds.usd(gas.gasMicroUSD)} >= balance $${Refunds.usd(leftMicroUSD)}. Send ${Refunds.SELF_SEND} for a signed refund of the full balance, sent at your own gas.`, { ...amounts, returnedMicroUSD: 0, ...gas.detail }))
+    const rule = Refunds.rule(this.cfg, gas)
+    if (asset === null || !asset.eip3009) return refused(Refunds.failed(409, 'nothing_to_return', `${rule}; this token has no gasless payment for the $${Refunds.usd(gas.gasMicroUSD)} refund gas. Send ${Refunds.SELF_SEND} for a signed refund of the full balance, sent from any wallet at your own gas.`, { ...amounts, returnedMicroUSD: 0, ...gas.detail }))
+    if (gas.gasMicroUSD >= leftMicroUSD) return refused(Refunds.failed(409, 'nothing_to_return', `${rule}; refund gas $${Refunds.usd(gas.gasMicroUSD)} >= balance $${Refunds.usd(leftMicroUSD)}. Send ${Refunds.SELF_SEND} for a signed refund of the full balance, sent from any wallet at your own gas.`, { ...amounts, returnedMicroUSD: 0, ...gas.detail }))
     const payTo = await this.gas.gasWallet()
     if (payTo === null) return refused(Refunds.failed(503, 'gas_unpriced', `the relay is unreachable. Retry in 60s, or send ${Refunds.SELF_SEND} for a signed refund to send yourself.`, { retry_after_seconds: Refunds.RETRY_SECS, leftMicroUSD }))
     const units = this.cfg.unitsOfMicroUSD(asset, gas.gasMicroUSD)
@@ -688,18 +787,13 @@ export class Refunds {
     return { ...plan, call, gas, amounts, payment: { asset, payTo, authorization: offered.authorization, signature: offered.signature } }
   }
 
-  async send(plan, holder) {
+  async send(plan) {
     const { ch, live, left, call, gas, amounts, payment } = plan
-    if (plan.self) {
-      const other = await this.channels.sending(String(ch.channelId).toLowerCase(), holder)
-      if (other?.unavailable) return Refunds.unheld()
-      if (other !== null) return Refunds.settling(other.settling)
-      return this.selfSend(ch, live, left, plan.nonce)
-    }
-    if (payment === null) return this.sendRefund(ch, call, left, 0, amounts, holder, gas.freeGasUnits)
+    if (plan.self) return this.selfSend(ch, live, left, plan.nonce)
+    if (payment === null) return this.sendRefundNow(ch, call, left, 0, amounts, gas.freeGasUnits)
     const pay = { to: payment.asset.address, data: Token.encodeTransfer(payment.authorization, payment.signature) }
     const bundle = Multicall3.aggregate3([call, pay])
-    const out = await this.sendRefund(ch, bundle, left, this.microUSD(ch, payment.authorization.value), amounts, holder)
+    const out = await this.sendRefundNow(ch, bundle, left, this.microUSD(ch, payment.authorization.value), amounts)
     return out.underpaid === undefined ? out : this.requote(ch, live, payment, amounts, gas, out.underpaid, call)
   }
 
@@ -722,7 +816,7 @@ export class Refunds {
     const moved = fresh.covered || paying >= fresh.gasMicroUSD
       ? `refund gas rose past the quote margin: sending costs $${Refunds.usd(sendCostMicroUSD)}, your payment is $${Refunds.usd(paying)}. Nothing was sent`
       : `your payment, $${Refunds.usd(paying)}, is under the quote, $${Refunds.usd(fresh.gasMicroUSD)}, and under what sending costs, $${Refunds.usd(sendCostMicroUSD)}. Nothing was sent`
-    if (quoted >= amounts.leftMicroUSD) return Refunds.failed(409, 'nothing_to_return', `${moved}; refund gas $${Refunds.usd(quoted)} (margin included) >= balance $${Refunds.usd(amounts.leftMicroUSD)}. Send ${Refunds.SELF_SEND} for a signed refund of the full balance, sent at your own gas.`, { ...numbers, returnedMicroUSD: 0, ...fresh.detail })
+    if (quoted >= amounts.leftMicroUSD) return Refunds.failed(409, 'nothing_to_return', `${moved}; refund gas $${Refunds.usd(quoted)} (margin included) >= balance $${Refunds.usd(amounts.leftMicroUSD)}. Send ${Refunds.SELF_SEND} for a signed refund of the full balance, sent from any wallet at your own gas.`, { ...numbers, returnedMicroUSD: 0, ...fresh.detail })
     const units = this.cfg.unitsOfMicroUSD(payment.asset, quoted)
     return this.gasQuote(ch, payment.asset, payment.payTo, units, numbers, fresh, `${moved}. New quote: that cost + ${fresh.detail.marginPercent}% margin`, { requoted: true, sendCostMicroUSD })
   }
@@ -752,12 +846,13 @@ export class Refunds {
     const q = await this.gas.refund(bundled > 0n, true, alreadyPaid)
     if (q === null) return null
     const counted = { alreadyPaid, freeGasUnits: this.cfg.gas.refund + (bundled > 0n ? this.cfg.gas.refundClaim : 0) }
-    const { cover } = q
     const earned = this.microUSD(ch, (n(live.claimed) + bundled).toString())
     const feeMicroUSD = GasQuote.feeMicroUSD(earned, this.cfg.feeShare)
     const detailOf = (p) => ({ gasUnits: p.gasUnits, gasUnitsWithMargin: p.gasUnitsWithMargin, gasPriceWei: p.gasPriceWei, ethUSD: p.ethUSD, l1FeeWei: p.l1FeeWei, marginPercent: p.marginPercent, quotedBy: p.quotedBy })
-    if (feeMicroUSD >= cover.microUSD) return { covered: true, gasMicroUSD: 0, costMicroUSD: 0, feeMicroUSD, coverMicroUSD: cover.microUSD, detail: detailOf(q.pay), ...counted }
+    if (feeMicroUSD >= q.cover.microUSD) return { covered: true, gasMicroUSD: 0, costMicroUSD: 0, feeMicroUSD, coverMicroUSD: q.cover.microUSD, detail: detailOf(q.pay), ...counted }
     const pay = (await this.gas.relayQuote(call)) ?? q.pay
+    const cover = pay === q.pay ? q.cover : this.gas.priced(q.cover.gasUnits, pay.gasPriceWei, pay.ethUSD)
+    if (feeMicroUSD >= cover.microUSD) return { covered: true, gasMicroUSD: 0, costMicroUSD: 0, feeMicroUSD, coverMicroUSD: cover.microUSD, detail: detailOf(pay), ...counted }
     return { covered: false, gasMicroUSD: pay.microUSD, costMicroUSD: pay.costMicroUSD, feeMicroUSD, coverMicroUSD: cover.microUSD, detail: detailOf(pay), ...counted }
   }
 
@@ -772,6 +867,10 @@ export class Refunds {
 
   static gasOf(gasInfo) {
     return gasInfo.alreadyPaid > 0 ? 'its deposit, its refund, the further deposits and earlier refunds ZEAM paid for' : 'its deposit, its refund'
+  }
+
+  static rule(cfg, gasInfo, pay) {
+    return `${refundRule(Math.round((cfg.gasBuffer - 1) * 100), pay)} Our fee is ${percent(cfg.feeShare)}% of what the buyer spent: $${Refunds.usd(gasInfo.feeMicroUSD)} on this channel, under the $${Refunds.usd(gasInfo.coverMicroUSD)} of gas it must cover (${Refunds.gasOf(gasInfo)} and the calls not yet settled, the margin included)`
   }
 
   async gasPaymentProblem(ch, asset, payTo, units, left, p) {
@@ -815,7 +914,7 @@ export class Refunds {
     return Refunds.answer(409, {
       op: 'refund_quote',
       code: 'gas_payment_needed',
-      why: `${lead}channel fees $${Refunds.usd(gasInfo.feeMicroUSD)} < the gas of ${Refunds.gasOf(gasInfo)} and any calls not yet settled, plus ${Math.round((this.cfg.gasBuffer - 1) * 100)}%, $${Refunds.usd(gasInfo.coverMicroUSD)}. Refund gas: $${Refunds.usd(gas)} USDC, no ETH (${d.gasUnits} gas, L1 fee ${d.l1FeeWei} wei, ${d.gasPriceWei} wei per gas, $${d.ethUSD} per ETH, ${d.marginPercent}% margin; ${d.quotedBy === 'relay' ? 'priced by the relay' : 'priced from measured refunds'}). Sign authorization (EIP-3009 TransferWithAuthorization; typed data in sign) and POST again with gasPayment: {authorization, signature} within ${Math.trunc(Number(this.cfg.gasPaymentSecs))}s. The refund of $${Refunds.usd(amounts.leftMicroUSD)} and the gas payment go in one transaction: $${Refunds.usd(amounts.leftMicroUSD - gas)} net to you. Or send ${Refunds.SELF_SEND} for a signed refund of the full balance, sent at your own gas.`,
+      why: `${lead}${Refunds.rule(this.cfg, gasInfo, d.marginPercent)}. Refund gas: $${Refunds.usd(gas)} USDC, no ETH (${d.gasUnits} gas, L1 fee ${d.l1FeeWei} wei, ${d.gasPriceWei} wei per gas, $${d.ethUSD} per ETH, ${d.marginPercent}% margin; ${d.quotedBy === 'relay' ? 'priced by the relay' : 'priced from measured refunds'}). Sign authorization (EIP-3009 TransferWithAuthorization; typed data in sign) and POST again with gasPayment: {authorization, signature} within ${Math.trunc(Number(this.cfg.gasPaymentSecs))}s. The refund of $${Refunds.usd(amounts.leftMicroUSD)} and the gas payment go in one transaction: $${Refunds.usd(amounts.leftMicroUSD - gas)} net to you. Or send ${Refunds.SELF_SEND} for a signed refund of the full balance, sent from any wallet at your own gas.`,
       ...amounts,
       gasMicroUSD: gas,
       ...d,
@@ -834,14 +933,6 @@ export class Refunds {
 
   async refundCall(ch, live, left, nonce) {
     return this.escrows.of(ch).refundCall(this.cfg.signingKey(), ch, left, nonce, this.cfg.chainId, Refunds.bundledClaim(ch, live) > 0n)
-  }
-
-  async sendRefund(ch, call, left, gasMicroUSD, amounts, holder, freeGasUnits = 0) {
-    const id = String(ch.channelId).toLowerCase()
-    const other = await this.channels.sending(id, holder)
-    if (other?.unavailable) return Refunds.unheld()
-    if (other !== null) return Refunds.settling(other.settling)
-    return this.sendRefundNow(ch, call, left, gasMicroUSD, amounts, freeGasUnits)
   }
 
   async sendRefundNow(ch, call, left, gasMicroUSD, amounts = {}, freeGasUnits = 0) {
@@ -914,6 +1005,6 @@ export class Refunds {
       return Refunds.failed(409, 'refund_error', message(e).slice(0, 160), { retry_after_seconds: Refunds.RETRY_SECS })
     }
     const timeMs = this.cfg.meter ? await this.cfg.meter.forget(id) : 0
-    return Refunds.answer(200, { op: 'refund_signed', microUSD: this.microUSD(ch, left), transaction, why: 'signed refund of the full balance; send it at your own gas', ...(timeMs > 0 ? { timeReturnedMs: timeMs } : {}) })
+    return Refunds.answer(200, { op: 'refund_signed', microUSD: this.microUSD(ch, left), transaction, why: 'signed refund of the full balance; send it from any wallet at your own gas', ...(timeMs > 0 ? { timeReturnedMs: timeMs } : {}) })
   }
 }

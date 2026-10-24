@@ -17,6 +17,7 @@ final class Server
     const MAX_PENDING_TTL_MS = 600000;
     const MPP_TTL_SECS = 300;
     const MPP_USED_TRIES = 5;
+    const MPP_SHOWN_RETRY_SECS = 2;
     const DEFAULT_PORTS = ['http' => 80, 'https' => 443, 'ws' => 80, 'wss' => 443, 'ftp' => 21];
     const SDK_FIELDS = [
         'channelId', 'channelConfig', 'chargedCumulativeAmount', 'signedMaxClaimable', 'signature', 'balance', 'totalClaimed',
@@ -153,7 +154,7 @@ final class Server
 
     public static function percent($share)
     {
-        return rtrim(rtrim(sprintf('%.2f', (float) $share * 100), '0'), '.');
+        return \ZeamPass\Discovery::percent($share);
     }
 
     private static function usd($microUSD)
@@ -193,7 +194,8 @@ final class Server
         return [
             'pricing' => Pricing::pricing($p),
             'deposit' => 'First call on a channel deposits at least $' . self::usd($floor) . '. Later calls spend it. The unspent balance is refundable.',
-            'refund' => 'Refund: ' . $where . ' with {channelId, issued, signature} signed by the payer; add channelConfig if the channel has no calls. ZEAM pays the gas when the channel\'s fees (' . self::percent($this->cfg->feeShare) . '% of its spend) cover the gas of its deposit, its refund and any calls not yet settled, and of every further deposit and every earlier refund ZEAM paid for on that channel, plus ' . (int) round(($this->cfg->gasBuffer - 1) * 100) . '%' . $about($cover) . '. Otherwise sign a gasless USDC payment of the refund gas (' . $figure . $margin . '% margin included); a refund request answers with the figure to sign. An unsettled call adds its claim gas. {"selfSend": true}: a signed refund you send at your own gas.',
+            'refund' => 'Refund: ' . $where . ' with {channelId, issued, signature} signed by the payer; add channelConfig if the channel has no calls. ' . \ZeamPass\Discovery::refundRule((int) round(($this->cfg->gasBuffer - 1) * 100), $margin) . ' Our fee is ' . self::percent($this->cfg->feeShare) . '% of what the buyer spends, against the gas it must cover with the margin' . $about($cover) . '. When it falls short, sign a gasless USDC payment of the refund gas (' . $figure . $margin . '% margin included); a refund request answers with the figure to sign. An unsettled call adds its claim gas. {"selfSend": true}: a signed refund you send from any wallet at your own gas.',
+            'split' => $this->cfg->relaySplit(),
         ];
     }
 
@@ -258,7 +260,7 @@ final class Server
 
     public function mppFloorMicroUSD()
     {
-        $gas = $this->gas->microUSD((int) ceil($this->cfg->gas['charge'] * $this->cfg->gasBuffer));
+        $gas = $this->gas->microUSD((int) ceil($this->cfg->gas['charge'] * $this->cfg->gasBuffer), GasQuote::RECENT_SECS);
         return $gas === null ? null : (int) ceil($gas / $this->cfg->feeShare);
     }
 
@@ -312,9 +314,16 @@ final class Server
         return Mpp::issue($this->cfg->mppSecret(), $this->mppRealm($resource), Mpp::METHOD, Mpp::INTENT, $request, $expires, $description, Mpp::once());
     }
 
+    public static function withoutDeposit(array $q)
+    {
+        unset($q['body']['deposit']);
+        $q['headers']['PAYMENT-REQUIRED'] = Json::base64(\ZeamPass\Bazaar::forHeader($q['body']));
+        return $q;
+    }
+
     public function mppRefuse($resource, $micro, \Throwable $error)
     {
-        $q = $this->paymentRequired($resource, null, null, [], $micro);
+        $q = self::withoutDeposit($this->paymentRequired($resource, null, null, [], $micro));
         return self::refuse(402, array_merge(Mpp::problemOf($error), ['accepts' => $q['body']['accepts']]), $q['headers']);
     }
 
@@ -344,6 +353,10 @@ final class Server
                     throw new MppException('verification-failed', 'the authorization signature is not valid for its payer');
                 }
             }
+            $was = $this->cfg->holds->entry($verified['replayKey']);
+            if (is_array($was) && !empty($was['sent'])) {
+                return $this->mppSent($verified, $was, $resource, $micro, $asset['address']);
+            }
             if ($this->mppUsed($asset['address'], $verified)) {
                 throw new MppException('verification-failed', 'this authorization has already been used');
             }
@@ -361,7 +374,85 @@ final class Server
 
     public function mppRelease(array $hold)
     {
+        if (!empty($hold['landed'])) {
+            $this->cfg->holds->mark($hold['verified']['replayKey'], 'taken', ['state' => 'sent']);
+            return;
+        }
         $this->cfg->holds->release($hold['verified']['replayKey']);
+    }
+
+    private static function usedIn($receipt, $token, array $v)
+    {
+        if (!is_array($receipt) || strtolower(isset($receipt['status']) ? (string) $receipt['status'] : '') !== '0x1') {
+            return false;
+        }
+        $event = Keccak::utf8('AuthorizationUsed(address,bytes32)');
+        $payer = '0x' . str_repeat('0', 24) . strtolower(substr($v['payer'], 2));
+        foreach (isset($receipt['logs']) && is_array($receipt['logs']) ? $receipt['logs'] : [] as $log) {
+            $t = isset($log['topics']) && is_array($log['topics']) ? array_values($log['topics']) : [];
+            if (count($t) >= 3 && Address::equals(isset($log['address']) ? $log['address'] : null, $token) && strtolower((string) $t[0]) === $event && strtolower((string) $t[1]) === $payer && strtolower((string) $t[2]) === $v['authorization']['nonce']) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private function mppNotShown($resource, $micro, $hash)
+    {
+        $s = self::MPP_SHOWN_RETRY_SECS;
+        $out = $this->mppRefuse($resource, $micro, new MppException('verification-failed', "the payment was sent in transaction $hash and the chain this seller reads does not show it yet, so this call was not delivered. Nothing more is sent for it. Send this credential again in {$s}s: once the transfer shows, the call is delivered, once; if the transfer did not happen, nothing was charged.", ['code' => 'sent_not_shown', 'txHash' => $hash, 'retry_after_seconds' => $s]));
+        $out['headers']['Retry-After'] = (string) $s;
+        return $out;
+    }
+
+    private function mppSent(array $verified, array $was, $resource, $micro, $asset)
+    {
+        $key = $verified['replayKey'];
+        $now = $this->cfg->nowMs();
+        $state = isset($was['state']) ? $was['state'] : null;
+        $gone = $state === 'sending' && $now - (int) (isset($was['at']) ? $was['at'] : 0) > 2000 * $this->cfg->receiptTimeoutSecs + 60000;
+        if ($state === 'delivered') {
+            return $this->mppRefuse($resource, $micro, new MppException('verification-failed', 'this authorization has already been used'));
+        }
+        if ($state !== 'sent' && !$gone) {
+            return $this->mppRefuse($resource, $micro, new MppException('verification-failed', 'this authorization is already in use'));
+        }
+        try {
+            $receipt = $this->chain->receipt($was['sent']);
+        } catch (\Throwable $e) {
+            $receipt = null;
+        }
+        if ($receipt === null) {
+            return $this->mppNotShown($resource, $micro, $was['sent']);
+        }
+        if (self::usedIn($receipt, $asset, $verified)) {
+            if (!$this->cfg->holds->mark($key, $state, ['state' => 'taken', 'at' => $now])) {
+                return $this->mppRefuse($resource, $micro, new MppException('verification-failed', 'this authorization is already in use'));
+            }
+            return ['ok' => true, 'hold' => ['kind' => 'mpp', 'verified' => $verified, 'micro' => $micro, 'resource' => self::resourceInfo($resource), 'asset' => $asset, 'landed' => $was['sent']]];
+        }
+        try {
+            $used = $this->mppUsed($asset, $verified);
+        } catch (\Throwable $e) {
+            return $this->mppNotShown($resource, $micro, $was['sent']);
+        }
+        if ($used) {
+            return $this->mppRefuse($resource, $micro, new MppException('verification-failed', 'this authorization has already been used'));
+        }
+        if (!$this->cfg->holds->mark($key, $state, ['state' => 'settled', 'at' => $now])) {
+            return $this->mppRefuse($resource, $micro, new MppException('verification-failed', 'this authorization is already in use'));
+        }
+        $this->cfg->holds->release($key);
+        $how = strtolower(isset($receipt['status']) ? (string) $receipt['status'] : '') === '0x1' ? 'did not use this authorization' : 'reverted';
+        return $this->mppRefuse($resource, $micro, new MppException('verification-failed', "the payment did not settle. Not delivered; nothing was charged. Transaction {$was['sent']} $how."));
+    }
+
+    private function mppDelivered(array $v, $hash)
+    {
+        $now = $this->cfg->nowMs();
+        $timestamp = gmdate('Y-m-d\TH:i:s', intdiv($now, 1000)) . sprintf('.%03dZ', $now % 1000);
+        $response = ['success' => true, 'transaction' => Hex::lower($hash), 'network' => $this->cfg->network, 'payer' => $v['payer'], 'amount' => $v['authorization']['value'], 'extra' => ['protocol' => 'mpp', 'method' => Mpp::METHOD, 'intent' => Mpp::INTENT, 'challengeId' => $v['challenge']['id']]];
+        return ['ok' => true, 'status' => 200, 'response' => $response, 'headers' => ['Payment-Receipt' => Mpp::receiptHeader(Mpp::receipt($v, $hash, $timestamp))]];
     }
 
     private function mppFail(array $hold, $detail)
@@ -393,8 +484,18 @@ final class Server
     public function mppSettle(array $hold)
     {
         $v = $hold['verified'];
+        if (!empty($hold['landed'])) {
+            if (!$this->cfg->holds->mark($v['replayKey'], 'taken', ['state' => 'delivered', 'at' => $this->cfg->nowMs()])) {
+                return $this->mppRefuse($hold['resource'], $hold['micro'], new MppException('verification-failed', 'this authorization is already in use'));
+            }
+            return $this->mppDelivered($v, $hold['landed']);
+        }
         $hash = null;
         $asked = false;
+        $notShown = function () use ($hold, $v, &$hash) {
+            $this->cfg->holds->mark($v['replayKey'], 'sending', ['state' => 'sent']);
+            return $this->mppNotShown($hold['resource'], $hold['micro'], $hash);
+        };
         try {
             $call = Mpp::call($v);
             try {
@@ -408,31 +509,22 @@ final class Server
             if ($hash === null) {
                 return $this->mppLost($hold, isset($sent[0]['error']) ? $sent[0]['error'] : 'the relay sent nothing', true);
             }
+            $hash = Hex::lower($hash);
+            $this->cfg->holds->mark($v['replayKey'], null, ['sent' => $hash, 'state' => 'sending', 'at' => $this->cfg->nowMs()]);
             $receipt = $this->waitForReceipt($hash);
             if ($receipt === null) {
-                return $this->mppFail($hold, "no receipt for $hash");
+                return $notShown();
             }
             if (strtolower(isset($receipt['status']) ? (string) $receipt['status'] : '') !== '0x1') {
                 return $this->mppLost($hold, "transaction $hash reverted");
             }
-            $used = false;
-            $event = Keccak::utf8('AuthorizationUsed(address,bytes32)');
-            $payer = '0x' . str_repeat('0', 24) . strtolower(substr($v['payer'], 2));
-            foreach (isset($receipt['logs']) && is_array($receipt['logs']) ? $receipt['logs'] : [] as $log) {
-                $t = isset($log['topics']) && is_array($log['topics']) ? array_values($log['topics']) : [];
-                if (count($t) >= 3 && Address::equals(isset($log['address']) ? $log['address'] : null, $call['to']) && strtolower((string) $t[0]) === $event && strtolower((string) $t[1]) === $payer && strtolower((string) $t[2]) === $v['authorization']['nonce']) {
-                    $used = true;
-                }
-            }
-            if (!$used) {
+            if (!self::usedIn($receipt, $call['to'], $v)) {
                 return $this->mppFail($hold, "transaction $hash did not use this authorization");
             }
-            $now = $this->cfg->nowMs();
-            $timestamp = gmdate('Y-m-d\TH:i:s', intdiv($now, 1000)) . sprintf('.%03dZ', $now % 1000);
-            $response = ['success' => true, 'transaction' => Hex::lower($hash), 'network' => $this->cfg->network, 'payer' => $v['payer'], 'amount' => $v['authorization']['value'], 'extra' => ['protocol' => 'mpp', 'method' => Mpp::METHOD, 'intent' => Mpp::INTENT, 'challengeId' => $v['challenge']['id']]];
-            return ['ok' => true, 'status' => 200, 'response' => $response, 'headers' => ['Payment-Receipt' => Mpp::receiptHeader(Mpp::receipt($v, $hash, $timestamp))]];
+            $this->cfg->holds->mark($v['replayKey'], 'sending', ['state' => 'delivered', 'at' => $this->cfg->nowMs()]);
+            return $this->mppDelivered($v, $hash);
         } catch (\Throwable $e) {
-            return $hash === null ? $this->mppLost($hold, \ZeamPass\message($e), $asked) : $this->mppFail($hold, \ZeamPass\message($e));
+            return $hash === null ? $this->mppLost($hold, \ZeamPass\message($e), $asked) : $notShown();
         }
     }
 
@@ -749,11 +841,32 @@ final class Server
         ];
     }
 
-    public function verifyPayment(array $payload, array $req, array &$ctx)
+    const MOVED_TRIES = 2;
+
+    public static function movedSince($seen, $current)
+    {
+        if ($seen === null || $current === null) {
+            return false;
+        }
+        $at = function ($r, $k) {
+            return isset($r[$k]) ? (string) $r[$k] : '';
+        };
+        return $at($seen, 'refundNonce') !== $at($current, 'refundNonce') || $at($seen, 'balance') !== $at($current, 'balance') || empty($seen['handedOver']) !== empty($current['handedOver']);
+    }
+
+    private function serially($channelId, callable $fn)
+    {
+        return $this->channels->serial($channelId, function () use ($channelId, $fn) {
+            return $this->store->update($channelId, $fn);
+        });
+    }
+
+    public function verifyPayment(array $payload, array $req, array &$ctx, $tries = 0)
     {
         $raw = $payload['payload'];
         $local = null;
         $normMax = null;
+        $snapshot = null;
         $now = $this->cfg->nowMs();
         if (Verify::isVoucherPayload($raw) || Verify::isDepositPayload($raw)) {
             try {
@@ -802,14 +915,20 @@ final class Server
         $pendingId = $ctx['pendingId'];
         $expiresAt = $now + min(self::MAX_PENDING_TTL_MS, max(self::MIN_PENDING_TTL_MS, max(0, (int) $req['maxTimeoutSeconds']) * 1000));
         $isLocal = $local !== null;
+        $seen = $snapshot;
         try {
-            $this->store->update($ctx['channelId'], function ($current) use ($raw, $req, $ex, $now, $pendingId, $expiresAt, $isLocal, $normMax, &$outcome, &$record) {
+            $this->serially($ctx['channelId'], function ($current) use ($raw, $req, $ex, $now, $pendingId, $expiresAt, $isLocal, $normMax, $seen, &$outcome, &$record) {
                 if (Channels::refundingWaitMs($current, $now) > 0) {
                     $outcome = 'refunding';
                     return $current;
                 }
                 if (Channels::pendingLive($current, $now)) {
                     $outcome = 'busy';
+                    return $current;
+                }
+                if (self::movedSince($seen, $current)) {
+                    $outcome = 'moved';
+                    $record = $current;
                     return $current;
                 }
                 $base = $current !== null && isset($current['chargedCumulativeAmount'])
@@ -860,7 +979,10 @@ final class Server
         if ($outcome === 'busy') {
             return Verify::invalid(Reason::CHANNEL_BUSY);
         }
-        if ($outcome === 'stale') {
+        if ($outcome === 'moved' && $tries < self::MOVED_TRIES) {
+            return $this->verifyPayment($payload, $req, $ctx, $tries + 1);
+        }
+        if ($outcome === 'stale' || $outcome === 'moved') {
             $ctx['snapshot'] = $record;
             return Verify::invalid(self::MISMATCH);
         }
@@ -914,6 +1036,17 @@ final class Server
         return $c;
     }
 
+    public static function owe(array &$record, array $hold)
+    {
+        $ms = $hold['owedMs'] ?? null;
+        if (!is_int($ms) || $ms <= 0) {
+            return;
+        }
+        $owed = isset($record['timeOwed']) && is_array($record['timeOwed']) ? $record['timeOwed'] : [];
+        $owed[(string) $hold['pendingId']] = $ms;
+        $record['timeOwed'] = $owed;
+    }
+
     public static function chargedExtra(array $hold, $charged, array $extra = [])
     {
         $reserved = (string) $hold['requirement']['amount'];
@@ -949,7 +1082,7 @@ final class Server
         $outcome = null;
         $previous = null;
         $charged = null;
-        $this->store->update($hold['channelId'], function ($current) use ($pendingId, $increment, $cap, $voucher, $now, &$outcome, &$previous, &$charged) {
+        $this->serially($hold['channelId'], function ($current) use ($hold, $pendingId, $increment, $cap, $voucher, $now, &$outcome, &$previous, &$charged) {
             if ($current === null) {
                 $outcome = 'missing';
                 return $current;
@@ -970,6 +1103,7 @@ final class Server
             $current['signedMaxClaimable'] = Big::strval($cap);
             $current['signature'] = $voucher['signature'];
             $current['lastRequestTimestamp'] = $now;
+            self::owe($current, $hold);
             unset($current['pendingRequest']);
             $outcome = 'committed';
             return $current;
@@ -1016,18 +1150,27 @@ final class Server
         $amount = Big::strval(Verify::uint($raw['deposit']['amount']));
         $data = BatchSettlement::encodeDeposit($raw['channelConfig'], $amount, $execution['collector'], $execution['collectorData']);
         $sent = $this->relay->send([['to' => BatchSettlement::ESCROW, 'data' => $data]], $this->cfg->relaySplit());
-        if (!isset($sent[0]['hash'])) {
-            if (preg_match('/below break-even: deposit at least \\$(\d+(?:\.\d+)?)/', isset($sent[0]['error']) ? (string) $sent[0]['error'] : '', $short)) {
-                return $this->depositShort($hold, $payload, (int) ceil(((float) $short[1]) * 1e6), $micro);
+        $hash = isset($sent[0]['hash']) ? $sent[0]['hash'] : null;
+        if ($hash === null && preg_match('/below break-even: deposit at least \\$(\d+(?:\.\d+)?)/', isset($sent[0]['error']) ? (string) $sent[0]['error'] : '', $short)) {
+            return $this->depositShort($hold, $payload, (int) ceil(((float) $short[1]) * 1e6), $micro);
+        }
+        try {
+            return $this->depositSent($hold, $verified, $amount, $increment, $hash, isset($sent[0]['error']) ? $sent[0]['error'] : null);
+        } catch (\Throwable $e) {
+            if ($hash === null) {
+                throw $e;
             }
-            return $this->settleFailed($hold, Reason::DEPOSIT_TRANSACTION_FAILED . ': ' . (isset($sent[0]['error']) ? $sent[0]['error'] : 'no hash'));
+            return $this->depositUnsettled($hold, $hash, \ZeamPass\message($e));
         }
-        $hash = $sent[0]['hash'];
-        $receipt = $this->waitForReceipt($hash);
-        if ($receipt === null) {
-            return $this->settleFailed($hold, Reason::DEPOSIT_TRANSACTION_FAILED . ": no receipt for $hash");
-        }
-        if (!isset($receipt['status']) || strtolower((string) $receipt['status']) !== '0x1') {
+    }
+
+    private function depositSent(array $hold, array $verified, $amount, $increment, $hash, $refused)
+    {
+        $req = $hold['requirement'];
+        $raw = $hold['payload']['payload'];
+        $channelId = $hold['channelId'];
+        $receipt = $hash === null ? null : $this->waitForReceipt($hash);
+        if ($receipt !== null && (!isset($receipt['status']) || strtolower((string) $receipt['status']) !== '0x1')) {
             return $this->settleFailed($hold, Reason::DEPOSIT_TRANSACTION_FAILED . ': transaction reverted (receipt status reverted)');
         }
         $ex = $verified['extra'];
@@ -1038,23 +1181,12 @@ final class Server
             'withdrawRequestedAt' => (int) $ex['withdrawRequestedAt'],
             'refundNonce' => (string) $ex['refundNonce'],
         ];
-        $expected = Big::init($state['balance'], 10);
-        $deadline = $this->cfg->nowMs() + $this->cfg->stateCatchUpMs;
-        $post = null;
-        while (true) {
-            try {
-                $post = $this->chain->state($channelId);
-            } catch (\Throwable $e) {
-                $post = null;
+        $post = $this->depositOnChain($channelId, Big::init($state['balance'], 10));
+        if ($receipt === null && $post === null) {
+            if ($hash === null) {
+                return $this->settleFailed($hold, Reason::DEPOSIT_TRANSACTION_FAILED . ': ' . ($refused !== null ? $refused : 'no hash'));
             }
-            if ($post !== null && Big::cmp(Big::init($post['balance'], 10), $expected) >= 0) {
-                break;
-            }
-            if ($this->cfg->nowMs() >= $deadline) {
-                $post = null;
-                break;
-            }
-            $this->cfg->sleepMs(150);
+            return $this->depositUnsettled($hold, $hash, Reason::DEPOSIT_TRANSACTION_FAILED . ": no receipt for $hash");
         }
         if ($post !== null) {
             $state = [
@@ -1069,7 +1201,7 @@ final class Server
         $now = $this->cfg->nowMs();
         $record = null;
         $heldBefore = Big::sign(Big::init((string) $ex['balance'], 10)) > 0 || Big::sign(Big::init((string) $ex['totalClaimed'], 10)) > 0;
-        $this->store->update($channelId, function ($current) use ($raw, $increment, $state, $pendingId, $now, $heldBefore, &$record) {
+        $this->serially($channelId, function ($current) use ($hold, $raw, $increment, $state, $pendingId, $now, $heldBefore, &$record) {
             if ($current === null || !isset($current['pendingRequest']['pendingId']) || $current['pendingRequest']['pendingId'] !== $pendingId) {
                 return $current;
             }
@@ -1092,18 +1224,19 @@ final class Server
                 }
             }
             $next['depositsWePaid'] = (isset($current['depositsWePaid']) ? (int) $current['depositsWePaid'] : ($heldBefore ? 1 : 0)) + 1;
+            self::owe($next, $hold);
             $record = $next;
             return $next;
         });
         if ($record === null) {
-            return $this->settleFailed($hold, Reason::CHANNEL_BUSY . ": deposit {$hash} landed after the hold expired. Not charged, not delivered.");
+            return $this->depositLate($hold, Reason::CHANNEL_BUSY . ': ' . ($hash === null ? 'the deposit' : "deposit $hash") . ' landed after the hold expired');
         }
         $channelState = $state;
         $channelState['chargedCumulativeAmount'] = $record['chargedCumulativeAmount'];
         $extra = self::chargedExtra($hold, $increment, ['channelState' => $channelState]);
         $response = [
             'success' => true,
-            'transaction' => $hash,
+            'transaction' => $hash === null ? '' : $hash,
             'network' => $req['network'],
             'payer' => $raw['channelConfig']['payer'],
             'amount' => $raw['deposit']['amount'],
@@ -1116,10 +1249,48 @@ final class Server
         return self::delivered($response);
     }
 
+    private function depositOnChain($channelId, $expected)
+    {
+        $deadline = $this->cfg->nowMs() + $this->cfg->stateCatchUpMs;
+        $reads = (int) ceil($this->cfg->stateCatchUpMs / 150) + 1;
+        for ($read = 1; ; $read++) {
+            try {
+                $post = $this->chain->state($channelId);
+            } catch (\Throwable $e) {
+                $post = null;
+            }
+            if ($post !== null && Big::cmp(Big::init($post['balance'], 10), $expected) >= 0) {
+                return $post;
+            }
+            if ($this->cfg->nowMs() >= $deadline || $read >= $reads) {
+                return null;
+            }
+            $this->cfg->sleepMs(150);
+        }
+    }
+
+    private function depositUnsettled(array $hold, $hash, $reason)
+    {
+        return $this->depositAnswer($hold, $reason, "the deposit was sent ($hash) and has not landed yet, so this call was not delivered. If it lands, your channel holds it: pay the next call with a voucher.");
+    }
+
+    private function depositLate(array $hold, $reason)
+    {
+        return $this->depositAnswer($hold, $reason, 'the deposit landed in your channel after this call was given up, so this call was not delivered and not charged. Your channel holds the deposit: pay the next call with a voucher.');
+    }
+
+    private function depositAnswer(array $hold, $reason, $said)
+    {
+        $out = $this->settleFailed($hold, $reason);
+        $out['body']['message'] = $said;
+        return $out;
+    }
+
     private function waitForReceipt($hash)
     {
         $deadline = $this->cfg->nowMs() + 1000 * $this->cfg->receiptTimeoutSecs;
-        while (true) {
+        $reads = (int) ceil(1000 * $this->cfg->receiptTimeoutSecs / max(1, $this->cfg->receiptPollMs)) + 1;
+        for ($read = 1; ; $read++) {
             try {
                 $r = $this->chain->receipt($hash);
             } catch (\Throwable $e) {
@@ -1128,7 +1299,7 @@ final class Server
             if ($r !== null) {
                 return $r;
             }
-            if ($this->cfg->nowMs() >= $deadline) {
+            if ($this->cfg->nowMs() >= $deadline || $read >= $reads) {
                 return null;
             }
             $this->cfg->sleepMs($this->cfg->receiptPollMs);

@@ -16,10 +16,12 @@ final class TimeMeter
     private $clocks;
     private $lines;
     private $now;
+    private $owed;
 
-    public function __construct(array $t, Store $clocks, Store $lines, ?callable $now = null)
+    public function __construct(array $t, Store $clocks, Store $lines, ?callable $now = null, ?array $owed = null)
     {
         $this->t = $t;
+        $this->owed = $owed;
         $this->clocks = $clocks;
         $this->lines = $lines;
         $this->now = $now ?: function () {
@@ -136,7 +138,7 @@ final class TimeMeter
         $idle = $t['idleMs'] > 0 ? ' and ' . $t['idleMs'] . ' ms after each' : '';
         $step = $t['rateMs'] > 1 ? ' in steps of ' . $t['rateMs'] . ' ms' : '';
         $most = empty($t['maxMs']) ? '' : ' (up to ' . $t['maxMs'] . ' ms a purchase)';
-        return 'Line time: ' . self::rate($t) . '. buy_time {"ms": N}' . $step . $most . '; buying again adds time; the time is credited to the paying channel once the payment settles. Open a line: POST ' . $base . '/line {"op":"open","channelId":"0x…"}, sign the message it returns with the payer key, POST {"op":"prove","channelId":"0x…","nonce":"…","signature":"0x…"}. Send the credential as x-line (MCP: _meta["zeam-pass/line"]). Time burns while a call runs on the line' . $idle . '; a call stops when the time runs out. {"op":"off"}: no new calls on the line; a running call burns to its end. Unburned time comes back with a refund.';
+        return 'Line time: ' . self::rate($t) . '. buy_time {"ms": N}' . $step . $most . '; buying again adds time; the time is credited to the paying channel once the payment settles. Open a line: POST ' . $base . '/line {"op":"open","channelId":"0x…"}, sign the message it returns with the payer key, POST {"op":"prove","channelId":"0x…","nonce":"…","signature":"0x…"}. Send the credential as x-line (MCP: _meta["zeam-pass/line"]). Time burns while a call runs on the line' . $idle . '; a call stops when the time runs out. {"op":"off"}: no new calls on any line of the channel; a running call burns to its end. Unburned time comes back with a refund.';
     }
 
     public static function hash($credential)
@@ -168,15 +170,34 @@ final class TimeMeter
         return self::callMsOf($this->t, $priceMicro);
     }
 
+    private function owing($channelId)
+    {
+        if ($this->owed === null) {
+            return null;
+        }
+        $o = call_user_func($this->owed['read'], strtolower((string) $channelId));
+        return is_array($o) && $o !== [] ? $o : null;
+    }
+
     public function change($channelId, callable $fn)
     {
         $id = strtolower((string) $channelId);
+        $owed = $this->owing($id);
         $out = null;
-        $this->clocks->update($id, function ($current) use ($id, $fn, &$out) {
+        $this->clocks->update($id, function ($current) use ($id, $fn, $owed, &$out) {
             $rec = $current === null ? Clock::fresh($id) : Clock::normalize($current);
+            if ($owed !== null) {
+                Clock::owe($rec, $owed, $this->nowMs(), $this->t['idleMs']);
+            }
             $out = $fn($rec);
             return Clock::snapshot($rec);
         });
+        if ($owed !== null) {
+            try {
+                call_user_func($this->owed['paid'], $id, array_map('strval', array_keys($owed)));
+            } catch (\Throwable $e) {
+            }
+        }
         return $out;
     }
 
@@ -188,10 +209,14 @@ final class TimeMeter
 
     public function status($channelId)
     {
+        $owed = $this->owing($channelId);
         $rec = $this->record($channelId);
         $rec = $rec === null ? Clock::fresh($channelId) : $rec;
         $now = $this->nowMs();
         $idle = $this->t['idleMs'];
+        if ($owed !== null) {
+            Clock::owe($rec, $owed, $now, $idle);
+        }
         return ['channelId' => $rec['channelId'], 'msRemaining' => Clock::remaining($rec, $now, $idle), 'msSpent' => Clock::spent($rec, $now, $idle), 'msReturned' => $rec['returnedMs'], 'metering' => $rec['on'], 'rateUSD' => Pricing::usd($this->t['rateMicro']), 'rateMs' => $this->t['rateMs']];
     }
 
@@ -284,8 +309,17 @@ final class TimeMeter
 
     public function unburnedMicro($channelId)
     {
+        $owed = $this->owing($channelId);
         $rec = $this->record($channelId);
-        return $rec === null ? 0 : Clock::unburnedMicro($rec, $this->nowMs(), $this->t['idleMs'], $this->t['rateMicro'], $this->t['rateMs']);
+        if ($rec === null && $owed === null) {
+            return 0;
+        }
+        $rec = $rec === null ? Clock::fresh(strtolower((string) $channelId)) : $rec;
+        $now = $this->nowMs();
+        if ($owed !== null) {
+            Clock::owe($rec, $owed, $now, $this->t['idleMs']);
+        }
+        return Clock::unburnedMicro($rec, $now, $this->t['idleMs'], $this->t['rateMicro'], $this->t['rateMs']);
     }
 
     private function drop($hash)
@@ -334,7 +368,7 @@ final class TimeMeter
         });
     }
 
-    public function prove(array $channel, $nonce, $signature)
+    public function prove(array $channel, $nonce, $signature, $gate = null)
     {
         if ($nonce === null || $nonce === '') {
             return ['ok' => false, 'status' => 400, 'code' => 'bad_request', 'why' => 'nonce is missing: send the nonce the open answer gave, with your signature of its message'];
@@ -365,16 +399,28 @@ final class TimeMeter
         }
         $credential = rtrim(strtr(base64_encode(random_bytes(32)), '+/', '-_'), '=');
         $h = self::hash($credential);
+        $idle = $this->t['idleMs'];
+        $attach = function ($refusal = null) use ($channelId, $h, $idle) {
+            return $this->change($channelId, function (array &$rec) use ($h, $idle, $refusal) {
+                $at = $this->nowMs();
+                if (count($rec['lines']) === 0) {
+                    if ($refusal !== null) {
+                        return ['refused' => $refusal];
+                    }
+                    Clock::switch($rec, true, $at, $idle);
+                }
+                $rec['lines'] = array_merge($rec['lines'], [$h]);
+                return ['msRemaining' => Clock::left($rec, $at, $idle), 'metering' => (bool) $rec['on']];
+            });
+        };
+        $opened = $gate === null ? $attach() : $gate($attach);
+        if (isset($opened['refused'])) {
+            return ['ok' => false, 'refused' => $opened['refused']];
+        }
         $this->lines->update($h, function () use ($channelId, $now) {
             return ['channelId' => $channelId, 'at' => $now];
         });
-        $idle = $this->t['idleMs'];
-        $msRemaining = $this->change($channelId, function (array &$rec) use ($h, $now, $idle) {
-            $rec['lines'] = array_merge($rec['lines'], [$h]);
-            Clock::switch($rec, true, $now, $idle);
-            return Clock::left($rec, $now, $idle);
-        });
-        return ['ok' => true, 'credential' => $credential, 'channelId' => $channelId, 'msRemaining' => $msRemaining];
+        return ['ok' => true, 'credential' => $credential, 'channelId' => $channelId, 'msRemaining' => $opened['msRemaining'], 'metering' => $opened['metering']];
     }
 
     public function line($credential)

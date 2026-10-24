@@ -15,7 +15,7 @@ import urllib.parse
 
 from .engine import DEFAULT_CREDITS, DEFAULT_RELAY, DEFAULT_RPC, GRANTED_BY, Engine, setting
 from .engine.bazaar import bazaar
-from .engine.discovery import CACHE_CONTROL, discovery
+from .engine.discovery import CACHE_CONTROL, FAILED_CALL, discovery
 from .engine.meter import bought_ms, time_micro, time_rate, time_text
 from .engine.pricing import FreeLimit, Hangup, caller, deadline_ms, hearing, metered, price_of, running, stopped, unhearing, units, usd
 from .engine.pricing import describe as describe_price
@@ -42,13 +42,14 @@ def _problem(payload):
     return isinstance(payload, dict) and isinstance(payload.get("type"), str) and payload["type"].startswith("https://paymentauth.org/problems/")
 
 
+REFUND_TURN = "Zeam-Refund-Turn"
 CORS = {"access-control-allow-origin": "*", "access-control-expose-headers": "PAYMENT-REQUIRED, PAYMENT-RESPONSE, WWW-Authenticate, Payment-Receipt, X-Pass-Granted-By, X-Pass-Ms-Remaining, X-Pass-Ms-Elapsed"}
 PREFLIGHT = {**CORS, "access-control-allow-methods": "GET, POST, OPTIONS",
              "access-control-allow-headers": "content-type, payment-signature, x-payment, authorization, payment-authorization, x-line, x-grant, mcp-protocol-version, mcp-session-id",
              "access-control-max-age": "600"}
 HOW = {"paywall": "Paid per call with x402 or MPP", "gate": "Admitted keys only, proven by a zero-value x402 signature; nothing is paid",
        "both": "Admitted keys only, paid per call with x402 or MPP"}
-RESULT_NOT_JSON = "the result is not valid JSON (a non-finite number or a non-JSON value); nothing was charged"
+RESULT_NOT_JSON = "the result is not valid JSON (a non-finite number or a non-JSON value). " + FAILED_CALL
 TYPES = {"string": (str,), "integer": (int,), "number": (int, float), "boolean": (bool,),
          "object": (dict,), "array": (list,), "null": (type(None),)}
 
@@ -200,7 +201,7 @@ def _first(headers, names):
 def _out_of_time(on_line, ms=None):
     if on_line:
         return {"error": "out_of_time", "message": "the line ran out of time during the call. Its time is spent. Buy time: buy_time."}
-    return {"error": "out_of_time", "message": f"the call ran past the {ms} ms its price buys. Nothing was charged. Buy time and call on a line."}
+    return {"error": "out_of_time", "message": f"the call needs more than the {ms} ms its price buys, so it was cut. Nothing was charged. Buy time and call on a line."}
 
 
 def _hung_up(on_line):
@@ -285,15 +286,15 @@ class _RpcError(Exception):
 class Bridge:
 
     def __init__(self, name, payout=None, mode="paywall", price=None, site=None, admit=None, relay=DEFAULT_RELAY,
-                 credits=DEFAULT_CREDITS, rpc=DEFAULT_RPC, state_dir=None, server_name=None, version="2.0.0", on_empty="refuse",
-                 fee_recipient=None, credit_issuer=None, refund_url=None, tick_seconds=60, relay_transport=None,
+                 credits=DEFAULT_CREDITS, rpc=DEFAULT_RPC, state_dir=None, server_name=None, version="2.1.0", on_empty="refuse",
+                 refund_url=None, tick_seconds=60, relay_transport=None,
                  credits_http=None, settings=None, contact=None, payout_is_fee_recipient=False, prices=None, free=None, free_limit=None, time=None):
         self.name = name
         self.server_name = server_name or name
         self.version = version
         self.site = site.rstrip("/") if site else None
         self.engine = Engine(name, payout, mode=mode, price=price, site=self.site, admit=admit, relay=relay, credits=credits,
-                             rpc=rpc, state_dir=state_dir, fee_recipient=fee_recipient, credit_issuer=credit_issuer,
+                             rpc=rpc, state_dir=state_dir,
                              on_empty=on_empty, refund_url=refund_url, relay_transport=relay_transport,
                              credits_http=credits_http, settings=settings, tick_seconds=tick_seconds, contact=contact,
                              payout_is_fee_recipient=payout_is_fee_recipient, prices=prices, free=free, free_limit=free_limit, time=time)
@@ -332,8 +333,10 @@ class Bridge:
         }
         self._tools["line"] = {
             "name": "line", "builtin": "line", "run": line, "price": None, "unit": None, "free": True,
-            "description": ("A line spends bought time without a payment per call. op: open {channelId} returns a message to sign "
-                            "with the payer key; prove {channelId, nonce, signature} returns the credential; on, off, status, close {credential}."),
+            "description": ('A line spends bought time without a payment per call. {"op":"open","channelId":"0x…"} returns a message to sign '
+                            'with the payer key; {"op":"prove","channelId":"0x…","nonce":"…","signature":"0x…"} returns the credential; '
+                            '{"op":"on","credential":"…"} and {"op":"off","credential":"…"} switch the channel\'s meter on and off; '
+                            '{"op":"status","credential":"…"} reads the line; {"op":"close","credential":"…"} ends it.'),
             "inputSchema": {"type": "object", "properties": {"op": {"enum": list(LINE_OPS)}, "channelId": {"type": "string"}, "nonce": {"type": "string"},
                                                              "signature": {"type": "string"}, "credential": {"type": "string"}}, "required": ["op"]},
         }
@@ -399,6 +402,12 @@ class Bridge:
         if tool.get("builtin") == "buy_time":
             ms = bought_ms(self.time, args)
             return {"micro": time_micro(self.time, ms), "unitMicro": None, "ms": ms}
+        p = self._base_price(tool, args)
+        if tool.get("meter") == "time" and self.time and p["unitMicro"] is None:
+            return {**p, "rateMicro": self.time["rateMicro"], "rateMs": self.time["rateMs"]}
+        return p
+
+    def _base_price(self, tool, args=None):
         fallback = self.engine.price_micro
         prices = self.engine.prices
         if self._own_price(tool):
@@ -412,7 +421,9 @@ class Bridge:
             return {"usd": "0", "per": "call", "free": True}
         if tool.get("builtin") == "buy_time":
             return {"usd": usd(self.time["rateMicro"]), "per": "ms", "ms": self.time["rateMs"], **({"maxMs": self.time["maxMs"]} if self.time.get("maxMs") else {})}
-        if tool.get("meter") == "time" and not (callable(self.engine.prices) and not self._own_price(tool)):
+        if tool.get("meter") == "time":
+            if callable(self.engine.prices) and not self._own_price(tool):
+                return {"per": "time", "usd": usd(self.time["rateMicro"]), "ms": self.time["rateMs"], "varies": True}
             p = self._price_for(tool)
             return {"per": "time", "usd": usd(self.time["rateMicro"]), "ms": self.time["rateMs"],
                     "callUSD": usd(p["micro"]), "callMs": self.meter.call_ms(p["micro"])}
@@ -516,7 +527,8 @@ class Bridge:
             except Exception:
                 return value
 
-        return {"credit": lambda hold: self.meter.credit(hold["channelId"], ms, hold["pendingId"]),
+        return {"ms": ms,
+                "credit": lambda hold: self.meter.credit(hold["channelId"], ms, hold["pendingId"]),
                 "undo": lambda hold: self.meter.uncredit(hold["channelId"], ms, hold["pendingId"]),
                 "stated": stated}
 
@@ -556,22 +568,29 @@ class Bridge:
         channel_id = meter.line(credential)
         if not channel_id:
             return {"status": 403, "body": {"error": "line_unknown", "message": 'no open line with that credential. Open one: POST {"op":"open","channelId":"0x…"} to this seller\'s line route, the address its 402 time line names.'}}
-        try:
-            ch = self.engine.parts()["server"].channels.judged(channel_id)
-        except Exception:
-            ch = None
-        if not ch:
-            return {"status": 403, "body": {"error": "line_unknown", "message": "no channel for this line."}}
-        if Channels.refunding_wait_ms(ch, meter._now()) > 0:
-            secs = Channels.refunding_retry_secs(self.engine.parts()["cfg"], ch, meter._now())
-            return {"status": 402, "body": {"error": "refund_settling", "message": f"a refund is settling on this channel, retry in {secs}s.", "retry_after_seconds": secs}}
-        if _int(ch.get("withdrawRequestedAt")) > 0:
-            return {"status": 402, "body": {"error": "channel_leaving", "message": "this channel is withdrawing. Open a new channel."}}
-        heard = caller()
-        if heard is not None and heard.gone:
-            return {"status": 499, "body": _hung_up(True)}
         ident = secrets.token_hex(8)
-        b = meter.begin(channel_id, ident)
+        heard = caller()
+        channels = self.engine.parts()["server"].channels
+
+        def seat(g, ch, now, asked):
+            if not ch:
+                return {"refused": {"status": 403, "body": {"error": "line_unknown", "message": "no channel for this line."}}}
+            if _int(ch.get("withdrawRequestedAt")) > 0:
+                return {"refused": {"status": 402, "body": {"error": "channel_leaving", "message": "this channel is withdrawing. Open a new channel."}}}
+            if heard is not None and heard.gone:
+                return {"refused": {"status": 499, "body": _hung_up(True)}}
+            return {"b": meter.begin(channel_id, ident)}
+
+        try:
+            k = channels.until_answered(channel_id, self.engine.parts()["cfg"].now_ms() + channels.judge_wait_ms(), seat)
+        except Exception:
+            k = {"refused": {"status": 403, "body": {"error": "line_unknown", "message": "no channel for this line."}}}
+        if "settling" in k:
+            secs = k["settling"]
+            return {"status": 402, "body": {"error": "refund_settling", "message": f"a refund is settling on this channel, retry in {secs}s.", "retry_after_seconds": secs}}
+        if "refused" in k:
+            return k["refused"]
+        b = k["b"]
         if not b["ok"]:
             ms_remaining = meter.status(channel_id)["msRemaining"]
             if b["code"] == "too_many_calls":
@@ -593,7 +612,7 @@ class Bridge:
                 return line["deadline"]
 
         out, _units = metered(lambda: self._within(b["deadline"] - meter._now(), tool, args, lambda: renew() - meter._now()), deadline=b["deadline"], renew=renew, channelId=channel_id)
-        ended = meter._now()
+        ended = meter.stopped(channel_id, ident)
         gone = self._gone(out)
         cut = not gone and (out is None or (ended >= line["deadline"] and not out[0]))
         e = meter.end(channel_id, ident) if cut else meter.end(channel_id, ident, b["started"], ended)
@@ -634,24 +653,52 @@ class Bridge:
             if op == "open":
                 c = meter.challenge(ident)
                 return {"status": 200, "body": {"op": "challenge", "channelId": ident, "nonce": c["nonce"], "sign": c["message"], "expiresInSeconds": c["expiresInSeconds"]}}
-            r = meter.prove(ch, args.get("nonce"), args.get("signature"))
+            channels = self.engine.parts()["server"].channels
+            cfg = self.engine.parts()["cfg"]
+            deadline = cfg.now_ms() + channels.judge_wait_ms()
+
+            def gate(attach):
+                out = channels.until_answered(ident, deadline, lambda g, rec, now, asked: attach({"judged": Channels.retry_secs(cfg, 0)} if asked else None))
+                if "settling" in out:
+                    return channels.serial(ident, lambda g: attach({"settling": out["settling"]}))
+                return out
+
+            try:
+                r = meter.prove(ch, args.get("nonce"), args.get("signature"), gate)
+            except Exception:
+                return {"status": 503, "body": {"op": "line_failed", "code": "line_unavailable", "why": "the line could not be read right now. Retry."}}
+            refused = r.get("refused") or {}
+            if "settling" in refused:
+                secs = refused["settling"]
+                return {"status": 402, "body": {"op": "line_failed", "code": "refund_settling", "why": f'a refund is settling on this channel, and a first line would switch its meter on. Nothing was opened: send {{"op":"open"}} again in {secs}s.', "retry_after_seconds": secs}}
+            if "judged" in refused:
+                secs = refused["judged"]
+                return {"status": 402, "body": {"op": "line_failed", "code": "refund_pending", "why": f'a refund asked for on this channel is being worked out, and the meter stays off until it is answered. Nothing was opened: send {{"op":"open"}} again in {secs}s.', "retry_after_seconds": secs}}
             if not r["ok"]:
                 return fail(r["status"], r["code"], r["why"])
-            return {"status": 200, "body": {"op": "opened", "credential": r["credential"], "channelId": ident, "msRemaining": r["msRemaining"], "metering": True}}
+            return {"status": 200, "body": {"op": "opened", "credential": r["credential"], "channelId": ident, "msRemaining": r["msRemaining"], "metering": r["metering"]}}
         credential = args["credential"] if isinstance(args.get("credential"), str) and args["credential"] != "" else header_credential
         if not credential:
             return fail(400, "bad_request", 'credential is missing or is not a string: add "credential":"<yours>" to the body, or send it as the x-line header')
         ident = meter.line(credential)
         if not ident:
             return fail(403, "line_unknown", "no open line with that credential")
+        channels = self.engine.parts()["server"].channels
         if op == "close":
-            meter.close(credential)
+            channels.serial(ident, lambda g: meter.close(credential))
             return {"status": 200, "body": {"op": "closed", "channelId": ident}}
         if op == "on":
-            holder = "0x" + secrets.token_hex(16)
-            channels = self.engine.parts()["server"].channels
-            marked = channels.mark(ident, holder, False)
-            if marked.get("unavailable"):
+            cfg = self.engine.parts()["cfg"]
+
+            def turn_on(g, ch, now, asked):
+                if asked:
+                    return {"judged": Channels.retry_secs(cfg, 0)}
+                meter.switch(ident, True)
+                return {}
+
+            try:
+                marked = channels.until_answered(ident, cfg.now_ms() + channels.judge_wait_ms(), turn_on)
+            except Exception:
                 return {"status": 503, "body": {"op": "line_failed", "code": "line_unavailable", "why": "the line could not be read right now. Retry."}}
             if "settling" in marked:
                 secs = marked["settling"]
@@ -659,12 +706,8 @@ class Bridge:
             if "judged" in marked:
                 secs = marked["judged"]
                 return {"status": 402, "body": {"op": "line_failed", "code": "refund_pending", "why": f"a refund asked for on this channel is being worked out, and the meter stays off until it is answered. Retry in {secs}s.", "retry_after_seconds": secs}}
-            try:
-                meter.switch(ident, True)
-            finally:
-                channels.unmark(ident, holder)
         elif op != "status":
-            meter.switch(ident, False)
+            channels.serial(ident, lambda g: meter.switch(ident, False))
         return {"status": 200, "body": {"op": op, **meter.status(ident)}}
 
     def _probe(self, tool, args, payment, credential):
@@ -788,8 +831,6 @@ class Bridge:
         args = params.get("arguments", {})
         if args is None:
             args = {}
-        if not isinstance(args, dict):
-            raise _RpcError(-32602, "params.arguments must be an object")
         payment = meta.get(META_PAYMENT)
         paying = payment is not None and payment is not False and payment != 0 and payment != ""
         tool = self._tools.get(name)
@@ -966,9 +1007,10 @@ class Bridge:
                "400": {"description": "invalid arguments; nothing is charged" if self.mode == "gate" else "invalid arguments (error invalid_arguments), or a payment that does not decode (error bad_payment_header) or is neither a voucher nor a deposit (error bad_payment_type); nothing is charged"},
                "402": {"description": "a zero-value x402 signature is required; nothing is paid" if self.mode == "gate" else
                        ("x402 payment required" if tool.get("builtin") == "buy_time" or self._price_tag(tool).get("per") == "unit" else "payment required: x402, or MPP when the 402 carries a Payment challenge")
-                       + ("; on a line, the meter is off or the line is out of time" if timed else "") + "; a refund settling on the channel answers refund_settling"},
-               "403": {"description": "key not admitted" + ("; on a line, no line with that credential" if timed else "")},
+                       + ("; on a line, the meter is off (error meter_off), the line is out of time (error out_of_time) or the channel is withdrawing (error channel_leaving)" if timed else "") + "; a refund settling on the channel answers refund_settling"},
+               "403": {"description": "key not admitted" + ("; on a line, no line with that credential (error line_unknown)" if timed else "")},
                "413": {"description": "the body is over the size this seller reads; nothing is charged"},
+               "499": {"description": "the caller hung up or canceled the call, so it was stopped (error client_gone); nothing is charged" + (" per call, and on a line the line is billed for the time the call ran" if timed else "")},
                "500": {"description": "the tool failed; nothing is charged per call" + (", and on a line the call has used the time it ran" if timed else "")},
                "503": {"description": unavailable + ", or this seller's setup is incomplete (error not_ready); nothing is charged. Retry later"}}
         if timed:
@@ -1029,7 +1071,10 @@ class Bridge:
             r = self.engine.refund(args)
         except Exception as e:
             return 503, {}, {"op": "refund_failed", "code": "refund_unavailable", "why": f"the refund could not be handled right now: {e}", "retry_after_seconds": 5}
-        return r["status"], {}, r["body"]
+        turn = r.get("turn")
+        if not isinstance(turn, int) or isinstance(turn, bool):
+            return r["status"], {}, r["body"]
+        return r["status"], {REFUND_TURN.lower(): str(turn), "access-control-expose-headers": CORS["access-control-expose-headers"] + ", " + REFUND_TURN}, {**r["body"], "turn": turn}
 
     @staticmethod
     def ours(path):
@@ -1213,8 +1258,8 @@ class Bridge:
     def refund_view(self):
         def refund():
             from flask import request, make_response
-            status, _, body = self.refund(request.get_data())
-            return self._flask_json(make_response, body, status)
+            status, extra, body = self.refund(request.get_data())
+            return self._flask(self._flask_json(make_response, body, status), extra)
         return refund
 
     @staticmethod

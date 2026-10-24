@@ -1,12 +1,12 @@
 {
   "name": "@zeambridge/bridge",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "license": "Apache-2.0",
   "author": "ZEAM Labs, LLC <info@zeamlabs.com> (https://www.zeamlabs.com)",
   "homepage": "https://zeambridge.com",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/zeam-labs/pass.git",
+    "url": "git+https://github.com/zeam-labs/bridge.git",
     "directory": "node"
   },
   "bugs": {

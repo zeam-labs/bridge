@@ -5,7 +5,6 @@ import { ESCROWS } from './x402.mjs'
 export class Channels {
   static REFUNDING_TTL_MS = 180000
   static JUDGING_TTL_MS = 30000
-  static JUDGING_POLL_MS = 20
 
   constructor(cfg, store, chain, escrows = ESCROWS) {
     this.cfg = cfg
@@ -28,139 +27,187 @@ export class Channels {
     return Math.max(1, Math.ceil(Math.min(left > 0 ? left : look, look) / 1000))
   }
 
-  static judging(c, now) {
-    return c !== null && c !== undefined && c.refundingJudging === true && Channels.refundingWaitMs(c, now) > 0
+  static GATES = new WeakMap()
+
+  gates() {
+    let all = Channels.GATES.get(this.store)
+    if (all === undefined) {
+      all = new Map()
+      Channels.GATES.set(this.store, all)
+    }
+    return all
   }
 
-  static weighed(c, now) {
-    const all = c !== null && c !== undefined && c.refundsJudged !== null && typeof c.refundsJudged === 'object' ? c.refundsJudged : {}
-    return Object.fromEntries(Object.entries(all).filter(([, until]) => Math.trunc(Number(until)) > now))
+  gate(channelId) {
+    const id = String(channelId).toLowerCase()
+    const all = this.gates()
+    let g = all.get(id)
+    if (g === undefined) {
+      g = { id, tail: Promise.resolve(), queued: 0, seq: 0, order: new Map(), checking: new Map(), arriving: new Map(), held: new Map(), judge: null, reading: null, lastRead: null, wakes: new Set() }
+      all.set(id, g)
+    }
+    return g
   }
 
-  static beingJudged(c, now) {
-    return Object.keys(Channels.weighed(c, now)).length > 0
+  idle(g) {
+    if (g.queued === 0 && g.order.size === 0 && g.checking.size === 0 && g.arriving.size === 0 && g.held.size === 0 && g.judge === null && g.reading === null && g.wakes.size === 0 && this.gates().get(g.id) === g) this.gates().delete(g.id)
   }
 
-  static judgedRetrySecs(cfg, c, now) {
-    const until = Math.max(0, ...Object.values(Channels.weighed(c, now)).map((v) => Math.trunc(Number(v))))
-    return Channels.retrySecs(cfg, until > now ? until - now : 0)
+  async serial(channelId, fn) {
+    const g = this.gate(channelId)
+    g.queued += 1
+    const before = g.tail
+    let done
+    const mine = new Promise((r) => { done = r })
+    g.tail = before.then(() => mine)
+    await before
+    try {
+      return await fn(g)
+    } finally {
+      g.queued -= 1
+      done()
+      this.idle(g)
+    }
   }
 
-  static held(c, now, pending = false) {
-    return Channels.judging(c, now) || (pending && Channels.beingJudged(c, now) && Channels.refundingWaitMs(c, now) === 0)
+  static live(entries, now) {
+    for (const [k, until] of entries) if (until <= now) entries.delete(k)
+    return entries.size
   }
 
-  static unweighed(r, holder, now) {
-    const rest = Channels.weighed(r, now)
-    delete rest[holder]
-    if (Object.keys(rest).length > 0) r.refundsJudged = rest
-    else delete r.refundsJudged
-    return r
+  static TURN_KEPT_MS = 600000
+  static TURNS = new WeakMap()
+
+  turn(g, now) {
+    let all = Channels.TURNS.get(this.store)
+    if (all === undefined) {
+      all = new Map()
+      Channels.TURNS.set(this.store, all)
+    }
+    const last = all.get(g.id)
+    g.seq = Math.max(g.seq, last !== undefined && now - last.at < Channels.TURN_KEPT_MS ? last.turn : 0) + 1
+    all.delete(g.id)
+    all.set(g.id, { turn: g.seq, at: now })
+    for (const [k, v] of all) {
+      if (now - v.at < Channels.TURN_KEPT_MS) break
+      all.delete(k)
+    }
+    return g.seq
+  }
+
+  ticket(channelId, holder, now) {
+    const g = this.gate(channelId)
+    const turn = this.turn(g, now)
+    g.order.set(holder, turn)
+    g.checking.set(holder, now + Channels.JUDGING_TTL_MS)
+    return turn
+  }
+
+  static before(g, holder, now) {
+    const mine = g.order.get(holder) ?? Infinity
+    const earlier = (entries) => {
+      Channels.live(entries, now)
+      for (const k of entries.keys()) if (k !== holder && (g.order.get(k) ?? Infinity) < mine) return true
+      return false
+    }
+    return { ahead: earlier(g.checking) || earlier(g.arriving), mine }
+  }
+
+  static earlier(g, holder, entries, now) {
+    const mine = g.order.get(holder) ?? Infinity
+    Channels.live(entries, now)
+    let count = 0
+    for (const k of entries.keys()) if (k !== holder && (g.order.get(k) ?? Infinity) < mine) count += 1
+    return count
+  }
+
+  static ahead(g, holder, now) {
+    return Channels.before(g, holder, now).ahead || Channels.place(g, holder, now) > 0
+  }
+
+  static place(g, holder, now) {
+    const mine = g.order.get(holder) ?? Infinity
+    Channels.live(g.held, now)
+    let place = 0
+    for (const k of g.held.keys()) if (k !== holder && (g.order.get(k) ?? Infinity) < mine) place += 1
+    return place
+  }
+
+  static judgeOf(g, now) {
+    if (g.judge !== null && g.judge.until <= now) g.judge = null
+    return g.judge
+  }
+
+  static arriving(g, now) {
+    return Channels.live(g.arriving, now) > 0
+  }
+
+  static holding(g, now) {
+    return Channels.live(g.held, now) > 0
+  }
+
+  static asked(g, now) {
+    return Channels.arriving(g, now) || Channels.holding(g, now)
+  }
+
+  waiter(g) {
+    let wake
+    const woken = new Promise((r) => { wake = r })
+    g.wakes.add(wake)
+    return { g, woken, wake }
+  }
+
+  wake(g) {
+    const all = [...g.wakes]
+    g.wakes.clear()
+    for (const w of all) w()
+  }
+
+  async waited(w, deadline) {
+    const left = Math.min(deadline - this.cfg.nowMs(), 2147483647)
+    if (left > 0) {
+      let timer = null
+      const lapse = this.cfg.sleeper ? this.cfg.sleepMs(left) : new Promise((r) => { timer = setTimeout(r, left) })
+      await Promise.race([w.woken, lapse])
+      if (timer !== null) clearTimeout(timer)
+    }
+    w.g.wakes.delete(w.wake)
+    this.idle(w.g)
   }
 
   judgeWaitMs() {
     return Math.max(0, Math.trunc(Number(this.cfg?.refundJudgeWaitMs ?? 5000)))
   }
 
-  async judged(channelId, pending = false) {
-    const deadline = this.cfg.nowMs() + this.judgeWaitMs()
+  async untilAnswered(channelId, deadline, decide) {
     for (;;) {
-      const c = await this.get(channelId)
-      const now = this.cfg.nowMs()
-      if (!Channels.held(c, now, pending) || now >= deadline) return c
-      await this.cfg.sleepMs(Channels.JUDGING_POLL_MS)
-    }
-  }
-
-  async weigh(channelId, holder) {
-    const deadline = this.cfg.nowMs() + this.judgeWaitMs()
-    for (;;) {
-      let wait = false
-      try {
-        await this.update(channelId, (r) => {
-          if (r === null) return r
-          const now = this.cfg.nowMs()
-          const weighed = Channels.weighed(r, now)
-          if (now < deadline && Channels.judging(r, now) && !Object.hasOwn(weighed, String(r.refundingBy))) {
-            wait = true
-            return r
-          }
-          r.refundsJudged = { ...weighed, [holder]: now + Channels.JUDGING_TTL_MS }
-          return r
-        })
-      } catch {
-        return false
-      }
-      if (!wait) return true
-      await this.cfg.sleepMs(Channels.JUDGING_POLL_MS)
-    }
-  }
-
-  unweigh(channelId, holder) {
-    return this.update(channelId, (r) => (r === null ? r : Channels.unweighed(r, holder, this.cfg.nowMs()))).catch(() => {})
-  }
-
-  async mark(channelId, holder, refuseOpen = true, sending = false) {
-    for (;;) {
-      let out = { ok: true }
-      try {
-        await this.update(channelId, (r) => {
-          if (r === null) return r
-          const now = this.cfg.nowMs()
-          if (Channels.judging(r, now)) out = { wait: true }
-          else if (Channels.refundingWaitMs(r, now) > 0) out = { settling: Channels.refundingRetrySecs(this.cfg, r, now) }
-          else if (!sending && Channels.beingJudged(r, now)) out = { judged: Channels.judgedRetrySecs(this.cfg, r, now) }
-          else if (refuseOpen && Channels.pendingLive(r, now)) out = { open: structuredClone(r), at: now }
-          else if (sending) {
-            r.refundingUntil = now + Channels.JUDGING_TTL_MS
-            r.refundingBy = holder
-            r.refundingJudging = true
-          } else {
-            r.refundingUntil = now + Channels.JUDGING_TTL_MS
-            r.refundingBy = holder
-            r.refundingJudging = true
-          }
-          return r
-        })
-      } catch {
-        return { unavailable: true }
-      }
-      if (out.wait !== true) return out
-      await this.cfg.sleepMs(Channels.JUDGING_POLL_MS)
-    }
-  }
-
-  async sending(channelId, holder) {
-    let other = null
-    try {
-      await this.update(channelId, (r) => {
-        if (r === null) return r
+      const out = await this.serial(channelId, async (g) => {
         const now = this.cfg.nowMs()
-        if (r.refundingBy !== holder || Channels.refundingWaitMs(r, now) === 0) {
-          other = Channels.refundingWaitMs(r, now) > 0 ? { settling: Channels.refundingRetrySecs(this.cfg, r, now) } : { unavailable: true }
-          return r
-        }
-        r.refundingUntil = now + Channels.REFUNDING_TTL_MS
-        r.refundingBy = holder
-        delete r.refundingJudging
-        return Channels.unweighed(r, holder, now)
+        const r = await this.get(channelId)
+        if (Channels.refundingWaitMs(r, now) > 0) return { settling: Channels.refundingRetrySecs(this.cfg, r, now), r }
+        const asked = Channels.asked(g, now)
+        if (asked && Channels.arriving(g, now) && now < deadline) return { wait: this.waiter(g) }
+        return decide(g, r, now, asked)
       })
-    } catch {
-      return { unavailable: true }
+      if (out?.wait === undefined) return out
+      await this.waited(out.wait, deadline)
     }
-    return other
   }
 
-  unmark(channelId, holder) {
-    return this.update(channelId, (r) => {
-      if (r === null) return r
-      if (r.refundingBy === holder) {
-        delete r.refundingUntil
-        delete r.refundingBy
-        delete r.refundingJudging
-      }
-      return Channels.unweighed(r, holder, this.cfg.nowMs())
-    }).catch(() => {})
+  async release(channelId, pendingId = null) {
+    let had = false
+    try {
+      await this.serial(channelId, () => this.update(channelId, (c) => {
+        if (c === null || c.pendingRequest === undefined || c.pendingRequest === null) return c
+        if (pendingId !== null && (c.pendingRequest.pendingId === undefined || c.pendingRequest.pendingId !== pendingId)) return c
+        had = true
+        delete c.pendingRequest
+        return c
+      }))
+    } catch {
+      return false
+    }
+    return had
   }
 
   static n(value) {
@@ -247,22 +294,6 @@ export class Channels {
       })
     }
     return leaving
-  }
-
-  async release(channelId, pendingId = null) {
-    let had = false
-    try {
-      await this.update(channelId, (c) => {
-        if (c === null || c.pendingRequest === undefined || c.pendingRequest === null) return c
-        if (pendingId !== null && (c.pendingRequest.pendingId === undefined || c.pendingRequest.pendingId !== pendingId)) return c
-        had = true
-        delete c.pendingRequest
-        return c
-      })
-    } catch {
-      return false
-    }
-    return had
   }
 
   static pendingLive(channel, now = 0) {

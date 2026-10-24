@@ -18,6 +18,21 @@ function zeam_pass_dedicated_keys()
     return $keys;
 }
 
+function zeam_pass_short_keys()
+{
+    $short = [];
+    foreach (['ZEAM_BRIDGE_KEY', 'ZEAM_PASS_KEY'] as $name) {
+        if (!defined($name)) {
+            continue;
+        }
+        $value = constant($name);
+        if (!is_string($value) || strlen($value) < 32) {
+            $short[$name] = 'the ' . $name . ' in wp-config.php ' . (is_string($value) ? 'is ' . strlen($value) . (strlen($value) === 1 ? ' character' : ' characters') . ', too short to use: a key must be 32 or more characters, so it is ignored' : 'is not a string: a key is a string of 32 or more characters, so it is ignored');
+        }
+    }
+    return $short;
+}
+
 function zeam_pass_has_dedicated_key()
 {
     return zeam_pass_dedicated_keys() !== [];
@@ -78,17 +93,28 @@ function zeam_pass_key_notices($newKey)
         $text .= $which === 'settle' ? ' Paid calls are off until then.' : ' Credit is not bought until then.';
         $notices[] = ['level' => 'error', 'lead' => 'ZEAM Bridge cannot open its ' . $label . '.', 'text' => $text, 'define' => null, 'after' => ''];
     }
+    $short = zeam_pass_short_keys();
+    $ignored = function () use (&$short) {
+        $out = [];
+        foreach ($short as $said) {
+            $out[] = ['level' => 'warning', 'lead' => 'ZEAM Bridge:', 'text' => $said . '.', 'define' => null, 'after' => ''];
+        }
+        return $out;
+    };
     if (zeam_pass_has_dedicated_key() || $notices !== []) {
-        return $notices;
+        return array_merge($notices, $ignored());
     }
     $define = "define('ZEAM_BRIDGE_KEY', '" . $newKey . "');";
+    $tooShort = isset($short['ZEAM_BRIDGE_KEY']) ? $short['ZEAM_BRIDGE_KEY'] : null;
+    unset($short['ZEAM_BRIDGE_KEY']);
+    $set = $tooShort === null ? 'add ZEAM_BRIDGE_KEY to wp-config.php, 32 or more random characters' : 'set ZEAM_BRIDGE_KEY in wp-config.php to 32 or more random characters';
     if ($sealed === []) {
-        $notices[] = ['level' => 'warning', 'lead' => 'ZEAM Bridge:', 'text' => 'no ZEAM_BRIDGE_KEY is set, so the keys this plugin makes will be sealed with a key derived from the WordPress salts. Add ZEAM_BRIDGE_KEY to wp-config.php before they are made, 32 or more random characters:', 'define' => $define, 'after' => 'Keep it across every move and redeploy: it is what the keys will be sealed with.'];
-        return $notices;
+        $notices[] = ['level' => 'warning', 'lead' => 'ZEAM Bridge:', 'text' => ($tooShort === null ? 'no ZEAM_BRIDGE_KEY is set' : $tooShort) . ', so the keys this plugin makes will be sealed with a key derived from the WordPress salts. ' . ($tooShort === null ? 'Add ZEAM_BRIDGE_KEY to wp-config.php before they are made, 32 or more random characters:' : 'Set ZEAM_BRIDGE_KEY in wp-config.php to 32 or more random characters before they are made:'), 'define' => $define, 'after' => 'Keep it across every move and redeploy: it is what the keys will be sealed with.'];
+        return array_merge($notices, $ignored());
     }
     $which = implode(' and ', $sealed);
-    $notices[] = ['level' => 'warning', 'lead' => 'ZEAM Bridge:', 'text' => 'your ' . $which . (count($sealed) > 1 ? ' are' : ' is') . ' sealed with a key derived from the WordPress salts. To seal ' . (count($sealed) > 1 ? 'them' : 'it') . ' with a key of your own, add ZEAM_BRIDGE_KEY to wp-config.php, 32 or more random characters:', 'define' => $define, 'after' => 'The salts still open ' . (count($sealed) > 1 ? 'them' : 'it') . ', and ' . (count($sealed) > 1 ? 'they are' : 'it is') . ' sealed again with ZEAM_BRIDGE_KEY on next use; keep that value from then on. Until you add it, keep your WordPress salts across every move and redeploy: they are what ' . (count($sealed) > 1 ? 'the keys are' : 'the key is') . ' sealed with.'];
-    return $notices;
+    $notices[] = ['level' => 'warning', 'lead' => 'ZEAM Bridge:', 'text' => ($tooShort === null ? 'your ' : $tooShort . ', so your ') . $which . (count($sealed) > 1 ? ' are' : ' is') . ' sealed with a key derived from the WordPress salts. To seal ' . (count($sealed) > 1 ? 'them' : 'it') . ' with a key of your own, ' . $set . ':', 'define' => $define, 'after' => 'The salts still open ' . (count($sealed) > 1 ? 'them' : 'it') . ', and ' . (count($sealed) > 1 ? 'they are' : 'it is') . ' sealed again with ZEAM_BRIDGE_KEY on next use; keep that value from then on. Until you add it, keep your WordPress salts across every move and redeploy: they are what ' . (count($sealed) > 1 ? 'the keys are' : 'the key is') . ' sealed with.'];
+    return array_merge($notices, $ignored());
 }
 
 function zeam_pass_wrapping_keys()

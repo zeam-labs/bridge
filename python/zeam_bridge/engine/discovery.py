@@ -3,12 +3,34 @@ import re
 CACHE_CONTROL = "max-age=300"
 _GUIDANCE = "Call a tool: POST its path with the arguments as a JSON object. A tool that is not free answers 402 with what to send when it is called without it. A call that fails is not charged."
 _ON_A_LINE = " On a line a call uses the time it runs, whether or not it succeeds."
-_MPP_402 = "; the 402 carries an MPP Payment challenge now, in WWW-Authenticate (method evm, intent charge); a refused MPP credential answers 402 with a fresh challenge and a problem"
+FAILED_CALL = "A failed call is not charged." + _ON_A_LINE
 _AMOUNT = re.compile(r"(0|[1-9][0-9]*)")
+
+
+def percent(share):
+    return ("%.2f" % (float(share) * 100)).rstrip("0").rstrip(".")
+
+
+def refund_rule(cover, pay=None):
+    pay = cover if pay is None else pay
+    return ("Our relay pays the gas of a refund when our fee on what the buyer spent covers the gas of the deposit, of the refund and of settling any calls not yet settled, and of every further deposit and every earlier refund it paid for on that channel, with a " + str(cover)
+            + "% margin; otherwise the buyer pays the refund's gas, with a " + str(pay) + "% margin, in USDC, quoted before the buyer signs that payment.")
 
 
 def _text(v):
     return isinstance(v, str) and v != ""
+
+
+def _mpp_402(offers):
+    said = "an MPP Payment challenge" if len(offers) == 1 else "MPP Payment challenges"
+    pairs = "; ".join(f"method {o['method']}, intent {o['intent']}" for o in offers)
+    status = "402 " if all(o["intent"] == "charge" for o in offers) else ""
+    return f"; the 402 carries {said} now, in WWW-Authenticate ({pairs}); a refused MPP credential answers {status}with a fresh challenge and a problem"
+
+
+def _offered(mpp):
+    return (isinstance(mpp, dict) and isinstance(mpp.get("amount"), str) and _AMOUNT.fullmatch(mpp["amount"]) is not None
+            and _text(mpp.get("currency")) and _text(mpp.get("method")) and _text(mpp.get("intent")))
 
 
 def price(tag):
@@ -28,16 +50,19 @@ def payment_info(tag, mpp=None):
     p = price(tag)
     if p is None:
         return None
-    charge = (p["mode"] == "fixed" and isinstance(mpp, dict) and isinstance(mpp.get("amount"), str) and _AMOUNT.fullmatch(mpp["amount"]) is not None
-              and _text(mpp.get("currency")) and _text(mpp.get("method")) and _text(mpp.get("intent")))
-    if not charge:
+    given = [m for m in (mpp if isinstance(mpp, list) else [mpp]) if _offered(m)] if p["mode"] == "fixed" else []
+    if not given:
         return {"price": p, "protocols": [{"x402": {}}]}
-    offer = {"amount": mpp["amount"], "currency": mpp["currency"]}
-    if _text(mpp.get("description")):
-        offer["description"] = mpp["description"]
-    offer["intent"] = mpp["intent"]
-    offer["method"] = mpp["method"]
-    return {"offers": [offer], "price": p, "protocols": [{"mpp": {"method": mpp["method"], "intent": mpp["intent"], "currency": mpp["currency"]}}, {"x402": {}}]}
+    offers = []
+    for m in given:
+        offer = {"amount": m["amount"], "currency": m["currency"]}
+        if _text(m.get("description")):
+            offer["description"] = m["description"]
+        offer["intent"] = m["intent"]
+        offer["method"] = m["method"]
+        offers.append(offer)
+    protocols = [{"mpp": {"method": m["method"], "intent": m["intent"], "currency": m["currency"]}} for m in given]
+    return {"offers": offers, "price": p, "protocols": protocols + [{"x402": {}}]}
 
 
 def discovery(doc, offers=None, homepage=None, origin=None, mount=""):
@@ -63,7 +88,7 @@ def discovery(doc, offers=None, homepage=None, origin=None, mount=""):
                 responses = op.get("responses")
                 required = responses.get("402") if isinstance(responses, dict) else None
                 if "offers" in info and isinstance(required, dict) and _text(required.get("description")):
-                    nxt["responses"] = {**responses, "402": {**required, "description": required["description"] + _MPP_402}}
+                    nxt["responses"] = {**responses, "402": {**required, "description": required["description"] + _mpp_402(info["offers"])}}
             out[method] = nxt
         paths[path if origin is None else mount + path] = out
     out = dict(doc)

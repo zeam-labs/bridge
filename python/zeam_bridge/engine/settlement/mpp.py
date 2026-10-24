@@ -24,10 +24,11 @@ _TITLES = {"malformed-credential": "Malformed Credential", "invalid-challenge": 
 
 
 class MppError(Exception):
-    def __init__(self, type_, detail):
+    def __init__(self, type_, detail, more=None):
         super().__init__(detail)
         self.type = type_
         self.detail = detail
+        self.more = more
 
 
 def _malformed(detail):
@@ -296,7 +297,7 @@ class Problem:
     @staticmethod
     def of(error):
         if isinstance(error, MppError):
-            return Problem.body(error.type, error.detail)
+            return {**Problem.body(error.type, error.detail), **(error.more or {})}
         return Problem.body("verification-failed", str(error))
 
 

@@ -13,10 +13,11 @@ const NOT_THE_PROBLEM = ['accepts', 'session']
 const BAD_GRANT = 'bad_grant'
 
 export class MppError extends Error {
-  constructor(type, detail) {
+  constructor(type, detail, more = null) {
     super(detail)
     this.type = type
     this.detail = detail
+    this.more = more
   }
 }
 
@@ -173,7 +174,7 @@ export const McpPayment = {
     const challenges = Challenge.parse(headerValue)
     if (!challenges.length) return null
     const out = { httpStatus: 402, challenges: challenges.map(Challenge.forMeta) }
-    if (body !== null && typeof body === 'object' && typeof body.type === 'string' && body.type.startsWith(PROBLEM)) out.problem = { ...Object.fromEntries(Object.entries(body).filter(([k, v]) => !NOT_THE_PROBLEM.includes(k) && v !== undefined)), status: 402 }
+    if (body !== null && typeof body === 'object' && typeof body.type === 'string' && body.type.startsWith(PROBLEM)) out.problem = Object.fromEntries(Object.entries(body).filter(([k, v]) => !NOT_THE_PROBLEM.includes(k) && v !== undefined))
     if (body !== null && typeof body === 'object' && body.session !== null && typeof body.session === 'object') out.session = body.session
     return out
   },
@@ -255,7 +256,7 @@ export const Problem = {
     return { type: PROBLEM + type, title: title ?? titles[type] ?? 'Payment Problem', status: 402, detail: String(detail) }
   },
   of(error) {
-    return error instanceof MppError ? Problem.body(error.type, error.detail) : Problem.body('verification-failed', String(error?.message ?? error))
+    return error instanceof MppError ? { ...Problem.body(error.type, error.detail), ...(error.more ?? {}) } : Problem.body('verification-failed', String(error?.message ?? error))
   },
 }
 

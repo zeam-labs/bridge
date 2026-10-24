@@ -80,6 +80,8 @@ gated?.tool({
 const gate = gated ? gated.handle('/gate') : async () => null
 
 const server = http.createServer(async (req, res) => {
+  const hung = new AbortController()
+  res.on('close', () => { if (!res.writableEnded) hung.abort() })
   try {
     if (req.method === 'GET' && req.url === '/health') {
       res.writeHead(200, { 'content-type': 'application/json' })
@@ -90,7 +92,8 @@ const server = http.createServer(async (req, res) => {
     for await (const c of req) body += c
     const headers = Object.fromEntries(Object.entries(req.headers).filter(([k]) => !['content-length', 'transfer-encoding'].includes(k)).map(([k, v]) => [k, Array.isArray(v) ? v.join(', ') : v]))
     const request = new Request(`http://${req.headers.host ?? 'localhost'}${req.url}`, { method: req.method, headers, body: ['GET', 'HEAD'].includes(req.method) ? undefined : body })
-    const response = (await handle(request, { ip: req.socket.remoteAddress })) ?? (await gate(request)) ?? new Response('ZEAM Bridge reference seller: the tools are at /agents/mcp and /agents/v1/<tool>\n', { status: 404, headers: { 'content-type': 'text/plain' } })
+    const info = { ip: req.socket.remoteAddress, signal: hung.signal }
+    const response = (await handle(request, info)) ?? (await gate(request, info)) ?? new Response('ZEAM Bridge reference seller: the tools are at /agents/mcp and /agents/v1/<tool>\n', { status: 404, headers: { 'content-type': 'text/plain' } })
     res.writeHead(response.status, Object.fromEntries(response.headers))
     res.end(Buffer.from(await response.arrayBuffer()))
   } catch (e) {

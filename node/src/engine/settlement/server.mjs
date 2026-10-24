@@ -12,15 +12,18 @@ import { Verify } from './verify.mjs'
 import { ESCROWS } from './x402.mjs'
 import { pricing, usd } from '../pricing.mjs'
 import { forHeader } from '../bazaar.mjs'
+import { percent, refundRule } from '../discovery.mjs'
 
 const MISMATCH = Reason.CUMULATIVE_AMOUNT_MISMATCH
 const MIN_PENDING_TTL_MS = 5000
 const MAX_PENDING_TTL_MS = 600000
+const MOVED_TRIES = 2
 const SDK_FIELDS = ['channelId', 'channelConfig', 'chargedCumulativeAmount', 'signedMaxClaimable', 'signature', 'balance', 'totalClaimed', 'withdrawRequestedAt', 'refundNonce', 'onchainSyncedAt', 'lastRequestTimestamp', 'pendingRequest']
 const clone = (v) => (v === undefined ? v : JSON.parse(JSON.stringify(v)))
 const message = (e) => String(e?.message ?? e)
 const MPP_TTL_SECS = 300
 const MPP_USED_TRIES = 5
+const MPP_SHOWN_RETRY_SECS = 2
 const AUTHORIZATION_USED = Keccak.utf8('AuthorizationUsed(address,bytes32)')
 const topicOf = (address) => '0x' + '0'.repeat(24) + Hex.body(address)
 
@@ -51,14 +54,26 @@ export class MppHeldMemory {
   }
 
   async claim(key, untilMs, nowMs) {
-    for (const [k, until] of this.held) if (until <= nowMs) this.held.delete(k)
+    for (const [k, e] of this.held) if (e.until <= nowMs) this.held.delete(k)
     if (this.held.has(key)) return false
-    this.held.set(key, untilMs)
+    this.held.set(key, { key: String(key), until: untilMs })
     return true
   }
 
   async release(key) {
     this.held.delete(key)
+  }
+
+  async entry(key) {
+    const e = this.held.get(key)
+    return e === undefined ? null : { ...e }
+  }
+
+  async mark(key, from, fields) {
+    const e = this.held.get(key)
+    if (e === undefined || (e.state ?? null) !== from) return false
+    this.held.set(key, { ...e, ...fields })
+    return true
   }
 
   async clear() {
@@ -135,7 +150,7 @@ export class Server {
   }
 
   static percent(share) {
-    return (Number(share) * 100).toFixed(2).replace(/0+$/, '').replace(/\.$/, '')
+    return percent(share)
   }
 
   static usd(microUSD) {
@@ -161,7 +176,8 @@ export class Server {
     return {
       pricing: pricing(p),
       deposit: `First call on a channel deposits at least $${Server.usd(floor)}. Later calls spend it. The unspent balance is refundable.`,
-      refund: `Refund: ${where} with {channelId, issued, signature} signed by the payer; add channelConfig if the channel has no calls. ZEAM pays the gas when the channel's fees (${Server.percent(this.cfg.feeShare)}% of its spend) cover the gas of its deposit, its refund and any calls not yet settled, and of every further deposit and every earlier refund ZEAM paid for on that channel, plus ${Math.round((this.cfg.gasBuffer - 1) * 100)}%${about(cover)}. Otherwise sign a gasless USDC payment of the refund gas (${figure}${margin}% margin included); a refund request answers with the figure to sign. An unsettled call adds its claim gas. {"selfSend": true}: a signed refund you send at your own gas.`,
+      refund: `Refund: ${where} with {channelId, issued, signature} signed by the payer; add channelConfig if the channel has no calls. ${refundRule(Math.round((this.cfg.gasBuffer - 1) * 100), margin)} Our fee is ${Server.percent(this.cfg.feeShare)}% of what the buyer spends, against the gas it must cover with the margin${about(cover)}. When it falls short, sign a gasless USDC payment of the refund gas (${figure}${margin}% margin included); a refund request answers with the figure to sign. An unsettled call adds its claim gas. {"selfSend": true}: a signed refund you send from any wallet at your own gas.`,
+      split: this.cfg.relaySplit(),
     }
   }
 
@@ -182,7 +198,7 @@ export class Server {
     const p = price !== null && typeof price === 'object' ? price : { micro: this.micro(price), unitMicro: null }
     let doc = Server.document(Server.resourceInfo(resource), null, this.accepts(p.micro))
     if (extensions && (Array.isArray(extensions) ? extensions.length : Object.keys(extensions).length)) doc.extensions = extensions
-    const said = shared ? shared.once(`terms\n${refundUrl}\n${p.micro}\n${p.unitMicro}\n${p.ms}`, () => this.terms(refundUrl, p)) : this.terms(refundUrl, p)
+    const said = shared ? shared.once(`terms\n${refundUrl}\n${p.micro}\n${p.unitMicro}\n${p.ms}\n${p.rateMicro}\n${p.rateMs}`, () => this.terms(refundUrl, p)) : this.terms(refundUrl, p)
     doc = { ...doc, ...(await said), ...more }
     const session = this.sessions !== null && Server.mppOffered(p) ? await this.sessions.challenge(doc.resource, p.micro, shared) : null
     if (session !== null) doc.session = this.sessions.published()
@@ -194,6 +210,11 @@ export class Server {
       headers['Cache-Control'] = 'no-store'
     }
     return { ok: false, status: 402, body: doc, headers }
+  }
+
+  static forSession(q) {
+    const body = Object.fromEntries(Object.entries(q.body).filter(([k]) => k !== 'deposit'))
+    return { ...q, body, headers: { ...q.headers, 'PAYMENT-REQUIRED': Json.base64(forHeader(body)) } }
   }
 
   static mppOffered(price) {
@@ -217,7 +238,7 @@ export class Server {
   }
 
   async mppFloorMicroUSD() {
-    const gas = await this.gasQuote.microUSD(Math.ceil(this.cfg.gas.charge * this.cfg.gasBuffer))
+    const gas = await this.gasQuote.microUSD(Math.ceil(this.cfg.gas.charge * this.cfg.gasBuffer), GasQuote.RECENT_SECS)
     return gas === null ? null : Math.ceil(gas / this.cfg.feeShare)
   }
 
@@ -238,6 +259,16 @@ export class Server {
     return { amount: String(q.amount), currency: Address.checksum(q.asset.address), ...(typeof said === 'string' && said !== '' ? { description: sentenceCut(said, 120) } : {}), intent: EvmCharge.INTENT, method: EvmCharge.METHOD }
   }
 
+  async mppOffers(price, description = null) {
+    const p = price !== null && typeof price === 'object' ? price : { micro: this.micro(price), unitMicro: null }
+    if (!Server.mppOffered(p)) return []
+    const charge = await this.mppOffer(p, description)
+    const request = this.sessions !== null ? await this.sessions.request(p.micro) : null
+    const said = Server.resourceInfo({ url: '', description }).description
+    const session = request === null ? null : { amount: request.amount, currency: request.currency, ...(typeof said === 'string' && said !== '' ? { description: sentenceCut(said, 120) } : {}), intent: this.sessions.constructor.INTENT, method: this.sessions.constructor.METHOD }
+    return [charge, session].filter((o) => o !== null)
+  }
+
   async mppChallenge(resource, micro, shared = null) {
     const q = await this.mppQuote(micro, shared)
     if (q === null) return null
@@ -247,12 +278,12 @@ export class Server {
     return Challenge.issue(this.cfg.mppSecret(), { realm: this.mppRealm(resource), method: EvmCharge.METHOD, intent: EvmCharge.INTENT, request, expires, opaque: Challenge.once(), description: typeof res.description === 'string' ? sentenceCut(res.description, 120) : null })
   }
 
-  async mppRefuse(resource, micro, error) {
-    const q = await this.paymentRequired(resource, null, null, {}, micro)
+  async mppRefuse(resource, micro, error, refundUrl = null) {
+    const q = Server.forSession(await this.paymentRequired(resource, null, refundUrl, {}, micro))
     return Server.refuse(402, { ...Problem.of(error), accepts: q.body.accepts }, q.headers)
   }
 
-  async mppHold(headerValue, resource, price = null) {
+  async mppHold(headerValue, resource, price = null, refundUrl = null) {
     const micro = this.micro(price)
     const asset = this.mppAsset()
     let verified
@@ -265,14 +296,16 @@ export class Server {
         const digest = Token.transferDigest(this.mppExpect(resource, asset).tokenDomain, verified.authorization)
         if (!(await this.chain.isValidSignature(verified.payer, digest, verified.signature))) throw new MppError('verification-failed', 'the authorization signature is not valid for its payer')
       }
+      const was = await this.mppHeld.entry(verified.replayKey)
+      if (was?.sent) return await this.mppSent(verified, was, { resource, micro, asset: asset.address, refundUrl })
       if (await this.mppUsed(asset.address, verified)) throw new MppError('verification-failed', 'this authorization has already been used')
       if (BigInt(await this.chain.balanceOf(asset.address, verified.payer)) < BigInt(verified.authorization.value)) throw new MppError('verification-failed', 'the payer does not hold the amount')
     } catch (e) {
       if (!(e instanceof MppError)) throw e
-      return this.mppRefuse(resource, micro, e)
+      return this.mppRefuse(resource, micro, e, refundUrl)
     }
-    if (!(await this.mppHeld.claim(verified.replayKey, Number(verified.authorization.validBefore) * 1000, this.cfg.nowMs()))) return this.mppRefuse(resource, micro, new MppError('verification-failed', 'this authorization is already in use'))
-    return { ok: true, hold: { kind: 'mpp', verified, micro, resource: Server.resourceInfo(resource), asset: asset.address } }
+    if (!(await this.mppHeld.claim(verified.replayKey, Number(verified.authorization.validBefore) * 1000, this.cfg.nowMs()))) return this.mppRefuse(resource, micro, new MppError('verification-failed', 'this authorization is already in use'), refundUrl)
+    return { ok: true, hold: { kind: 'mpp', verified, micro, resource: Server.resourceInfo(resource), asset: asset.address, refundUrl } }
   }
 
   async mppUsed(token, verified) {
@@ -280,15 +313,71 @@ export class Server {
     return BigInt(Hex.lower(out) === '0x' ? '0x0' : out) !== 0n
   }
 
+  static usedIn(receipt, token, v) {
+    return String(receipt?.status ?? '').toLowerCase() === '0x1' && (receipt.logs ?? []).some((l) => Address.equals(l.address, token) && String(l.topics?.[0] ?? '').toLowerCase() === AUTHORIZATION_USED && String(l.topics?.[1] ?? '').toLowerCase() === topicOf(v.payer) && String(l.topics?.[2] ?? '').toLowerCase() === v.authorization.nonce)
+  }
+
+  async mppNotShown(resource, micro, hash, refundUrl) {
+    const out = await this.mppRefuse(resource, micro, new MppError('verification-failed', `the payment was sent in transaction ${hash} and the chain this seller reads does not show it yet, so this call was not delivered. Nothing more is sent for it. Send this credential again in ${MPP_SHOWN_RETRY_SECS}s: once the transfer shows, the call is delivered, once; if the transfer did not happen, nothing was charged.`, { code: 'sent_not_shown', txHash: hash, retry_after_seconds: MPP_SHOWN_RETRY_SECS }), refundUrl)
+    out.headers = { ...out.headers, 'Retry-After': String(MPP_SHOWN_RETRY_SECS) }
+    return out
+  }
+
+  async mppSent(verified, was, { resource, micro, asset, refundUrl }) {
+    const key = verified.replayKey
+    const refuse = (detail) => this.mppRefuse(resource, micro, new MppError('verification-failed', detail), refundUrl)
+    const now = this.cfg.nowMs()
+    const gone = was.state === 'sending' && now - Number(was.at ?? 0) > 2000 * this.cfg.receiptTimeoutSecs + 60000
+    if (was.state === 'delivered') return refuse('this authorization has already been used')
+    if (was.state !== 'sent' && !gone) return refuse('this authorization is already in use')
+    let receipt
+    try {
+      receipt = await this.chain.receipt(was.sent)
+    } catch {
+      receipt = null
+    }
+    if (receipt === null) return this.mppNotShown(resource, micro, was.sent, refundUrl)
+    if (Server.usedIn(receipt, asset, verified)) {
+      if (!(await this.mppHeld.mark(key, was.state, { state: 'taken', at: now }))) return refuse('this authorization is already in use')
+      return { ok: true, hold: { kind: 'mpp', verified, micro, resource: Server.resourceInfo(resource), asset, refundUrl, landed: was.sent } }
+    }
+    let used
+    try {
+      used = await this.mppUsed(asset, verified)
+    } catch {
+      return this.mppNotShown(resource, micro, was.sent, refundUrl)
+    }
+    if (used) return refuse('this authorization has already been used')
+    if (!(await this.mppHeld.mark(key, was.state, { state: 'settled', at: now }))) return refuse('this authorization is already in use')
+    await this.mppHeld.release(key)
+    return refuse(`the payment did not settle. Not delivered; nothing was charged. Transaction ${was.sent} ${String(receipt.status ?? '').toLowerCase() === '0x1' ? 'did not use this authorization' : 'reverted'}.`)
+  }
+
+  async mppLanded(hold) {
+    const v = hold.verified
+    if (!(await this.mppHeld.mark(v.replayKey, 'taken', { state: 'delivered', at: this.cfg.nowMs() }))) return this.mppRefuse(hold.resource, hold.micro, new MppError('verification-failed', 'this authorization is already in use'), hold.refundUrl ?? null)
+    return this.mppDelivered(v, hold.landed)
+  }
+
+  mppDelivered(v, hash) {
+    const response = { success: true, transaction: Hex.lower(hash), network: this.cfg.network, payer: v.payer, amount: v.authorization.value, extra: { protocol: 'mpp', method: EvmCharge.METHOD, intent: EvmCharge.INTENT, challengeId: v.challenge.id } }
+    return { ok: true, status: 200, response, headers: { 'Payment-Receipt': Receipt.header(EvmCharge.receipt(v, hash, new Date(this.cfg.nowMs()).toISOString())) } }
+  }
+
   async mppRelease(hold) {
+    if (hold.landed) {
+      await this.mppHeld.mark(hold.verified.replayKey, 'taken', { state: 'sent' })
+      return
+    }
     await this.mppHeld.release(hold.verified.replayKey)
   }
 
   async mppSettle(hold) {
     const v = hold.verified
+    if (hold.landed) return this.mppLanded(hold)
     const fail = async (detail) => {
       await this.mppRelease(hold)
-      return this.mppRefuse(hold.resource, hold.micro, new MppError('verification-failed', `the payment did not settle. Not delivered; nothing was charged. ${String(detail).slice(0, 200)}`))
+      return this.mppRefuse(hold.resource, hold.micro, new MppError('verification-failed', `the payment did not settle. Not delivered; nothing was charged. ${String(detail).slice(0, 200)}`), hold.refundUrl ?? null)
     }
     const lost = async (detail, sent = false) => {
       const tries = sent && /revert/i.test(String(detail)) ? MPP_USED_TRIES : 1
@@ -300,12 +389,16 @@ export class Server {
         } catch {
           break
         }
-        if (used) return this.mppRefuse(hold.resource, hold.micro, new MppError('verification-failed', 'this authorization has already been used'))
+        if (used) return this.mppRefuse(hold.resource, hold.micro, new MppError('verification-failed', 'this authorization has already been used'), hold.refundUrl ?? null)
       }
       return fail(detail)
     }
     let hash
     let asked = false
+    const notShown = async () => {
+      await this.mppHeld.mark(v.replayKey, 'sending', { state: 'sent' })
+      return this.mppNotShown(hold.resource, hold.micro, hash, hold.refundUrl ?? null)
+    }
     try {
       const call = EvmCharge.call(v)
       try {
@@ -317,15 +410,16 @@ export class Server {
       const sent = await this.relay.send([call], this.cfg.relaySplit())
       hash = sent[0]?.hash
       if (hash === undefined) return await lost(sent[0]?.error ?? 'the relay sent nothing', true)
+      hash = Hex.lower(hash)
+      await this.mppHeld.mark(v.replayKey, null, { sent: hash, state: 'sending', at: this.cfg.nowMs() })
       const receipt = await this.waitForReceipt(hash)
-      if (receipt === null) return await fail(`no receipt for ${hash}`)
+      if (receipt === null) return await notShown()
       if (String(receipt.status ?? '').toLowerCase() !== '0x1') return await lost(`transaction ${hash} reverted`)
-      const used = (receipt.logs ?? []).some((l) => Address.equals(l.address, call.to) && String(l.topics?.[0] ?? '').toLowerCase() === AUTHORIZATION_USED && String(l.topics?.[1] ?? '').toLowerCase() === topicOf(v.payer) && String(l.topics?.[2] ?? '').toLowerCase() === v.authorization.nonce)
-      if (!used) return await fail(`transaction ${hash} did not use this authorization`)
-      const response = { success: true, transaction: Hex.lower(hash), network: this.cfg.network, payer: v.payer, amount: v.authorization.value, extra: { protocol: 'mpp', method: EvmCharge.METHOD, intent: EvmCharge.INTENT, challengeId: v.challenge.id } }
-      return { ok: true, status: 200, response, headers: { 'Payment-Receipt': Receipt.header(EvmCharge.receipt(v, hash, new Date(this.cfg.nowMs()).toISOString())) } }
+      if (!Server.usedIn(receipt, call.to, v)) return await fail(`transaction ${hash} did not use this authorization`)
+      await this.mppHeld.mark(v.replayKey, 'sending', { state: 'delivered', at: this.cfg.nowMs() })
+      return this.mppDelivered(v, hash)
     } catch (e) {
-      return hash === undefined ? lost(message(e), asked) : fail(message(e))
+      return hash === undefined ? lost(message(e), asked) : notShown()
     }
   }
 
@@ -473,6 +567,7 @@ export class Server {
     const escrow = this.escrowOf(payload.accepted?.scheme ?? payload.scheme)
     const MISMATCH = escrow.reasons.CUMULATIVE_AMOUNT_MISMATCH
     const cid = Server.channelIdOf(payload)
+    const judgedBy = this.cfg.nowMs() + this.channels.judgeWaitMs()
     let ch = null
     if (cid !== null) {
       try {
@@ -484,10 +579,10 @@ export class Server {
     }
     if (ch !== null) {
       if (this.escrows.of(ch) !== escrow) return Server.unserved(new UnknownEscrow(this.escrows.of(ch).kind))
-      if (Channels.held(ch, this.cfg.nowMs(), true)) ch = (await this.channels.judged(cid, true)) ?? ch
-      const refundAt = this.cfg.nowMs()
-      if (Channels.refundingWaitMs(ch, refundAt) > 0) {
-        const secs = Channels.refundingRetrySecs(this.cfg, ch, refundAt)
+      const seen = await this.channels.untilAnswered(cid, judgedBy, (g, r, now, asked) => (asked && now < judgedBy ? { wait: this.channels.waiter(g) } : { r }))
+      ch = seen.r ?? ch
+      if (seen.settling !== undefined) {
+        const secs = seen.settling
         return Server.refuse(402, { error: 'refund_settling', code: 'refund_settling', message: `a refund is settling on this channel, retry in ${secs}s. Nothing was charged.`, retry_after_seconds: secs })
       }
       if (await this.channels.leaving(ch)) return Server.refuse(402, { error: 'channel_leaving', code: 'channel_leaving', message: 'this channel is withdrawing. Open a new channel. Nothing was charged.' })
@@ -525,13 +620,10 @@ export class Server {
     }
     if (match === null) return Server.refuse(402, { error: 'no_matching_requirement', message: 'the payment matches no requirement here', accepts })
     const ctx = { snapshot: null }
-    let verified = await this.verifyPayment(payload, match, ctx)
-    const judgedBy = this.cfg.nowMs() + this.channels.judgeWaitMs()
-    for (let again = 0; verified.invalidReason === Reason.REFUND_SETTLING; again++) {
-      const now = await this.channels.judged(cid)
-      const at = this.cfg.nowMs()
-      if (Channels.refundingWaitMs(now, at) > 0 || (again >= 3 && at >= judgedBy)) break
-      verified = await this.verifyPayment(payload, match, ctx)
+    let verified = await this.verifyPayment(payload, match, ctx, judgedBy)
+    while (verified.held !== undefined) {
+      await this.channels.waited(verified.held, judgedBy)
+      verified = await this.verifyPayment(payload, match, ctx, judgedBy)
     }
     if (verified.invalidReason === Reason.REFUND_SETTLING) {
       const secs = Channels.refundingRetrySecs(this.cfg, await this.channels.get(cid), this.cfg.nowMs())
@@ -552,7 +644,13 @@ export class Server {
     return { ok: true, hold: { kind, channelId: ctx.channelId, pendingId: ctx.pendingId, payload, requirement: match, resource: res, payer: verified.payer, micro } }
   }
 
-  async verifyPayment(payload, req, ctx) {
+  static movedSince(seen, current) {
+    if (seen === null || seen === undefined || current === null || current === undefined) return false
+    const at = (r, k) => (r[k] === undefined || r[k] === null ? '' : String(r[k]))
+    return at(seen, 'refundNonce') !== at(current, 'refundNonce') || at(seen, 'balance') !== at(current, 'balance') || empty(seen.handedOver) !== empty(current.handedOver)
+  }
+
+  async verifyPayment(payload, req, ctx, judgedBy = 0, tries = 0) {
     const raw = payload.payload
     const escrow = this.escrowOf(req.scheme)
     const verify = this.verifiers.get(escrow)
@@ -560,6 +658,7 @@ export class Server {
     const MISMATCH = R.CUMULATIVE_AMOUNT_MISMATCH
     let local = null
     let normMax = null
+    let seen = null
     const now = this.cfg.nowMs()
     if (Verify.isVoucherPayload(raw) || Verify.isDepositPayload(raw)) {
       try {
@@ -572,6 +671,7 @@ export class Server {
         if (bind) return Verify.invalid(bind)
         const cid = String(raw.voucher.channelId).toLowerCase()
         const snapshot = await this.store.get(cid)
+        seen = snapshot
         const charged = snapshot !== null && snapshot.chargedCumulativeAmount !== undefined && snapshot.chargedCumulativeAmount !== null ? String(snapshot.chargedCumulativeAmount) : Server.inferCharged(raw.voucher.maxClaimableAmount, req.amount)
         const expected = BigInt(charged) + Verify.uint(req.amount)
         if (Channels.pendingLive(snapshot, now)) return Verify.invalid(R.CHANNEL_BUSY)
@@ -596,50 +696,66 @@ export class Server {
     const pendingId = ctx.pendingId
     const expiresAt = now + Math.min(MAX_PENDING_TTL_MS, Math.max(MIN_PENDING_TTL_MS, Math.max(0, Math.trunc(Number(req.maxTimeoutSeconds))) * 1000))
     const isLocal = local !== null
+    let held = null
     try {
-      await this.store.update(ctx.channelId, (current) => {
-        if (Channels.refundingWaitMs(current, now) > 0) {
-          outcome = 'refunding'
-          return current
+      await this.channels.serial(ctx.channelId, (g) => {
+        const at = this.cfg.nowMs()
+        if (Channels.asked(g, at) && at < judgedBy) {
+          outcome = 'held'
+          held = this.channels.waiter(g)
+          return null
         }
-        if (Channels.pendingLive(current, now)) {
-          outcome = 'busy'
-          return current
-        }
-        const base = current !== null && current.chargedCumulativeAmount !== undefined && current.chargedCumulativeAmount !== null ? String(current.chargedCumulativeAmount) : Server.inferCharged(raw.voucher.maxClaimableAmount, req.amount)
-        const expected = BigInt(base) + Verify.uint(req.amount)
-        if (Verify.uint(raw.voucher.maxClaimableAmount) !== expected) {
-          outcome = 'stale'
-          record = current !== null ? current : Server.provisional(raw, base, now)
-          return current
-        }
-        const next = {
-          channelId: raw.voucher.channelId,
-          channelConfig: raw.channelConfig,
-          chargedCumulativeAmount: base,
-          signedMaxClaimable: normMax,
-          signature: raw.voucher.signature,
-          balance: ex.balance !== undefined && ex.balance !== null ? String(ex.balance) : '0',
-          totalClaimed: ex.totalClaimed !== undefined && ex.totalClaimed !== null ? String(ex.totalClaimed) : '0',
-          withdrawRequestedAt: ex.withdrawRequestedAt !== undefined && ex.withdrawRequestedAt !== null ? Math.trunc(Number(ex.withdrawRequestedAt)) : 0,
-          refundNonce: ex.refundNonce !== undefined && ex.refundNonce !== null ? Math.trunc(Number(ex.refundNonce)) : 0,
-        }
-        const synced = isLocal ? (current !== null && current.onchainSyncedAt !== undefined && current.onchainSyncedAt !== null ? current.onchainSyncedAt : null) : now
-        if (synced !== null) next.onchainSyncedAt = synced
-        next.lastRequestTimestamp = now
-        next.pendingRequest = { pendingId, signedMaxClaimable: normMax, expiresAt }
-        for (const [k, v] of Object.entries(current ?? {})) if (!SDK_FIELDS.includes(k)) next[k] = v
-        Object.assign(next, this.escrows.tag(escrow))
-        outcome = 'reserved'
-        record = next
-        return next
+        return this.store.update(ctx.channelId, (current) => {
+          if (Channels.refundingWaitMs(current, now) > 0) {
+            outcome = 'refunding'
+            return current
+          }
+          if (Channels.pendingLive(current, now)) {
+            outcome = 'busy'
+            return current
+          }
+          if (Server.movedSince(seen, current)) {
+            outcome = 'moved'
+            record = current
+            return current
+          }
+          const base = current !== null && current.chargedCumulativeAmount !== undefined && current.chargedCumulativeAmount !== null ? String(current.chargedCumulativeAmount) : Server.inferCharged(raw.voucher.maxClaimableAmount, req.amount)
+          const expected = BigInt(base) + Verify.uint(req.amount)
+          if (Verify.uint(raw.voucher.maxClaimableAmount) !== expected) {
+            outcome = 'stale'
+            record = current !== null ? current : Server.provisional(raw, base, now)
+            return current
+          }
+          const next = {
+            channelId: raw.voucher.channelId,
+            channelConfig: raw.channelConfig,
+            chargedCumulativeAmount: base,
+            signedMaxClaimable: normMax,
+            signature: raw.voucher.signature,
+            balance: ex.balance !== undefined && ex.balance !== null ? String(ex.balance) : '0',
+            totalClaimed: ex.totalClaimed !== undefined && ex.totalClaimed !== null ? String(ex.totalClaimed) : '0',
+            withdrawRequestedAt: ex.withdrawRequestedAt !== undefined && ex.withdrawRequestedAt !== null ? Math.trunc(Number(ex.withdrawRequestedAt)) : 0,
+            refundNonce: ex.refundNonce !== undefined && ex.refundNonce !== null ? Math.trunc(Number(ex.refundNonce)) : 0,
+          }
+          const synced = isLocal ? (current !== null && current.onchainSyncedAt !== undefined && current.onchainSyncedAt !== null ? current.onchainSyncedAt : null) : now
+          if (synced !== null) next.onchainSyncedAt = synced
+          next.lastRequestTimestamp = now
+          next.pendingRequest = { pendingId, signedMaxClaimable: normMax, expiresAt }
+          for (const [k, v] of Object.entries(current ?? {})) if (!SDK_FIELDS.includes(k)) next[k] = v
+          Object.assign(next, this.escrows.tag(escrow))
+          outcome = 'reserved'
+          record = next
+          return next
+        })
       })
     } catch {
       return Verify.invalid(R.VERIFICATION_STATE_UNAVAILABLE)
     }
+    if (outcome === 'held') return { ...Verify.invalid(Reason.REFUND_SETTLING), held }
     if (outcome === 'refunding') return Verify.invalid(Reason.REFUND_SETTLING)
     if (outcome === 'busy') return Verify.invalid(R.CHANNEL_BUSY)
-    if (outcome === 'stale') {
+    if (outcome === 'moved' && tries < MOVED_TRIES) return this.verifyPayment(payload, req, ctx, judgedBy, tries + 1)
+    if (outcome === 'stale' || outcome === 'moved') {
       ctx.snapshot = record
       return Verify.invalid(MISMATCH)
     }
@@ -681,6 +797,11 @@ export class Server {
     return c
   }
 
+  static owe(record, hold) {
+    if (!Number.isSafeInteger(hold.owedMs) || hold.owedMs <= 0) return
+    record.timeOwed = { ...(record.timeOwed !== null && typeof record.timeOwed === 'object' ? record.timeOwed : {}), [hold.pendingId]: hold.owedMs }
+  }
+
   static chargedExtra(hold, charged, extra = {}) {
     const reserved = String(hold.requirement.amount)
     return { ...extra, chargedAmount: String(charged), reservedAmount: reserved }
@@ -708,31 +829,32 @@ export class Server {
     let outcome = null
     let previous = null
     let charged = null
-    await this.store.update(hold.channelId, (current) => {
-      if (current === null) {
-        outcome = 'missing'
-        return current
-      }
-      if (current.pendingRequest?.pendingId === undefined || current.pendingRequest.pendingId !== pendingId) {
-        outcome = 'pending_mismatch'
-        return current
-      }
-      const next = BigInt(String(current.chargedCumulativeAmount)) + increment
-      if (next > cap) {
-        outcome = 'cap_exceeded'
+    await this.channels.serial(hold.channelId, () => this.store.update(hold.channelId, (current) => {
+        if (current === null) {
+          outcome = 'missing'
+          return current
+        }
+        if (current.pendingRequest?.pendingId === undefined || current.pendingRequest.pendingId !== pendingId) {
+          outcome = 'pending_mismatch'
+          return current
+        }
+        const next = BigInt(String(current.chargedCumulativeAmount)) + increment
+        if (next > cap) {
+          outcome = 'cap_exceeded'
+          delete current.pendingRequest
+          return current
+        }
+        previous = clone(current)
+        charged = next.toString()
+        current.chargedCumulativeAmount = charged
+        current.signedMaxClaimable = cap.toString()
+        current.signature = voucher.signature
+        current.lastRequestTimestamp = now
+        Server.owe(current, hold)
         delete current.pendingRequest
+        outcome = 'committed'
         return current
-      }
-      previous = clone(current)
-      charged = next.toString()
-      current.chargedCumulativeAmount = charged
-      current.signedMaxClaimable = cap.toString()
-      current.signature = voucher.signature
-      current.lastRequestTimestamp = now
-      delete current.pendingRequest
-      outcome = 'committed'
-      return current
-    })
+    }))
     if (outcome === 'missing') return this.settleFailed(hold, R.MISSING_CHANNEL)
     if (outcome === 'cap_exceeded') return this.settleFailed(hold, R.CHARGE_EXCEEDS_SIGNED_CUMULATIVE)
     if (outcome !== 'committed') return this.settleFailed(hold, R.CHANNEL_BUSY)
@@ -763,15 +885,26 @@ export class Server {
     const execution = verified.execution
     const amount = Verify.uint(raw.deposit.amount).toString()
     const sent = await this.relay.send([escrow.depositCall(raw.channelConfig, amount, execution)], this.cfg.relaySplit())
-    if (sent[0]?.hash === undefined) {
+    const hash = sent[0]?.hash
+    if (hash === undefined) {
       const short = /below break-even: deposit at least \$(\d+(?:\.\d+)?)/.exec(String(sent[0]?.error ?? ''))
       if (short !== null) return this.depositShort(hold, payload, Math.ceil(Number(short[1]) * 1e6))
-      return this.settleFailed(hold, `${R.DEPOSIT_TRANSACTION_FAILED}: ${sent[0]?.error ?? 'no hash'}`)
     }
-    const hash = sent[0].hash
-    const receipt = await this.waitForReceipt(hash)
-    if (receipt === null) return this.settleFailed(hold, `${R.DEPOSIT_TRANSACTION_FAILED}: no receipt for ${hash}`)
-    if (receipt.status === undefined || receipt.status === null || String(receipt.status).toLowerCase() !== '0x1') return this.settleFailed(hold, `${R.DEPOSIT_TRANSACTION_FAILED}: transaction reverted (receipt status reverted)`)
+    try {
+      return await this.depositSent(hold, escrow, verified, amount, increment, hash, sent[0]?.error)
+    } catch (e) {
+      if (hash === undefined) throw e
+      return this.depositUnsettled(hold, hash, message(e))
+    }
+  }
+
+  async depositSent(hold, escrow, verified, amount, increment, hash, refused) {
+    const req = hold.requirement
+    const R = escrow.reasons
+    const raw = hold.payload.payload
+    const channelId = hold.channelId
+    const receipt = hash === undefined ? null : await this.waitForReceipt(hash)
+    if (receipt !== null && (receipt.status === undefined || receipt.status === null || String(receipt.status).toLowerCase() !== '0x1')) return this.settleFailed(hold, `${R.DEPOSIT_TRANSACTION_FAILED}: transaction reverted (receipt status reverted)`)
     const ex = verified.extra
     let state = {
       channelId: raw.voucher.channelId,
@@ -780,51 +913,41 @@ export class Server {
       withdrawRequestedAt: Math.trunc(Number(ex.withdrawRequestedAt)),
       refundNonce: String(ex.refundNonce),
     }
-    const expected = BigInt(state.balance)
-    const deadline = this.cfg.nowMs() + this.cfg.stateCatchUpMs
-    let post = null
-    for (;;) {
-      try {
-        post = await this.chain.state(channelId, escrow)
-      } catch {
-        post = null
-      }
-      if (post !== null && BigInt(post.balance) >= expected) break
-      if (this.cfg.nowMs() >= deadline) {
-        post = null
-        break
-      }
-      await this.cfg.sleepMs(150)
+    const post = await this.depositOnChain(channelId, escrow, BigInt(state.balance))
+    if (receipt === null && post === null) {
+      if (hash === undefined) return this.settleFailed(hold, `${R.DEPOSIT_TRANSACTION_FAILED}: ${refused ?? 'no hash'}`)
+      return this.depositUnsettled(hold, hash, `${R.DEPOSIT_TRANSACTION_FAILED}: no receipt for ${hash}`)
     }
     if (post !== null) state = { channelId: raw.voucher.channelId, balance: post.balance, totalClaimed: post.totalClaimed, withdrawRequestedAt: post.withdrawRequestedAt, refundNonce: post.refundNonce }
     const pendingId = hold.pendingId
     const now = this.cfg.nowMs()
     let record = null
-    await this.store.update(channelId, (current) => {
-      if (current === null || current.pendingRequest?.pendingId === undefined || current.pendingRequest.pendingId !== pendingId) return current
-      const next = {
-        channelId: raw.voucher.channelId,
-        channelConfig: raw.channelConfig,
-        chargedCumulativeAmount: (BigInt(String(current.chargedCumulativeAmount)) + increment).toString(),
-        signedMaxClaimable: Verify.uint(raw.voucher.maxClaimableAmount).toString(),
-        signature: raw.voucher.signature,
-        balance: state.balance,
-        totalClaimed: state.totalClaimed,
-        withdrawRequestedAt: Math.trunc(Number(state.withdrawRequestedAt)),
-        refundNonce: Math.trunc(Number(state.refundNonce)),
-        onchainSyncedAt: now,
-        lastRequestTimestamp: now,
-      }
-      for (const [k, v] of Object.entries(current)) if (!SDK_FIELDS.includes(k)) next[k] = v
-      Object.assign(next, this.escrows.tag(escrow))
-      const heldBefore = BigInt(String(ex.balance)) > 0n || BigInt(String(ex.totalClaimed)) > 0n
-      next.depositsWePaid = (current.depositsWePaid !== undefined ? Math.trunc(Number(current.depositsWePaid)) : heldBefore ? 1 : 0) + 1
-      record = next
-      return next
-    })
-    if (record === null) return this.settleFailed(hold, `${R.CHANNEL_BUSY}: deposit ${hash} landed after the hold expired. Not charged, not delivered.`)
+    await this.channels.serial(channelId, () => this.store.update(channelId, (current) => {
+        if (current === null || current.pendingRequest?.pendingId === undefined || current.pendingRequest.pendingId !== pendingId) return current
+        const next = {
+          channelId: raw.voucher.channelId,
+          channelConfig: raw.channelConfig,
+          chargedCumulativeAmount: (BigInt(String(current.chargedCumulativeAmount)) + increment).toString(),
+          signedMaxClaimable: Verify.uint(raw.voucher.maxClaimableAmount).toString(),
+          signature: raw.voucher.signature,
+          balance: state.balance,
+          totalClaimed: state.totalClaimed,
+          withdrawRequestedAt: Math.trunc(Number(state.withdrawRequestedAt)),
+          refundNonce: Math.trunc(Number(state.refundNonce)),
+          onchainSyncedAt: now,
+          lastRequestTimestamp: now,
+        }
+        for (const [k, v] of Object.entries(current)) if (!SDK_FIELDS.includes(k)) next[k] = v
+        Object.assign(next, this.escrows.tag(escrow))
+        const heldBefore = BigInt(String(ex.balance)) > 0n || BigInt(String(ex.totalClaimed)) > 0n
+        next.depositsWePaid = (current.depositsWePaid !== undefined ? Math.trunc(Number(current.depositsWePaid)) : heldBefore ? 1 : 0) + 1
+        Server.owe(next, hold)
+        record = next
+        return next
+    }))
+    if (record === null) return this.depositLate(hold, `${R.CHANNEL_BUSY}: ${hash === undefined ? 'the deposit' : `deposit ${hash}`} landed after the hold expired`)
     const extra = Server.chargedExtra(hold, increment, { channelState: { ...state, chargedCumulativeAmount: record.chargedCumulativeAmount } })
-    const response = { success: true, transaction: hash, network: req.network, payer: escrow.payer(raw.channelConfig), amount: raw.deposit.amount, extra }
+    const response = { success: true, transaction: hash ?? '', network: req.network, payer: escrow.payer(raw.channelConfig), amount: raw.deposit.amount, extra }
     response.extra.depositAmount = response.amount
     if (String(response.amount) !== String(req.amount)) {
       response.amount = String(req.amount)
@@ -832,9 +955,40 @@ export class Server {
     return Server.delivered(response)
   }
 
+  async depositOnChain(channelId, escrow, expected) {
+    const deadline = this.cfg.nowMs() + this.cfg.stateCatchUpMs
+    const reads = Math.ceil(this.cfg.stateCatchUpMs / 150) + 1
+    for (let read = 1; ; read++) {
+      let post
+      try {
+        post = await this.chain.state(channelId, escrow)
+      } catch {
+        post = null
+      }
+      if (post !== null && BigInt(post.balance) >= expected) return post
+      if (this.cfg.nowMs() >= deadline || read >= reads) return null
+      await this.cfg.sleepMs(150)
+    }
+  }
+
+  async depositUnsettled(hold, hash, reason) {
+    return this.depositAnswer(hold, reason, `the deposit was sent (${hash}) and has not landed yet, so this call was not delivered. If it lands, your channel holds it: pay the next call with a voucher.`)
+  }
+
+  async depositLate(hold, reason) {
+    return this.depositAnswer(hold, reason, 'the deposit landed in your channel after this call was given up, so this call was not delivered and not charged. Your channel holds the deposit: pay the next call with a voucher.')
+  }
+
+  async depositAnswer(hold, reason, said) {
+    const out = await this.settleFailed(hold, reason)
+    out.body.message = said
+    return out
+  }
+
   async waitForReceipt(hash) {
     const deadline = this.cfg.nowMs() + 1000 * this.cfg.receiptTimeoutSecs
-    for (;;) {
+    const reads = Math.ceil((1000 * this.cfg.receiptTimeoutSecs) / Math.max(1, this.cfg.receiptPollMs)) + 1
+    for (let read = 1; ; read++) {
       let r
       try {
         r = await this.chain.receipt(hash)
@@ -842,7 +996,7 @@ export class Server {
         r = null
       }
       if (r !== null) return r
-      if (this.cfg.nowMs() >= deadline) return null
+      if (this.cfg.nowMs() >= deadline || read >= reads) return null
       await this.cfg.sleepMs(this.cfg.receiptPollMs)
     }
   }

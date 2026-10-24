@@ -1,7 +1,10 @@
 export const CACHE_CONTROL = 'max-age=300'
 const GUIDANCE = 'Call a tool: POST its path with the arguments as a JSON object. A tool that is not free answers 402 with what to send when it is called without it. A call that fails is not charged.'
 const ON_A_LINE = ' On a line a call uses the time it runs, whether or not it succeeds.'
-const MPP_402 = '; the 402 carries an MPP Payment challenge now, in WWW-Authenticate (method evm, intent charge); a refused MPP credential answers 402 with a fresh challenge and a problem'
+export const FAILED_CALL = `A failed call is not charged.${ON_A_LINE}`
+export const percent = (share) => (Number(share) * 100).toFixed(2).replace(/0+$/, '').replace(/\.$/, '')
+export const refundRule = (cover, pay = cover) => `Our relay pays the gas of a refund when our fee on what the buyer spent covers the gas of the deposit, of the refund and of settling any calls not yet settled, and of every further deposit and every earlier refund it paid for on that channel, with a ${cover}% margin; otherwise the buyer pays the refund's gas, with a ${pay}% margin, in USDC, quoted before the buyer signs that payment.`
+const mpp402 = (offers) => `; the 402 carries ${offers.length === 1 ? 'an MPP Payment challenge' : 'MPP Payment challenges'} now, in WWW-Authenticate (${offers.map((o) => `method ${o.method}, intent ${o.intent}`).join('; ')}); a refused MPP credential answers ${offers.every((o) => o.intent === 'charge') ? '402 ' : ''}with a fresh challenge and a problem`
 
 const isObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v)
 const text = (v) => typeof v === 'string' && v !== ''
@@ -15,16 +18,15 @@ export function price(tag) {
   return text(amount) ? { mode: 'fixed', currency: 'USD', amount } : null
 }
 
+const offered = (mpp) => isObject(mpp) && typeof mpp.amount === 'string' && /^(0|[1-9][0-9]*)$/.test(mpp.amount) && text(mpp.currency) && text(mpp.method) && text(mpp.intent)
+
 export function paymentInfo(tag, mpp = null) {
   const p = price(tag)
   if (p === null) return null
-  const charge = p.mode === 'fixed' && isObject(mpp) && typeof mpp.amount === 'string' && /^(0|[1-9][0-9]*)$/.test(mpp.amount) && text(mpp.currency) && text(mpp.method) && text(mpp.intent) ? mpp : null
-  if (charge === null) return { price: p, protocols: [{ x402: {} }] }
-  const offer = { amount: charge.amount, currency: charge.currency }
-  if (text(charge.description)) offer.description = charge.description
-  offer.intent = charge.intent
-  offer.method = charge.method
-  return { offers: [offer], price: p, protocols: [{ mpp: { method: charge.method, intent: charge.intent, currency: charge.currency } }, { x402: {} }] }
+  const given = p.mode === 'fixed' ? (Array.isArray(mpp) ? mpp : [mpp]).filter(offered) : []
+  if (!given.length) return { price: p, protocols: [{ x402: {} }] }
+  const offers = given.map((m) => ({ amount: m.amount, currency: m.currency, ...(text(m.description) ? { description: m.description } : {}), intent: m.intent, method: m.method }))
+  return { offers, price: p, protocols: [...given.map((m) => ({ mpp: { method: m.method, intent: m.intent, currency: m.currency } })), { x402: {} }] }
 }
 
 export function discovery(doc, offers = {}, { homepage = null, origin = null, mount = '' } = {}) {
@@ -41,7 +43,7 @@ export function discovery(doc, offers = {}, { homepage = null, origin = null, mo
       if (isObject(tag)) next.security = []
       if (info !== null) {
         next['x-payment-info'] = info
-        if (info.offers && isObject(op.responses) && isObject(op.responses[402]) && text(op.responses[402].description)) next.responses = { ...op.responses, 402: { ...op.responses[402], description: op.responses[402].description + MPP_402 } }
+        if (info.offers && isObject(op.responses) && isObject(op.responses[402]) && text(op.responses[402].description)) next.responses = { ...op.responses, 402: { ...op.responses[402], description: op.responses[402].description + mpp402(info.offers) } }
       }
       out[method] = next
     }

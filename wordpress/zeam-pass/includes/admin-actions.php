@@ -14,6 +14,11 @@ function zeam_pass_price_range()
     return 'From 0.000001 to ' . \ZeamPass\Pricing::MAX_USD . ', at most 6 decimals.';
 }
 
+function zeam_pass_name_rule()
+{
+    return 'A name is 2 to 32 of a-z, 0-9 and -, starting with a letter.';
+}
+
 function zeam_pass_parse_addresses($text)
 {
     $good = [];
@@ -64,7 +69,7 @@ function zeam_pass_save_settings(array $in)
     }
     $name = strtolower(trim((string) ($in['name'] ?? '')));
     if ($name !== '' && !preg_match('/^[a-z][a-z0-9-]{1,31}$/D', $name)) {
-        $errors[] = 'A name is 2 to 32 of a-z, 0-9 and -, starting with a letter.';
+        $errors[] = zeam_pass_name_rule();
     } else {
         $values['name'] = $name;
     }
@@ -254,9 +259,7 @@ function zeam_pass_admin_page()
         'settleAddress' => zeam_pass_secret_address('settle'),
         'creditAddress' => zeam_pass_secret_address('credit'),
         'feeRecipient' => zeam_pass_fee_recipient(),
-        'feeOverridden' => zeam_pass_fee_recipient() !== ZEAM_PASS_DEFAULT_FEE_RECIPIENT,
         'creditIssuer' => zeam_pass_credit_issuer(),
-        'issuerOverridden' => zeam_pass_credit_issuer() !== ZEAM_PASS_DEFAULT_CREDIT_ISSUER,
         'mcp' => rest_url(ZEAM_PASS_NS . '/mcp'),
         'api' => rest_url(ZEAM_PASS_NS . '/openapi.json'),
         'refund' => rest_url(ZEAM_PASS_NS . '/refund'),

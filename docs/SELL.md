@@ -16,7 +16,7 @@ decisions.
 ## Set up
 
 1. **Install the plugin:** Node `@zeambridge/bridge`, Python `zeambridge`, WordPress `ZEAM Bridge`: `npm install @zeambridge/bridge`
-   (Node ≥18) / `pip install zeambridge` (Python ≥3.9) / download https://zeampass.com/downloads/zeam-pass-2.0.0.zip and use
+   (Node ≥18) / `pip install zeambridge` (Python ≥3.9) / download https://zeampass.com/downloads/zeam-pass-2.1.0.zip and use
    Plugins → Add New → Upload Plugin; before you activate it, add `define('ZEAM_BRIDGE_KEY', '…');` (32 or more random
    characters) to wp-config.php and keep it.
 2. **Connect your payout wallet.** Your earnings go there. It admits no one; the gate admits the keys you list.
@@ -41,7 +41,8 @@ Your site serves your tools:
 - **MCP** at `/mcp`; payment rides in the tool call's `_meta`.
 - **HTTP** at `POST /v1/<tool>`, with the x402 or MPP headers, and `/openapi.json`.
 - **Directories** read `/openapi.json` at the root of your origin, over HTTPS. Each paid tool there carries a `402`
-  response and `x-payment-info`: its price, x402, and the MPP charge its 402 carries where it carries one. WordPress
+  response and `x-payment-info`: its price, x402, and each MPP offer its 402 carries: the charge where it carries one,
+  and on Node the session where you have turned sessions on. WordPress
   serves it at the root when the site is installed at the root of its domain and permalinks are not "Plain". On Node
   switch it on with `agents.handle('/agents', { discovery: true })`. On Python add one route that returns
   `agents.discovery(origin, "/agents")`; the Python guide shows it. Where your own app already serves
@@ -98,11 +99,11 @@ Keys: `description`, `inputSchema`, `outputSchema` (the result's JSON Schema, op
   ZEAM's 9.99% fee on it covers that gas; and of an MPP charge on the same rule (a charge whose fee does not cover it is not sent: the call is not delivered and nothing is charged). A refund has its own rule, under Refunds.
 - **Payouts.** Automatic once ZEAM's 9.99% fee on a payout covers its gas. The first payout waits for more sales: it also creates your
   split, which costs more gas.
-- **Deposits.** An agent's first call on a channel deposits at least the deposit floor: your price per call, or the gas floor where that is higher (about $0.036 at a gas price of 0.0084 gwei and ETH at $2,370; it tracks gas, and your 402 states the live figure); later
+- **Deposits.** An agent's first call on a channel deposits at least the deposit floor: your price per call, or the gas floor where that is higher (it tracks the gas price and the ETH price; your 402's `deposit` line states the live figure); later
   calls spend it, and a later top-up meets the same floor.
-- **Refunds.** The unspent balance goes back to the agent through the relay. ZEAM pays the gas when the channel's
-  fees cover the gas of its deposit, its refund and any calls not yet settled, and of every further deposit and every earlier refund ZEAM paid for on that channel, plus 15%; otherwise the agent pays the quoted gas in USDC (15% margin, priced by the
-  relay, public at `https://api.zeampass.com/relay/quote`). Nothing is claimed for you from it. `selfSend`: the
+- **Refunds.** The unspent balance goes back to the agent through the relay. Our relay pays the gas of a refund when our fee on what the buyer spent covers the gas of the deposit, of the refund and of settling any calls not yet settled, and of every further deposit and every earlier refund it paid for on that channel, with a 15% margin; otherwise the buyer pays the refund's gas, with a 15% margin, in USDC, quoted before the buyer signs that payment. Our fee is 9.99% of what the
+  buyer spent, and all of it when your payout is the fee address. The relay prices the gas, public at
+  `https://api.zeampass.com/relay/quote`. Nothing is claimed for you from it. `selfSend`: the
   agent gets a signed refund of the full balance and sends it from any wallet with ETH on Base for gas. Without you:
   the agent sends `initiateWithdraw`, then `finalizeWithdraw` after the withdrawal delay, each from the channel's
   payer wallet with ETH on Base for gas, for at most the channel's `balance` minus `totalClaimed` in the escrow.
@@ -111,11 +112,12 @@ Keys: `description`, `inputSchema`, `outputSchema` (the result's JSON Schema, op
   pass service does not send it or pay its gas.
 - **MPP clients.** For a tool priced per call, your 402 also carries an MPP `Payment` challenge (the
   `WWW-Authenticate: Payment` header) when ZEAM's fee on that one call (9.99% of it; all of it when your payout is the fee address) covers the gas of one USDC transfer plus 15%; an MPP
-  client pays that call with one USDC transfer to your split. Nothing to set up. Below that price your 402 offers
-  x402 only (and, on Node, a session where you have turned sessions on: MPP sessions, below), and so does every tool priced by use and every purchase of line time.
+  client pays that call with one USDC transfer to your split. Nothing to set up. Below that price, a tool priced per
+  call is offered x402 and, on Node where you have turned sessions on, an MPP session (MPP sessions, below), with no
+  charge. A tool priced by use and a purchase of line time are offered x402 only: no charge and no session.
   A time tool called without a line is a tool priced per call here, at its `callUSD`.
 - **Stock x402 clients.** Stock x402 clients deposit 5x your price. They work when your price is at least 1/5 of the
-  deposit floor in your 402 `deposit` line. Example: floor $0.036, price $0.0072 and up. Line time follows the same
+  deposit floor in your 402 `deposit` line. That line states the live figure. Above your price, the floor is worked from the Base gas price and the ETH price (the relay's `GET /quote` states both, as `gasPriceWei` and `ethUSD`): a deposit's gas is ceil(145,000 × `gasPriceWei` × `ethUSD` / 10^12) micro-USD, and the floor is ceil(that gas × 1.25 / 0.0999) micro-USD; a stock client needs a price of at least a fifth of it. An illustration at stated inputs, not today's floor: at a `gasPriceWei` of 6000000 (0.006 gwei) and an `ethUSD` of 2400, a deposit's gas is 2088 micro-USD and the floor is ceil(2088 × 1.25 / 0.0999) = 26127 micro-USD; a 402 that says "First call on a channel deposits at least $0.026127" works for a price of $0.005226 and up. Line time follows the same
   rule: on a new channel a stock client's first purchase must cost at least 1/5 of the floor, so it buys that many
   milliseconds or more; a pass and the Pass client deposit enough for a small purchase. Use the Pass client
   4.0.0 or later: earlier versions, formerly `@zeam-labs/x402-mcp-bridge`, read `X402_…` settings.
@@ -133,8 +135,9 @@ the escrow, and what a session earns you passes through your payee contract, bel
 - **What a buyer sees.** Your 402 for every tool priced per call carries a second MPP `Payment` challenge,
   `intent="session"` (`draft-evm-session-00`), at the same price as every other way to pay, whether or not it
   carries a charge. A tool priced by use and a purchase of line time get none.
-- **How a buyer pays.** One deposit into the escrow, which the relay sends from the buyer's signed authorization
-  (for a pass, the pass service sends it), then one signed voucher per call. A call that fails is not charged.
+- **How a buyer pays.** One deposit into the escrow, which the relay sends from the buyer's signed authorization,
+  then one signed voucher per call. A call that fails is not charged. A pass does not pay by session: it pays over
+  x402, and its balance sits in the x402 batch-settlement escrow.
 - **Your payee.** A session pays your `SessionPayee` contract, at the factory's `addressOf(your settle key's address,
   your split)`. It signs for your split, which cannot sign, and forwards all it receives to it; your split and its
   90.01% and 9.99% are as they were. Your 402 publishes the split, its salt and the settle key's address beside the
@@ -144,7 +147,7 @@ the escrow, and what a session earns you passes through your payee contract, bel
   withdraws to your wallet, by the rule under Payouts below break-even. You need no ETH.
 - **A buyer leaves.** On a buyer's close you are paid what it spent and the rest of its deposit returns to it in the
   same transaction; the relay sends that free when the channel's fees cover the gas of its open, of every top-up and
-  close request the relay sent for it, and of its close, and
+  close request the relay sent for it, and of its close, plus 15%, and
   otherwise takes the gas in USDC from what returns to the buyer, who needs no ETH. A buyer
   can also leave without you: it asks the escrow to close and withdraws after 15 minutes, and a background run
   in that time claims what it spent without waiting for the channel to be idle. A buyer you have taken off your access list can still close.
@@ -163,7 +166,7 @@ What a buyer signs and checks: [docs/AGENTS.md](../../docs/AGENTS.md), section 7
 
 - **Contact.** A key not on your list is refused with a `how` that says to ask you. Set `contact` to an `http(s)://`
   page or a `mailto:` address: Node `bridge({ contact })` or `bridge.json`, Python `Bridge(contact=...)`, WordPress
-  "Contact for access". It goes in every 402, in that refusal and in your `openapi.json`. WordPress defaults to your
+  "Contact for access". It goes in the 402 an unpaid call gets, in that refusal and in your `openapi.json`. WordPress defaults to your
   site's address and never shows your admin email.
 - **What an agent sends.** A zero-value x402 `exact` payment signed with its key, on every call (any x402 client
   makes one). It moves nothing and is never sent to the chain. Your Bridge verifies the signature in your process,

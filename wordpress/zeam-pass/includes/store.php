@@ -6,7 +6,7 @@ if (!defined('ABSPATH')) {
 
 // phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
 
-const ZEAM_PASS_DB_VERSION = '3';
+const ZEAM_PASS_DB_VERSION = '6';
 
 function zeam_pass_table($name)
 {
@@ -24,6 +24,8 @@ function zeam_pass_install_tables()
     $replay = zeam_pass_table('replay');
     $meter = zeam_pass_table('meter');
     $held = zeam_pass_table('held');
+    $tickets = zeam_pass_table('tickets');
+    $turns = zeam_pass_table('turns');
     dbDelta("CREATE TABLE {$channels} (
   id char(66) NOT NULL,
   record longtext NOT NULL,
@@ -54,8 +56,26 @@ function zeam_pass_install_tables()
     dbDelta("CREATE TABLE {$held} (
   k char(40) NOT NULL,
   expires bigint(20) unsigned NOT NULL DEFAULT 0,
+  note varchar(255) NOT NULL DEFAULT '',
   PRIMARY KEY  (k),
   KEY expires (expires)
+) {$charset};");
+    dbDelta("CREATE TABLE {$tickets} (
+  id bigint(20) unsigned NOT NULL AUTO_INCREMENT,
+  channel char(66) NOT NULL,
+  token char(32) NOT NULL,
+  until_ms bigint(20) unsigned NOT NULL DEFAULT 0,
+  turn bigint(20) unsigned NOT NULL DEFAULT 0,
+  PRIMARY KEY  (id),
+  KEY channel (channel,id),
+  KEY until_ms (until_ms)
+) {$charset};");
+    dbDelta("CREATE TABLE {$turns} (
+  channel char(66) NOT NULL,
+  turn bigint(20) unsigned NOT NULL DEFAULT 0,
+  updated bigint(20) unsigned NOT NULL DEFAULT 0,
+  PRIMARY KEY  (channel),
+  KEY updated (updated)
 ) {$charset};");
     update_option('zeam_pass_db', ZEAM_PASS_DB_VERSION, true);
 }
@@ -84,6 +104,12 @@ final class ZeamPassLock
     {
         global $wpdb;
         $wpdb->get_var($wpdb->prepare('SELECT RELEASE_LOCK(%s)', self::name($key)));
+    }
+
+    public static function used($key)
+    {
+        global $wpdb;
+        return $wpdb->get_var($wpdb->prepare('SELECT IS_USED_LOCK(%s)', self::name($key))) !== null;
     }
 
     public static function with($key, callable $fn, $wait = 10)
@@ -152,6 +178,87 @@ final class ZeamPassChannelStore implements \ZeamPass\Settlement\Store
             }
             return $next;
         });
+    }
+
+    const SERIAL_WAIT_SECS = 15;
+
+    public function serial($channelId, callable $fn)
+    {
+        return ZeamPassLock::with('serial:' . \ZeamPass\Settlement\ChannelId::key($channelId), $fn, self::SERIAL_WAIT_SECS);
+    }
+
+    public function serialBusy($channelId)
+    {
+        return ZeamPassLock::used('serial:' . \ZeamPass\Settlement\ChannelId::key($channelId));
+    }
+
+    const TURN_KEPT_MS = 600000;
+
+    public function ticket($channelId, $untilMs)
+    {
+        global $wpdb;
+        $channel = \ZeamPass\Settlement\ChannelId::key($channelId);
+        $token = bin2hex(random_bytes(16));
+        $table = zeam_pass_table('tickets');
+        $turns = zeam_pass_table('turns');
+        $taken = ZeamPassLock::with('tickets:' . $channel, function () use ($wpdb, $channel, $token, $table, $turns, $untilMs) {
+            if (!ZeamPassLock::acquire('ticket:' . $token, 0)) {
+                self::fail('hold a refund ticket');
+            }
+            $now = zeam_pass_now_ms();
+            $last = $wpdb->get_var($wpdb->prepare("SELECT GREATEST(COALESCE((SELECT turn FROM {$turns} WHERE channel = %s AND updated > %d), 0), COALESCE((SELECT MAX(turn) FROM {$table} WHERE channel = %s), 0))", $channel, $now - self::TURN_KEPT_MS, $channel));
+            $turn = $last === null ? null : (int) $last + 1;
+            if ($turn === null || $wpdb->replace($turns, ['channel' => $channel, 'turn' => $turn, 'updated' => $now], ['%s', '%d', '%d']) === false) {
+                ZeamPassLock::release('ticket:' . $token);
+                self::fail('number a refund ticket');
+            }
+            $ok = $wpdb->insert($table, ['channel' => $channel, 'token' => $token, 'until_ms' => (int) $untilMs, 'turn' => $turn], ['%s', '%s', '%d', '%d']);
+            if ($ok === false) {
+                ZeamPassLock::release('ticket:' . $token);
+                self::fail('take a refund ticket');
+            }
+            return ['id' => (int) $wpdb->insert_id, 'turn' => $turn];
+        }, self::SERIAL_WAIT_SECS);
+        $now = zeam_pass_now_ms();
+        $wpdb->query($wpdb->prepare("DELETE FROM {$table} WHERE until_ms < %d", $now - 60000));
+        $wpdb->query($wpdb->prepare("DELETE FROM {$turns} WHERE updated < %d", $now - self::TURN_KEPT_MS));
+        return ['id' => $taken['id'], 'token' => $token, 'until' => (int) $untilMs, 'turn' => $taken['turn']];
+    }
+
+    public function renew($channelId, array $ticket, $untilMs)
+    {
+        global $wpdb;
+        $wpdb->update(zeam_pass_table('tickets'), ['until_ms' => (int) $untilMs], ['id' => (int) $ticket['id']], ['%d'], ['%d']);
+    }
+
+    public function ahead($channelId, array $ticket, $nowMs)
+    {
+        global $wpdb;
+        $table = zeam_pass_table('tickets');
+        $rows = $wpdb->get_results($wpdb->prepare("SELECT id, token, until_ms FROM {$table} WHERE channel = %s AND id < %d AND until_ms > %d ORDER BY id", \ZeamPass\Settlement\ChannelId::key($channelId), (int) $ticket['id'], (int) $nowMs), ARRAY_A);
+        $out = [];
+        foreach ((array) $rows as $row) {
+            $out[] = ['id' => (int) $row['id'], 'token' => (string) $row['token'], 'until' => (int) $row['until_ms']];
+        }
+        return $out;
+    }
+
+    public function awaitTicket($channelId, array $earlier, $untilMs, $nowMs)
+    {
+        global $wpdb;
+        if (!ZeamPassLock::acquire('ticket:' . $earlier['token'], max(1, (int) ceil(($untilMs - $nowMs) / 1000)))) {
+            return false;
+        }
+        ZeamPassLock::release('ticket:' . $earlier['token']);
+        $wpdb->delete(zeam_pass_table('tickets'), ['id' => (int) $earlier['id']], ['%d']);
+        return true;
+    }
+
+    public function untick($channelId, array $ticket)
+    {
+        global $wpdb;
+        $wpdb->delete(zeam_pass_table('tickets'), ['id' => (int) $ticket['id']], ['%d']);
+        ZeamPassLock::release('ticket:' . $ticket['token']);
     }
 
     public function list()
@@ -409,5 +516,36 @@ final class ZeamPassHolds implements \ZeamPass\Settlement\Holds
     {
         global $wpdb;
         $wpdb->delete(zeam_pass_table('held'), ['k' => self::k($key)], ['%s']);
+    }
+
+    public function entry($key)
+    {
+        global $wpdb;
+        $table = zeam_pass_table('held');
+        $row = $wpdb->get_row($wpdb->prepare("SELECT expires, note FROM {$table} WHERE k = %s", self::k($key)), ARRAY_A);
+        if (!is_array($row)) {
+            return null;
+        }
+        $note = json_decode((string) $row['note'], true);
+        return array_merge(is_array($note) ? $note : [], ['until' => (int) $row['expires']]);
+    }
+
+    public function mark($key, $from, array $fields)
+    {
+        global $wpdb;
+        $k = self::k($key);
+        $table = zeam_pass_table('held');
+        return ZeamPassLock::with('held:' . $k, function () use ($wpdb, $k, $table, $from, $fields) {
+            $row = $wpdb->get_row($wpdb->prepare("SELECT note FROM {$table} WHERE k = %s", $k), ARRAY_A);
+            if (!is_array($row)) {
+                return false;
+            }
+            $note = json_decode((string) $row['note'], true);
+            $note = is_array($note) ? $note : [];
+            if ((isset($note['state']) ? $note['state'] : null) !== $from) {
+                return false;
+            }
+            return $wpdb->update($table, ['note' => wp_json_encode(array_merge($note, $fields))], ['k' => $k], ['%s'], ['%s']) !== false;
+        }) === true;
     }
 }

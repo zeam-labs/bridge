@@ -5,18 +5,20 @@ A ZEAM :: Bridge seller serves its tools on its own site:
 - **MCP** at `<base>/mcp`. `tools/list` is free. A paid call carries the x402 PaymentPayload as a JSON object in
   `_meta["x402/payment"]`, or an MPP credential (section 7).
 - **HTTP** at `POST <base>/v1/<tool>`, with the x402 `PAYMENT-SIGNATURE` header (base64 of the PaymentPayload JSON), or an MPP credential (section 7).
-  `<base>/openapi.json` lists the tools; its `info.description` states the mode: paywall, gate or both. A seller may
+  `<base>/openapi.json` lists the tools; its `info.description` states the mode: paywall, gate or both. It names MPP
+  sessions where the seller offers them. A seller may
   list only its paid tools there, and its `info.description` then says where the free ones are. Each paid
   operation carries `x-payment-info`: `price` (`{"mode":"fixed","currency":"USD","amount":"0.02"}`, or `"dynamic"` with
-  `min` and `max` where the seller states them), `protocols`, and `offers` with the MPP `evm` charge where the tool's 402 carries
-  a Payment challenge now. The 402 is what counts. A seller may serve the same document at `/openapi.json` on its
+  `min` and `max` where the seller states them), `protocols`, and `offers` with each MPP Payment challenge the tool's 402
+  carries now: the `evm` charge where it carries one, and the `evm` session where the seller offers sessions
+  (section 7), each at the `amount` its challenge states. The 402 is what counts. A seller may serve the same document at `/openapi.json` on its
   origin's root, each path written in full.
 
 An agent pays a seller with a pass (section 6), with the Pass client (section 1), or with any x402 or MPP client.
 
 Request bodies below are written short: `{channelId, issued, signature}` is a JSON object with those keys and your
 values. No sign-up, no API key. To pay: hold USDC on Base and sign. An agent needs no ETH to pay on the USDC row without Permit2, or for a refund the seller sends through the ZEAM relay.
-To pay and to get money back, the agent needs ETH on Base only where it sends a transaction itself, in five cases: the Permit2 row's one-time approval, `selfSend` (from any wallet), `initiateWithdraw` and `finalizeWithdraw` (from the channel's payer), and, with an MPP session, an open or top-up it sends itself for a credential of `type` `hash` (the USDC approval for the session escrow, then its `open` or `topUp`) and `requestClose` and `withdraw` on the session escrow without the relay (each from the channel's payer, section 7). To pass a gate: sign with your key; nothing is paid and the key needs no funds.
+To pay and to get money back, the agent needs ETH on Base only where it sends a transaction itself, in five cases: the Permit2 row's one-time approval (from the channel's payer), `selfSend` (from any wallet), `initiateWithdraw` and `finalizeWithdraw` (from the channel's payer), and, with an MPP session, an open or top-up it sends itself for a credential of `type` `hash` (the USDC approval for the session escrow, then its `open` or `topUp`) and `requestClose` and `withdraw` on the session escrow without the relay (each from the channel's payer, section 7). To pass a gate: sign with your key; nothing is paid and the key needs no funds.
 
 ## 1. Pay with your own wallet
 
@@ -34,7 +36,7 @@ It pays by MPP session, over MCP and over HTTP, only where `PASS_SESSION_ESCROW`
 
 - **Use the eip3009 row.** For USDC, the `accepts[]` row whose `extra` has `name` and `version` and no
   `assetTransferMethod` is EIP-3009: signed offline, no approval. The `"assetTransferMethod": "permit2"` row needs a
-  one-time on-chain Permit2 approval, sent by the agent and paid in its ETH.
+  one-time on-chain Permit2 approval, sent from the channel's payer and paid in its ETH.
 - **Deposit = price × multiplier.** The first call on a channel deposits; later calls spend the deposit. Multiplier:
   5 for the stock x402 SDK, set with `new BatchSettlementEvmScheme(signer, { depositPolicy: { depositMultiplier: N } })`;
   `PASS_DEPOSIT_MULTIPLIER` for the Pass client (default 40, minimum 3). The deposit must reach the floor in the 402's
@@ -43,6 +45,9 @@ It pays by MPP session, over MCP and over HTTP, only where `PASS_SESSION_ESCROW`
 - **The channel id.** Every paid answer carries it: `extra.channelState.channelId` in `PAYMENT-RESPONSE`. Line and
   refund requests name the channel by it. For a channel that never had a paid answer, compute it from the channel's
   seven fields with `computeChannelId` from `@x402/evm/batch-settlement/client`, or read it from the `ChannelCreated` event of your deposit.
+  `extra.channelState.balance` is the balance as the seller last read it on chain, at most a minute before the call: a
+  top-up sent other than through this seller (by the Pass service, or by you) shows there within a minute. The
+  escrow's `channels(channelId)` is the live figure.
 - **Two USDC rows.** `accepts` lists the USDC row without Permit2 first and again last, identical: some x402 indexers
   keep only the last row per scheme and network. Sign either. A 402 that
   corrects a payment is the one exception: the channel's state (`extra.channelState`, `extra.voucherState`) is on the
@@ -68,7 +73,9 @@ Call a tool without paying:
 `accepts[].amount` is the price per call in micro-USDC: `"20000"` is $0.02. `pricing` states it in dollars
 (`"$0.02 per call. A failed call is not charged."`). `deposit` states the minimum deposit in the words of a first call; a later top-up meets the same floor
 (`"First call on a channel deposits at least $0.03. Later calls spend it. The unspent balance is refundable."`).
-`refund` states the refund rule (section 5). A gate's amount is `"0"`.
+`refund` states the refund rule (section 5). `split` is `{receiver, split, salt}`: the seller's receiver, the 0xSplits split
+it is (`recipients`, `allocations`, `totalAllocation`, `distributionIncentive`) and its salt; the Pass service pays a
+deposit's gas only when it checks (section 6). A gate's amount is `"0"`.
 
 Each tool has its own price. `prices` in the 402 tags the tools the Bridge engine serves (a seller's own free tools outside it may be missing), or the tool called alone when the 402 carries `priceList`, which names the seller's `mcp` and `openapi` addresses, where every tag is; `tools/list` tags each tool in
 `_meta["zeam-pass/price"]`; `openapi.json` in each operation's `x-price`:
@@ -82,6 +89,7 @@ Each tool has its own price. `prices` in the 402 tags the tools the Bridge engin
 | `{"per":"call","varies":true}` | depends on the arguments; the call's 402 states it |
 | `{"usd":"0.000001","per":"ms","ms":1}` | `buy_time`: line time at $0.000001 per millisecond. Buy any number of milliseconds, and buying again adds time. `"ms":10` means the price is per 10 ms and purchases are multiples of 10 ms. A tag with `maxMs` is a seller that limits one purchase (see Line time) |
 | `{"per":"time","usd":"0.000001","ms":1,"callUSD":"0.01","callMs":10000}` | a time tool: on a line it burns line time at `usd` per `ms` milliseconds; without one, $0.01 a call for up to 10,000 ms |
+| `{"per":"time","usd":"0.000001","ms":1,"varies":true}` | a time tool whose price without a line depends on the arguments: on a line it burns line time at `usd` per `ms` milliseconds; without one, the call's 402 states its price and how long it runs |
 
 Usage: sign `accepts[].amount`, the reserve. `PAYMENT-RESPONSE` `extra` states `chargedAmount` (used) and
 `reservedAmount` on every settled call, equal when the whole reserve was charged; the rest stays in your channel. Sign the next voucher on `extra.channelState.chargedCumulativeAmount`
@@ -94,22 +102,28 @@ A seller that sells time lists `buy_time` and `line`, tags each time tool
 402's `time` line.
 
 1. **Buy.** Call `buy_time` `{"ms": N}` and pay for N milliseconds at the tagged rate (its tag is `per: "ms"`). The time goes to the
-   paying channel with the payment: time that cannot be recorded is not charged (500 `tool_failed`, as for any tool), and a payment
-   that does not settle credits no time. The answer states `boughtMs` and `msRemaining`. With no `ms` the seller's
+   paying channel with the payment, written in the same record as the charge: time that cannot be recorded is not charged
+   (402 `settle_failed`, as for any payment that does not settle), and a payment that does not settle credits no time. The answer states `boughtMs` and `msRemaining`. With no `ms` the seller's
    default amount is bought; the `buy_time` schema states it. A seller that limits one purchase tags `maxMs` and
    refuses more with 400 `invalid_arguments`; most set none.
 2. **Open a line.** `POST <base>/line` `{"op":"open","channelId":"0x…"}` answers `{nonce, sign}`. Sign `sign` (EIP-191)
    with the channel's payer key (or `payerAuthorizer`), then `POST` `{"op":"prove","channelId":"0x…","nonce":"…","signature":"0x…"}`:
-   the answer carries `credential`. A nonce is one attempt, valid 300 s. MCP: the free `line` tool, same arguments.
+   the answer carries `credential` and `metering`. A nonce is one attempt, valid 300 s. MCP: the free `line` tool, same arguments.
+   A line opened on a channel with no other line open switches the channel's meter on. A line opened while another
+   line is open on the channel leaves the meter as it is: if an agent switched it off, `metering` is `false` and calls
+   answer 402 `meter_off` until someone sends `{"op":"on"}`.
 3. **Call.** Send the credential as the `x-line` header (MCP: `_meta["zeam-pass/line"]`, or `x-line` on the MCP
    request). No payment per call. The answer carries `x-pass-ms-remaining` and `x-pass-ms-elapsed` (MCP:
    `_meta["zeam-pass/meter"]`), a failed call's answer too. With calls at once, a JSON-RPC batch included, each answer carries its own
    reading, which can differ from what the line holds once they all finish; `POST <base>/line {"op":"status"}` with the credential is exact once no call is running. Read while a call or a
    subscription runs, it shows the time burned up to that read, and the call goes on burning until it ends. The burn
-   starts once the line has recorded the call, so a mid-call reading can come out higher than the call's share of the
-   final figure by the time those records took: up to a few tens of milliseconds (about 25 ms seen), more on a slow disk
-   or a seller on more than one process, as every WordPress seller is. Billing is unaffected: concurrent calls burn one
-   clock and the final status is exact.
+   starts once the line has recorded the call. On a seller on one process the time left a reading gives
+   (`x-pass-ms-remaining`) is never less than a later reading's, a reading right after a hang-up or a cancel
+   included: the time left never goes back up, and the time burned never goes down. On a seller on more than one
+   process, as every WordPress seller is, a reading taken while a call runs or ends can come out higher than the
+   call's share of the final figure by the time the line took to record the call's start and its end: up to a few
+   tens of milliseconds, more on a slow disk. Billing is unaffected: concurrent calls burn one clock and the final
+   status is exact.
    To stop a call over MCP, send `notifications/cancelled` with its `requestId` and the line credential the call carried (`params._meta["zeam-pass/line"]` or the `x-line` header), or on the `Mcp-Session-Id` the call was sent on (the answer to `initialize` carries one): the line is billed to that moment, nothing after; a cancel with neither is answered 202 and stops nothing.
    Hanging up does the same on a Node seller and on a Python seller served over ASGI. A WordPress seller, and a Python seller served over WSGI, cannot see a hang-up: there a call you hang up on burns until it returns, so cancel it first.
    A call cut for time, or one whose line ran out while it ran, whether or not the tool failed, answers `out_of_time` with `msRemaining` in the body and carries no meter reading. A seller's
@@ -119,7 +133,7 @@ A seller that sells time lists `buy_time` and `line`, tags each time tool
    `maxCalls` (1..1000, default 1000) may be live on a line at once; the next gets 429 `too_many_calls` with `msRemaining`. A seller may also
    burn a fixed idle time after each call; the line's status shows what was burned. A call stops when the
    time runs out: 402 `out_of_time`, its time spent.
-5. **Meter.** `{"op":"off"}`: no new calls on the line; a running call burns to its end; a call sent meanwhile gets
+5. **Meter.** The meter is the channel's, not one line's: `{"op":"off"}` or `{"op":"on"}` sent with any line's credential switches it for every line open on that channel (opening another line does not switch it back on), and `{"op":"close"}` ends only the line whose credential it carries. `{"op":"off"}`: no new calls on any line of the channel; a running call burns to its end; a call sent meanwhile gets
    402 `meter_off` with `msRemaining`, the time the line still holds. `{"op":"on"}`, `{"op":"status"}`,
    `{"op":"close"}`, each with the credential as `"credential"` in the body or as the `x-line` header. Over HTTP the line is `POST <base>/line`, or `POST <base>/v1/line`
    with the same body; both answer a failed step with its status and `{op, code, why}`, `op` being `line_failed`. `/v1/line` is the
@@ -127,7 +141,9 @@ A seller that sells time lists `buy_time` and `line`, tags each time tool
    `400 invalid_arguments` there. While a refund is settling on the channel, `{"op":"on"}` and a call on the line each
    answer 402 `refund_settling` with `retry_after_seconds`; nothing is charged. Retry after it. While a refund asked for
    on the channel is being worked out, `{"op":"on"}` answers 402 `refund_pending` with `retry_after_seconds` and changes
-   nothing (section 5).
+   nothing (section 5). A `prove` that would open the channel's first line, and so switch its meter on, is answered the
+   same way, 402 `refund_settling` or `refund_pending`, and opens nothing: send `open` again after `retry_after_seconds`.
+   A line opened beside an open line is let in, its meter left as it is.
 6. **Leave.** A refund (section 5) returns the unburned time with the balance (`timeReturnedMs`) and closes the line.
 
 Without a line a time tool is a paid call at `callUSD`, for up to `callMs`; a call past it: 402 `out_of_time`, not
@@ -198,7 +214,7 @@ def call(url, body, grant=None):
 ```
 
 **Getting admitted.** A key not on the list gets `403 refused` with a `how`. The seller's `contact` (an `http(s)://`
-page or a `mailto:` address), when set, is in that answer, in every 402 and in `openapi.json` `info.contact`. A
+page or a `mailto:` address), when set, is in that answer, in the 402 an unpaid call gets and in `openapi.json` `info.contact`. A
 WordPress seller's default is its site address. Send the seller your key's address, or ask for a grant.
 
 **Grants.** A listed key can admit your key with a grant: your key's address, one tool or all (`*`), an end time.
@@ -263,10 +279,10 @@ when it was sent, or `op: "refund_signed"` for `selfSend` (section 5).
 
 | code | status | meaning | next step |
 |---|---|---|---|
-| `invalid_arguments` | 400 | the arguments do not match the tool's `inputSchema`, or the body is not JSON (ZEAM Prism answers `invalid_json` for a body that is not JSON); nothing held. Over HTTP an unpaid call with no arguments gets the 402 instead; over MCP a seller may answer this | fix the arguments from `tools/list` |
+| `invalid_arguments` | 400 | the arguments do not match the tool's `inputSchema`, or the body is not JSON (ZEAM Prism answers `invalid_json` for a body that is not JSON); nothing held. A body that is JSON but not an object, or MCP `arguments` that is neither an object nor `null` (`[]`, a string, a number), gets it with the message `the arguments must be an object`, before any payment terms. `POST <base>/v1/line`, the line tool's route, answers it for an `op` that is not in the tool's schema, where `POST <base>/line` answers `bad_request`. Over HTTP an unpaid call with no arguments gets the 402 instead; over MCP a seller may answer this | fix the arguments from `tools/list` |
 | `unknown_tool` | 404 | no tool by that name; the answer lists the tools or says where the catalog is (over MCP, some sellers answer JSON-RPC -32602 instead) | use a name from `tools/list` |
 | an x402 code ending `channel_busy`, with `code: "payment_invalid"` | 402 | another call on this channel is being paid for right now; its `accepts` carry no channel state. A call that arrives while another call or a deposit holds the channel gets this answer whatever amount it signed. Two calls that arrive in the same instant, before either holds it, are different: the later one may get a cumulative amount mismatch whose state does not yet count the other | send the same call again in a moment; if it answers a cumulative amount mismatch, re-sign from that answer's `accepts`. Sending one paid call at a time per channel avoids both |
-| `tool_failed` | 500 | the tool failed after the hold (for `buy_time`: the time could not be recorded), its result is not valid JSON, or a usage tool reported no units; hold released, nothing charged per call (on a line the call has used the time it ran, and the answer carries the meter reading, over HTTP with `msRemaining` and `elapsedMs` in the body too). Over HTTP the body carries every field the failure carries over MCP in `structuredContent`; a tool may name its own `error` and, for a refusal that is yours, a status of 400 to 599 (never 402), with `Retry-After` when it gives `retry_after_seconds` | retry later, or with other arguments; for a refusal that is yours, do what its `message` says |
+| `tool_failed` | 500 | the tool failed after the hold, its result is not valid JSON, or a usage tool reported no units; hold released, nothing charged per call (on a line the call has used the time it ran, and the answer carries the meter reading, over HTTP with `msRemaining` and `elapsedMs` in the body too). Over HTTP the body carries every field the failure carries over MCP in `structuredContent`; a tool may name its own `error` and, for a refusal that is yours, a status of 400 to 599 (never 402), with `Retry-After` when it gives `retry_after_seconds` | retry later, or with other arguments; for a refusal that is yours, do what its `message` says |
 | `not_found` | 404 | (WordPress) no published post with that id; nothing charged | find an id with `search_posts` |
 | `internal_error` | 500 | the seller's server failed | retry later |
 | `price_invalid` | 500 | the seller cannot price this call; nothing held | retry later, or with other arguments |
@@ -280,7 +296,7 @@ when it was sent, or `op: "refund_signed"` for `selfSend` (section 5).
 | `free_limit` | 429 | over the free tool's calls an hour per address (callers the seller sees no address for share one count); `retry_after_seconds` | retry after `retry_after_seconds` |
 | `body_too_large` | 413 | (a Python seller) the body is over 1 MB. The Pass API at api.zeampass.com answers the same with 413, `error` `body_too_large` and the sentence in `message` | send a smaller body |
 | `payload_too_large` | 413 | (ZEAM Prism) the body is too large | send a smaller body |
-| `not_ready` | 503 | (WordPress, Python) the seller's setup is incomplete | retry later |
+| `not_ready` | 503 | (WordPress, Python) the seller's setup is incomplete. On WordPress every tool call answers it, `POST <base>/v1/line` among them, but not `POST <base>/line`; on Python a paid or gated call does, and neither line route. The refund route of either answers it as `code` | retry later |
 | `payment_unavailable` | 503 | the payment check or settlement failed; nothing charged | retry |
 | (none, with `accepts`) | 402 | payment required; for a gate, a signed proof of key | pay one row of `accepts` (section 1), or sign the zero-value row (section 3) |
 | `bad_payment_header` | 400 | the payment does not decode, or its `voucher.maxClaimableAmount` is not an unsigned integer | send base64 of the PaymentPayload JSON (MCP: the object), the amount as a base-10 or 0x string or a whole JSON number up to 9007199254740991 |
@@ -290,10 +306,15 @@ when it was sent, or `op: "refund_signed"` for `selfSend` (section 5).
 | `price_changed` | 402 | a deposit made on a row that is for less than this call's price by 2 micro-USD or more, such as a cheaper tool's row. Any other payment for less, a deposit on a row exactly 1 micro-USD under among them, answers `no_matching_requirement` or `payment_invalid` | pay the `accepts` quote |
 | `funding_requires_open_fee` | 402 | the deposit is signed on a row of this call's `accepts` and is under the floor, or gas rose past the floor the 402 stated before the deposit was sent; nothing charged | deposit at least `neededMicroUSD` |
 | `channel_leaving` | 402; 409 on the line route | the channel is withdrawing | open a new channel |
-| `refund_settling` | 402 | a refund is settling on this channel; nothing charged. A paid call (voucher or deposit), a line's `{"op":"on"}` and a call on a line each get it; `retry_after_seconds` is when to ask again | retry after `retry_after_seconds` |
-| `refund_pending` | 402 | (line route) `{"op":"on"}` while a refund asked for on the channel is being worked out: its proof verified and the chain shows a balance, so the line's meter is off until the refund is answered; nothing changed; `retry_after_seconds` | retry after `retry_after_seconds`. Once the refund is refused, `{"op":"on"}` rides the line again; once it is sent, the line is closed |
+| `unknown_escrow` | 402; 409 on the refund and line routes | (Node) the channel's record names an escrow other than the one this payment is for, or one this seller does not serve; nothing charged or sent | pay on a new channel from this call's `accepts`; this seller does not refund that channel or open a line on it |
+| `refund_settling` | 402 | a refund is settling on this channel; nothing charged. A paid call (voucher or deposit), a line's `{"op":"on"}`, a `prove` that would open the channel's first line (nothing opened) and a call on a line each get it; `retry_after_seconds` is when to ask again | retry after `retry_after_seconds` |
+| `refund_pending` | 402 | (line route) `{"op":"on"}`, or a `prove` that would open the channel's first line, while a refund asked for on the channel is being worked out: its proof verified and the chain shows a balance, so the line's meter is off until the refund is answered; nothing changed; `retry_after_seconds` | retry after `retry_after_seconds`. Once the refund is refused, `{"op":"on"}` rides the line again; once it is sent, the line is closed |
 | `refund_outstanding` | 402 | the channel has an unsent signed refund | send it (the transaction in the answer), or open a new channel |
-| `settle_failed` | 402 | the payment did not settle; not delivered, nothing charged | call again with a new payment |
+| `settle_failed` | 402 | the payment did not settle; not delivered. Nothing was charged, unless `message` says your deposit was sent and has not landed, or landed after the call was given up: a deposit that lands is in your channel | when `message` names a deposit, pay the next call with a voucher once your channel holds it; otherwise call again with a new payment |
+| `sent_not_shown` | 402 | (MPP, `verification-failed`) an MPP charge, or a session's open, top-up or close, was sent and the seller's node does not show it yet; `txHash` (a session's answer has none while the relay has not handed the seller a transaction), `retry_after_seconds` and a `Retry-After` header. The call was not delivered and nothing more is sent for it | send the same credential again after `retry_after_seconds`: it is taken once. Once a charge's transfer shows, the call is delivered, once; once the chain shows it reverted with the authorization unused, the answer says nothing was charged and the same credential can pay again |
+| `gas_payment_needed` | 402 | (MPP session close, `verification-failed`) the channel's fees (its spend times the fee address's share of the seller's split) do not cover the gas of its open, of every top-up and close request the relay sent for it, and of its close, plus 15%; nothing sent. The answer is the close's gas quote: `gasMicroUSD` (L1 fee and 15% margin included, `quotedBy` `relay` or `engine`), `leftMicroUSD`, `returnedMicroUSD`, `feeMicroUSD`, `coverMicroUSD`, the gas figures, `payTo`, `authorization` and `sign`. With a sentence before the quote in `detail`, a `gasPayment` you sent was refused and this is a new quote; with `requoted: true` and `sendCostMicroUSD`, your payment is under what sending costs | sign `sign` (EIP-3009 `TransferWithAuthorization`) and send the close again, the same voucher, with `"gasPayment": {"authorization": {…}, "signature": "0x…"}` in its payload, `authorization` the answer's as it came, at least 30 s before its `validBefore` (5 minutes after the quote): one transaction closes the channel and takes the gas from what returns. Or leave without the seller (section 7, Leaving) |
+| `nothing_to_return` | 402 | (MPP session close, `verification-failed`) the close's gas is not less than what the close returns, and the channel's fees do not cover it; `returnedMicroUSD` 0; nothing sent | keep paying calls with vouchers from the deposit, or leave at your own gas from the channel's payer: `requestClose(channelId)` on the escrow, then `withdraw(channelId)` after its 15-minute grace period (section 7, Leaving, way 3) |
+| `gas_unpriced` | 402 | (MPP session close, `verification-failed`) the channel's fees do not cover the close's gas, and the gas cannot be priced now; `retry_after_seconds` (60) and a `Retry-After` header, `leftMicroUSD`; nothing sent | send the close again after `retry_after_seconds`, or leave without the seller (section 7, Leaving) |
 | `no_payment` | 402 | (gate) no `PAYMENT-SIGNATURE`, or not base64 JSON of an x402 payment | sign the zero-amount requirement with your key |
 | `bad_payment` | 402 | (gate) no authorization in the payment | send an `exact` EIP-3009 payment |
 | `invalid_payment` | 402 | (gate) the signature, amount, recipient or time window is wrong; `message` names it | re-sign as given: value 0, its `payTo`, a future `validBefore` |
@@ -312,20 +333,33 @@ when it was sent, or `op: "refund_signed"` for `selfSend` (section 5).
 | `not_the_payer` | 403 | (refund and line routes) the proof is not signed by the channel's payer | sign with the payer's key |
 | `line_unavailable` | 503 | (line route) the line could not be read, or its channel could not be held for an `{"op":"on"}`, right now; nothing changed | send the same request again |
 | `request_open` | 409 | (refund route) a paid call is open on the channel, or a call is running on the channel's line | retry after `retry_after_seconds` |
-| `refund_settling` | 409 | (refund route) a refund is already settling on the channel: it is being sent now; nothing more is sent. A request that would be refused is never told this: it gets its own answer | retry after `retry_after_seconds` |
-| `nothing_to_return` | 409 | (refund route) the balance is 0, or refund gas ≥ balance; `returnedMicroUSD` 0 | with a balance of 0 there is nothing to do. Otherwise keep spending the balance, or send `selfSend` for a signed refund of all of it at your own gas. If the channel has a line and held a balance, the request switched the line's meter off: `POST <base>/line {"op":"on","credential":"<yours>"}` to ride it again |
+| `refund_settling` | 409 | (refund route) a refund is already settling on the channel: it is being sent now; nothing more is sent. A refund request is told this when it arrives, or its own judgment ends refused, while another refund on the channel is being sent, or is being checked before it is sent and is then handed to the relay (or is still being checked after `refundJudgeWaitMs`, 5 s by default); `nothing_to_return` instead if the chain shows the channel empty. If that check ends refused, or no other refund on the channel is being checked or sent, a refused request gets its own answer | retry after `retry_after_seconds` |
+| `nothing_to_return` | 409 | (refund route) the balance is 0, or refund gas ≥ balance; `returnedMicroUSD` 0 | with a balance of 0 there is nothing to do. Otherwise keep spending the balance, or send `selfSend` for a signed refund of all of it, which you send from any wallet at your own gas. If the channel has a line and held a balance, the request switched the line's meter off: `POST <base>/line {"op":"on","credential":"<yours>"}` to ride it again |
 | `chain_unreadable` | 409 | (refund route) the chain read failed | retry after `retry_after_seconds` |
 | `gas_unpriced` | 503 | (refund route) refund gas cannot be priced, or the relay is unreachable | retry after `retry_after_seconds`, or send `"selfSend": true` |
 | `refund_unavailable` | 503 | (refund route) the seller's refund handler failed, it could not hold the channel for the refund, or more refund requests on the channel are already being worked out than the seller takes at once (four); nothing sent; `retry_after_seconds` | retry after `retry_after_seconds` |
 | `refund_error` | 409 | (refund route) the refund could not be built, sent or recorded; nothing sent. Always `retry_after_seconds`; `leftMicroUSD` where the balance was read, and the gas figures only where the relay did not send | retry after `retry_after_seconds` |
-| `gas_payment_needed` | 409 | (refund route, `op: "refund_quote"`) channel fees (`feeMicroUSD`) < the gas of its deposit, its refund and any calls not yet settled, and of every further deposit and every earlier refund ZEAM paid for on that channel, plus 15% (`coverMicroUSD`); `gasMicroUSD` is the quoted refund gas, L1 fee included (`l1FeeWei`), 15% margin, priced by the relay (`quotedBy: "relay"`) or the seller (`quotedBy: "engine"`). With `requoted: true` and `sendCostMicroUSD`: your payment is under the send cost (the cost rose, or you signed less than the quote); nothing sent; a new quote | sign `sign` (EIP-712) and POST again with a new `issued` and `signature`, plus `gasPayment: {authorization, signature}`, within 5 minutes. The request switched the line's meter off, if the channel has a line: `POST <base>/line {"op":"on","credential":"<yours>"}` to ride it again |
+| `gas_payment_needed` | 409 | (refund route, `op: "refund_quote"`) channel fees (`feeMicroUSD`) < `coverMicroUSD`, the gas the rule in section 5 counts, with its 15% margin; `gasMicroUSD` is the quoted refund gas, L1 fee included (`l1FeeWei`), 15% margin, priced by the relay (`quotedBy: "relay"`) or the seller (`quotedBy: "engine"`). With `requoted: true` and `sendCostMicroUSD`: your payment is under the send cost (the cost rose, or you signed less than the quote); nothing sent; a new quote | sign `sign` (EIP-712) and POST again with a new `issued` and `signature`, plus `gasPayment: {authorization, signature}`, within 5 minutes. The request switched the line's meter off, if the channel has a line: `POST <base>/line {"op":"on","credential":"<yours>"}` to ride it again |
 
 MCP transport errors are JSON-RPC: `-32700` the body is not JSON, `-32600` not a JSON-RPC request, `-32601` no such
 method, `-32602` bad `params`, `-32603` the server failed.
 
 ## 5. Refunds
 
-`POST <base>/refund` (the 402's `refund` line names the URL) with `{channelId, issued, signature}`. `signature` is
+**With the Pass client, at any ZEAM :: Bridge seller:** run it once with `--refund`, with the same `PASS_PRIVATE_KEY`,
+`PASS_SALT` and `PASS_STATE_DIR` it paid with, and `PASS_MCP_URL` set to that seller. It needs Node.js 20 or later:
+
+    export PASS_PRIVATE_KEY=0x…
+    PASS_MCP_URL=https://seller.example/agents/mcp npx -y @zeampass/client --refund
+
+It asks only that seller, for the channel this key and `PASS_SALT` pay it, at the refund route the seller names; it
+signs the proof below and, when the seller quotes refund gas, pays it in USDC out of what returns. When it finds no
+channel of yours at that seller, `--refund --channel <id>` asks for that channel by its id (`extra.channelState.channelId`,
+section 1). `--refund --self-send` asks for a signed refund of all of it (`selfSend`) and sends it from your key when the
+key holds ETH on Base, and otherwise prints it for any wallet to send. `--refund` also closes the MPP session channels
+it opened at that seller (section 7).
+
+Without the Pass client: `POST <base>/refund` (the 402's `refund` line names the URL) with `{channelId, issued, signature}`. `signature` is
 the payer's (or `payerAuthorizer`'s) EIP-191 signature of:
 
 ```
@@ -346,9 +380,9 @@ up to a few seconds. The meter stays off whatever the answer is, a gas quote inc
 A request refused before the amount is worked out leaves the meter as it was: `nothing_to_return` on a
 channel that holds nothing.
 
-The rule: ZEAM pays the gas when the channel's fees (its spend times the fee address's share of the seller's split:
+**The rule.** Our relay pays the gas of a refund when our fee on what the buyer spent covers the gas of the deposit, of the refund and of settling any calls not yet settled, and of every further deposit and every earlier refund it paid for on that channel, with a 15% margin; otherwise the buyer pays the refund's gas, with a 15% margin, in USDC, quoted before the buyer signs that payment. Our fee is the channel's spend times the fee address's share of the seller's split:
 9.99% for most sellers, who keep 90.01%; 100% for one whose split pays the fee address everything, like Prism; the
-402's `refund` names it) ≥ `coverMicroUSD`: the gas of its deposit, its refund and any calls not yet settled, and of every further deposit into the channel and every earlier refund of it that ZEAM paid for, plus 15%, at the current gas and ETH price. The figure in the
+402's `refund` names it. In the answers, `feeMicroUSD` is that fee and `coverMicroUSD` that gas with its 15% margin, at the current gas and ETH price. The figure in the
 402's `refund` line and `coverMicroUSD` already have the 15% in them; do not add it again. `feeMicroUSD`
 rounds down, `coverMicroUSD` rounds up; free when `feeMicroUSD >= coverMicroUSD`. The seller, the relay and the 402
 apply the same comparison. An unsettled call rides the refund as a claim and adds its gas to both.
@@ -371,7 +405,20 @@ apply the same comparison. An unsettled call rides the refund as a claim and add
   `totalClaimed` the escrow's `channels(channelId)` returns (more reverts), then `finalizeWithdraw` after the
   channel's `withdrawDelay` (it pays the payer), each with ETH on Base for gas.
 
-While a refund is settling on a channel, a paid call, a line's `{"op":"on"}` and a call on the line each get 402 `refund_settling` with `retry_after_seconds`; nothing is charged. Retry after it.
+While a refund is settling on a channel, a paid call, a line's `{"op":"on"}` and a call on the line each get 402 `refund_settling` with `retry_after_seconds`; nothing is charged. Retry after it. On a WordPress seller every request waits for a free PHP worker, so a paid call sent during a burst of refund requests is answered only after the burst; if the refund was sent by then, the paid call is answered as the channel then stands: 402 `payment_invalid` with the channel's state after the refund (`channelState`), nothing charged. Deposit again to call on.
+
+**Turns.** Every answer the refund route gives for a channel carries its `turn`, in the body and in a `Zeam-Refund-Turn`
+header: the place the seller gave the request on that channel when it reached the seller, before anything in it was
+checked. The seller judges a channel's requests in turn order, and each answer is the channel as it stood at that
+request's turn. A request whose turn comes before a refund's is answered as the channel was before that refund, with
+a gas quote, kept or fresh, that counts the money the refund then returns, say. A request whose turn comes after it is told
+`refund_settling` while that refund is being sent, and `nothing_to_return` once it has landed. Turn order is the order
+requests reach the seller, which is not always the order they were sent: two requests sent a few ms apart can arrive
+in either order (a WordPress request takes its turn once a PHP worker is free and WordPress has loaded). To know the
+order a seller judged in, compare turns, not send times. A channel's turns count up from 1; the count starts again at 1
+after ten minutes with no refund request on the channel, and when a Node or Python seller restarts. An answer given
+before the request reached its channel carries no turn: `invalid_json`, `invalid_request`, `not_a_paywall`,
+`not_ready`, and a 503 `refund_unavailable` because the seller's refund handler failed.
 
 **The quote.** The seller hands its signed refund to the relay. The relay prices it: the gas the refund uses (`eth_simulateV1` from its
 sender; `eth_estimateGas` where the RPC lacks it), + the gas a payment adds (median of its paid refunds), + Base's L1 data fee, at the current gas and
@@ -419,7 +466,7 @@ and your refund is then quoted again. Sign it only to post it, over HTTPS.
 
 A pass is an allowance at one ZEAM :: Bridge seller, for another agent or a person's chatbot: a channel with your wallet as payer, a
 pass key as spender, the seller as receiver. It pays that seller up to what you load, or returns the balance to your
-wallet. The page https://zeampass.com/pass runs these steps in a browser; a seller links to it with
+wallet. The page https://zeampass.com/ runs these steps in a browser; a seller links to it with
 `?seller=<its MCP URL>`. The buyer API is `https://api.zeampass.com/pass` (every path below is under it); connector
 links are `https://api.zeampass.com/c/<token>/mcp`.
 
@@ -428,7 +475,7 @@ links are `https://api.zeampass.com/c/<token>/mcp`.
    `admission`, for a seller with an access list; `contact`, when set) and its prices: `pricing` (a sentence: the
    per-call range, tools priced by use, line time), `priceMicro` and `priceTool` (its cheapest per-call tool, a time tool counted at its `callUSD`; never `buy_time`), `prices` (each tool's
    tag: `{tool, usd, per}` with `per` `call`; `{tool, usd, per, upTo}` with `per` `unit`; `{tool, per, ...}` with `per`
-   `time`; `{tool, free}` with `free` true; or `{tool, varies}` with `varies` true) and `time` (`{tool, usd, ms}`: `usd` per `ms` milliseconds, plus `maxMs` if the seller limits one purchase, when it sells line time). It creates
+   `time`, with `varies` true and no `callUSD` when its price without a line depends on the arguments; `{tool, free}` with `free` true; or `{tool, varies}` with `varies` true), `time` (`{tool, usd, ms}`: `usd` per `ms` milliseconds, plus `maxMs` if the seller limits one purchase, when it sells line time), `deposit` (the seller's sentence on its least first deposit) and `minimumUSD` (that least deposit in dollars: the seller's live break-even floor). It creates
    nothing.
 2. Derive the pass key from your wallet. Sign this text with the wallet (EIP-191, personal_sign), with the seller's
    receiver address from the quote, checksummed, in place of `<receiver>`:
@@ -459,7 +506,9 @@ links are `https://api.zeampass.com/c/<token>/mcp`.
 4. `POST /c/<token>/prepare {"payer": "<your wallet>", "amount": "1.00", "salt": "<the pass's salt>"}` answers
    `typedData`: an EIP-3009 `ReceiveWithAuthorization` of `amount` from your wallet. Sign it (no gas), then
    `POST /c/<token>/deposit` with the prepare answer plus `signature`. The service sends the deposit and pays the
-   gas, only into a channel to this pass's seller, in its asset. `503 deposit_not_sent` with `retry_after_seconds`:
+   gas, only into a channel to this pass's seller, in its asset. Every deposit, a top-up too, must reach the seller's
+   floor, the quote's `minimumUSD` read again at the deposit ($0.01 where the seller states none): under it, `400`
+   with the floor in `error`, and nothing moved. `503 deposit_not_sent` with `retry_after_seconds`:
    nothing moved; send the same request again. `502 deposit_unconfirmed` with `transaction`: it was sent; do not send it
    again, read `/status`. `502 deposit_reverted` with `transaction`: the chain turned it down, nothing moved; prepare
    again. `502 deposit_failed`: not sent, nothing moved. `400 receiver_not_zeam_split` with `receiver`: the service
@@ -467,10 +516,17 @@ links are `https://api.zeampass.com/c/<token>/mcp`.
    deposits from one address, or to one pass, this hour. `501`: this service has no gas key and sends no deposit. Every
    other refusal says what was wrong in a sentence, in `error`; nothing was sent.
 5. `POST /c/<token>/link {"payer": "<your wallet>", "salt": "<the pass's salt>"}` checks the channel on chain. The `connectorUrl` then
-   pays that seller. `GET /c/<token>/status`: `loaded` (all deposits; `funded` is the same figure), `spent`,
+   pays that seller. A pass whose deposit landed is funded whether or not `/link` ran: a deposit the service sends
+   links it, and a channel it was prepared or sent a deposit for that holds a balance on chain links it the first time
+   the pass is asked for (`/status`, the refund, the connector, `/issue`). If the chain cannot be read then, the answer is
+   `503 channel_not_read` with `retry_after_seconds`. `GET /c/<token>/status`: `loaded` (all deposits; `funded` is the same figure), `spent`,
    `returned` (back to your wallet, net of gas), `gas_paid` (quoted refund gas you paid in USDC) and `remaining`,
    with each `transaction` in `returns` (`usd` net to your wallet, `gas_usd` paid out of it).
-   `loaded = spent + returned + gas_paid + remaining`. The connector's free `pass_balance` tool (`loaded_usd`,
+   `loaded = spent + returned + gas_paid + remaining`. `sent_home` is true once the pass is sent home (step 6): its
+   refund was sent (`refunded` true) or its withdrawal was handed to you (`refunded` false, `withdrawal.handedAt`
+   set). Until you broadcast that withdrawal its money stays in `remaining`; `withdrawal.readyAt` is when its
+   `finalize` is due, once the service has seen your `withdraw` on chain (`/refund` asked again); once the escrow
+   pays the `finalize`, the money shows in `returned`. The connector's free `pass_balance` tool (`loaded_usd`,
    `spent_usd`, `returned_usd`, `gas_paid_usd`, `remaining_usd`) and the pass page show the same five.
 6. `POST /c/<token>/refund` returns the balance: it calls the seller's refund route with the channel config, so a
    pass with no calls is refunded too.
@@ -491,8 +547,9 @@ links are `https://api.zeampass.com/c/<token>/mcp`.
      `502 withdrawal_unavailable` with `retry_after_seconds`. `POST /c/<token>/finalize` returns the `finalize`
      calldata to broadcast once it is due; it does not send it.
    - A pass sent home (refund sent, or its withdrawal handed to you as above, before you broadcast it) pays nothing
-     and takes no top-up: `prepare`, `deposit` and `link` answer `409 pass_sent_home`, and the service drops the pass
-     key from memory. Fund a new pass.
+     and takes no top-up: `prepare`, `deposit` and `link` answer `409 pass_sent_home`, its connector's tools answer
+     `pass_sent_home` (the message says whether its refund was sent or its withdrawal handed to you), and the service
+     drops the pass key from memory. Fund a new pass.
 
 The link is the key: whoever holds it can spend the pass at its seller, nothing else. The service stores no key and
 no secret that derives one.
@@ -500,12 +557,15 @@ no secret that derives one.
 ## 7. Pay with an MPP client
 
 A 402 from a ZEAM :: Bridge seller for a tool priced per call also carries a `WWW-Authenticate: Payment` challenge of intent `charge` when the fee address's share of that one call (9.99% for most sellers; 100% for one whose split pays the fee address everything) covers the gas of one USDC transfer plus 15%.
+The seller judges that at each 402, on Base's gas price read at most 5 s before, or, while its node does not answer, on the last gas price it read, for up to 60 s after that read: a tool priced near that line can carry a charge in one answer and not in the next, and a 402 for which the seller has no gas price under 60 s old carries none. Call again for a fresh 402.
 ZEAM Prism offers no charge: it takes x402 and an MPP session (Sessions, below).
 A price under that carries no charge challenge, whatever the split. A seller that offers sessions carries a challenge of intent `session` at any price per call (Sessions, below). The 402 says which challenges a call carries.
 A time tool called without a line is a tool priced per call here, at its `callUSD` (section 2, Line time).
 The charge: method `evm`, intent `charge`, USDC on Base (chain 8453), credential type `authorization`.
 
-1. Sign an EIP-3009 `transferWithAuthorization` of `request.amount` to `request.recipient`: `validAfter` 0,
+1. Sign an EIP-3009 `TransferWithAuthorization(address from,address to,uint256 value,uint256 validAfter,uint256
+   validBefore,bytes32 nonce)` in USDC's domain (name `USD Coin`, version `2`, chain 8453, verifying contract
+   `request.currency`) of `request.amount` to `request.recipient`: `validAfter` 0,
    `validBefore` no later than the challenge's `expires`, `nonce` the keccak256 of the JSON array `[id, realm]` as UTF-8,
    written compactly: `["<id>","<realm>"]`, no space after the comma (Python: `json.dumps([id, realm], separators=(",", ":"), ensure_ascii=False)`).
 2. Resend with `Authorization: Payment <credential>` or `Payment-Authorization: Payment <credential>`. The credential
@@ -519,11 +579,22 @@ The charge: method `evm`, intent `charge`, USDC on Base (chain 8453), credential
 
 - **By a charge, one authorization pays one call.** No channel, no deposit, nothing to refund.
 - **A failed call sends nothing.** The authorization is not used and expires at its `validBefore`.
+- **A charge sent and not yet shown** is 402 `verification-failed` with `code: "sent_not_shown"`, `txHash`,
+  `retry_after_seconds` and a `Retry-After` header: the transfer was sent, the seller's node does not show it yet, the
+  call was not delivered, and nothing more is sent for it. Send the same credential again after
+  `retry_after_seconds`. Once the transfer shows, the call is delivered, once. Once the chain shows that the transfer
+  reverted and the authorization is unused, the answer says nothing was charged, and the same credential can pay
+  again. A charge is never delivered twice: a copy sent while one is being delivered is told
+  `this authorization is already in use`, and a copy sent after it is told `this authorization has already been used`.
 - **The payer's wallet needs no ETH.** The ZEAM relay sends the transfer.
-- **No Payment challenge on a 402.** ZEAM's fee on that call does not cover the gas of one transfer plus 15% and the
-  seller offers no session, or the tool is priced by use, or the call buys line time.
+- **No Payment challenge on a 402.** ZEAM's fee on that call does not cover the gas of one transfer plus 15% (or the
+  seller had no gas price under 60 s old for that 402) and the seller offers no session, or the tool is priced by use, or the call buys line time.
 - **Over MCP the unpaid answer is a tool result**, unless the client declared payment (next). The challenges are in
-  `result._meta["org.paymentauth/payment-required"]`.
+  `result._meta["org.paymentauth/payment-required"]`: `challenges` holds every challenge the same call's 402 carries
+  over HTTP at that moment (`charge`, `session` or both), beside `httpStatus` 402 and, with a session challenge, the
+  `session` member. It is the object a client that declares payment gets as `error.data`. The MPP MCP transport draft
+  defines only that error; this `_meta` member is ZEAM's, for a client that declared nothing. A tool result without it
+  carries no challenge: that 402 offered none.
 - **A client that declares payment over MCP is answered as the MPP MCP transport draft writes it.** Declare
   `capabilities.experimental.payment`, an object such as `{"methods": {"evm": {"intents": ["charge"]}}}`, at
   `initialize`, and send the `Mcp-Session-Id` header that answer carries on every later request; on MCP revision
@@ -540,7 +611,11 @@ The charge: method `evm`, intent `charge`, USDC on Base (chain 8453), credential
   offered, the answer is the tool result every client gets.
 - **A refused credential:** 402 with a problem `type` ending `malformed-credential`, `invalid-challenge` or
   `verification-failed`; `detail` says which check. It carries a fresh challenge of each intent the tool's 402 offers,
-  and none when the 402 offers none. A tool priced by use, a purchase of line time and a gate do not read an MPP
+  and none when the 402 offers none. Like a session refusal, it never carries the x402 terms' `deposit` sentence, in
+  its body or its `PAYMENT-REQUIRED`. Over MCP, which has no headers, its `structuredContent` is its body with the terms
+  its `PAYMENT-REQUIRED` carries (`x402Version`, `resource` and the rest), as every 402 over MCP is: what it carries over
+  HTTP, in one object. Only `detail` (the check the credential failed, which depends on how it was sent) and `resource`
+  (the address asked) differ. A tool priced by use, a purchase of line time and a gate do not read an MPP
   credential: the answer is the 402 an unpaid call gets, with no problem.
 - **The nonce** may instead be the keccak256 of `id` followed by `realm`, as the EVM charge draft writes it.
 - **`methodDetails.permit2Address`** is the canonical Permit2 contract, `0x000000000022D473030F116dDEE9F6B43aC78BA3`, which the EVM
@@ -553,7 +628,8 @@ A ZEAM :: Bridge seller on the Node engine that has sessions turned on, and ZEAM
 (`draft-evm-session-00`, method `evm`, USDC on Base) for every tool priced per call: the 402 carries a second
 `Payment` challenge with `intent="session"`, after the `charge` one when there is one. A Python seller and a
 WordPress seller offer no session today, and no seller offers one for a tool priced by use or for line time. A call
-costs the same by session, by charge and by x402.
+costs the same by session, by charge and by x402. The Pass client pays by session only where `PASS_SESSION_ESCROW`
+names the escrow below; a pass does not pay by session.
 
 A session is a payment channel: one deposit into an escrow contract, then one signed voucher per call for the
 running total, and what is not spent comes back when the channel closes. The deposit is what a session commits; a
@@ -570,7 +646,8 @@ deposit sits in it until the channel closes.
 payee) and `methodDetails`: `{"chainId": 8453, "escrowContract": "0x…", "feePayer": true, "credentialTypes":
 ["authorization", "hash"]}`. Beside the challenge, in the 402 body and the `PAYMENT-REQUIRED` header (MCP: the unpaid
 result and `_meta["org.paymentauth/payment-required"]`), is a member
-`session`: `{"receiver", "signer", "split": {"recipients", "allocations", "totalAllocation", "distributionIncentive"}, "salt"}`.
+`session`: `{"receiver": "0x…", "signer": "0x…", "split": {"recipients": ["0x…", "0x…"], "allocations": ["…", "…"],
+"totalAllocation": "1000000", "distributionIncentive": 0}, "salt": "0x…"}`.
 
 **Check the payee before you deposit.** `recipient` is not the seller's wallet. It is the seller's `SessionPayee`, a
 contract in front of the seller's split: it signs for the split, which cannot sign, and forwards all it receives to
@@ -617,7 +694,7 @@ bytes32, address)`, with the zero address when there is no `authorizedSigner`. `
 `cumulativeAmount` is the price of this call (`amount`) and `voucherSignature` the voucher for it: an open carries
 the first voucher and pays the call it rides on. The ZEAM relay sends the deposit: your wallet needs USDC and no ETH.
 A deposit under `suggestedDeposit` is refused `insufficient-balance` with `requiredDeposit`. Or open the channel
-yourself, at your own gas: approve the escrow for the deposit, send its `open(payee, token, deposit, salt,
+yourself, at your own gas from the channel's payer: approve the escrow for the deposit, send its `open(payee, token, deposit, salt,
 authorizedSigner)`, and send `{"action": "open", "type": "hash", "channelId": "0x…", "hash": "0x…",
 "cumulativeAmount": "…", "signature": "0x…", "salt": "0x…"}` (and `authorizedSigner`), `hash` that transaction and
 `signature` the voucher, with `source` naming the payer.
@@ -654,7 +731,7 @@ been paid:
    a voucher for what was spent (the receipt's `spent`): the seller is paid what was spent and the rest of the
    deposit returns to the payer in the same transaction. The relay sends it free when the channel's
    fees (its spend times the fee address's share of the seller's split) cover the gas of its open, of every top-up and
-   close request the relay sent for it, and of its close. When
+   close request the relay sent for it, and of its close, plus 15%. When
    they do not, the close is answered `verification-failed` with `code: "gas_payment_needed"` and a refund's gas
    quote: sign `sign` and send the close again with `"gasPayment": {"authorization": {…}, "signature": "0x…"}` in its
    payload, `authorization` the answer's as it came, and one
@@ -671,19 +748,27 @@ been paid:
    gave it. The answer's `results` holds one entry per call: `hash` when it was sent, `held: true` with `sendAfter` and
    `until` when the relay keeps it, or `error` and `code`. After the escrow's grace period, 15 minutes from the
    request's block (`closeRequestedAt` + `CLOSE_GRACE_PERIOD`, both read on the escrow), do the same with
-   `WithdrawAuthorization` and `withdrawWithAuthorization`: everything the seller has not settled returns to the
+   `WithdrawAuthorization(bytes32 channelId,uint256 nonce,uint256 deadline)` in the same domain and
+   `withdrawWithAuthorization(channelId, nonce, deadline, payerSignature)`, with a `nonce` of its own (the request's
+   and the withdrawal's nonces are one used set): everything the seller has not settled returns to the
    payer. The relay sends the two free when the fees on what the channel has settled cover the gas of its open, of
-   every top-up the relay sent and of its exit; when they do not it answers `code: "gas_payment_needed"`. Then
+   every top-up and close request the relay sent for it, and of its exit, plus 15%; when they do not it answers `code: "gas_payment_needed"`. Then
    `POST https://api.zeampass.com/relay/quote` with `{"call": {"to": "<escrow>", "data": "<the request>"}, "split":
    <the session member>}`: it answers `op: "refund_gas_quote"`, `shape: {"session": "exit", "payment": true}`,
    `quoteMicroUSD` (the gas of the request and the withdrawal, 15% included, in USDC base units), `payTo` (the relay's
    gas wallet) and `covered`, with the other figures of a refund's quote (section 5). Sign the withdrawal and a USDC
-   `TransferWithAuthorization` of `quoteMicroUSD` from the payer to `payTo`: its `validAfter` the chain's time now plus
+   `TransferWithAuthorization` of `quoteMicroUSD` from the payer to `payTo`, in USDC's domain as for the charge (step
+   1 above), its `nonce` 32 random bytes: its `validAfter` the chain's time now plus
    the grace period plus 30 s, so nobody can take it during the grace period, and its `validBefore` and the
    withdrawal's `deadline` at least 60 s after that. POST the request together with a Multicall3
    (`0xcA11bde05977b3631167028862bE2a173976CA11`) `aggregate3` of the withdrawal and the gas payment, neither allowed
-   to fail, as two `calls`: the relay sends the request, holds the rest and sends it after the grace period, with no
-   ETH. These two calls are ZEAM's additions to the draft's escrow.
+   to fail, as two `calls`: `{"calls": [{"to": "<escrow>", "data": "<the request>"}, {"to": "<Multicall3>", "data":
+   "0x…"}], "split": <the session member>}`, the second `data` the `aggregate3([{"target": "<escrow>",
+   "allowFailure": false, "callData": "<the withdrawal>"}, {"target": "<USDC>", "allowFailure": false, "callData":
+   "<transferWithAuthorization(from, to, value, validAfter, validBefore, nonce, signature)>"}])`, `signature` the
+   65 bytes. The relay sends the request, holds the rest and sends it after the grace period, once the
+   chain's time is past the payment's `validAfter`, with no ETH; the same call posted before then answers `held`
+   again. These two calls are ZEAM's additions to the draft's escrow.
 3. **Without the seller or the relay, at your own gas.** The payer sends the draft's `requestClose(channelId)` to the
    escrow, and `withdraw(channelId)` after the same 15 minutes. This needs ETH on Base and nothing from anyone.
 
@@ -696,6 +781,7 @@ the session draft's `invalid-signature`, `signer-mismatch`, `amount-exceeds-depo
 `challenge-not-found` and `insufficient-balance` (402), `channel-not-found` and `channel-finalized` (410) and
 `transaction-reverted` (409); and `malformed-credential`, `invalid-challenge` and `verification-failed` (402;
 `verification-failed`: the relay declined, a call is in flight, or a transaction has no receipt yet).
+A session refusal carries `deposit` only where its problem names one, in base units and the same over HTTP and MCP, and never the x402 terms' `deposit` sentence; nor does a `bad_grant` answered to a session credential, body or `PAYMENT-REQUIRED`.
 A `verification-failed` with `code: "sent_not_shown"` means your open, top-up or close was sent and the seller's node
 does not show it yet: send the same credential again after `retry_after_seconds`; it is taken once.
 

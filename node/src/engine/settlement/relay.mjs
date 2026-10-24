@@ -147,7 +147,12 @@ export class Relay {
 
 export class GasQuote {
   static QUOTE_TTL = 60
+  static RECENT_SECS = 5
   static FLOOR_TTL = 86400 * 30
+  static RETRY_SECS = 20
+  static RETRY_FIRST_MS = 250
+  static RETRY_MOST_MS = 4000
+  static RETRY_KEY = 'zeam_pass_gas_retry'
 
   constructor(cfg, chain, relay = null) {
     this.cfg = cfg
@@ -185,30 +190,52 @@ export class GasQuote {
     return sender
   }
 
-  async weiPerGas(fresh = false) {
+  async weiPerGas(fresh = false, recent = null) {
     if (this.cfg.gasPriceWei !== null && this.cfg.gasPriceWei !== undefined && this.cfg.gasPriceWei !== '') return String(this.cfg.gasPriceWei)
     const key = 'zeam_pass_gas_price'
-    const hit = fresh ? null : this.cfg.cache.get(key)
-    if (typeof hit === 'string' && /^\d+$/.test(hit)) return hit
+    const near = recent === null ? null : this.cfg.cache.get(`${key}_recent`)
+    if (recent !== null && typeof near === 'string' && /^\d+$/.test(near)) return near
+    const hit = this.cfg.cache.get(key)
+    const last = typeof hit === 'string' && /^\d+$/.test(hit) ? hit : null
+    if (last !== null && !fresh && recent === null) return last
+    const retry = GasQuote.retryOf(this.cfg.cache.get(GasQuote.RETRY_KEY))
+    if (last !== null && retry !== null && this.cfg.nowMs() < retry.due) return last
     let wei
     try {
       wei = await this.chain.gasPrice()
     } catch {
-      return null
+      this.missed(retry)
+      return last
     }
     this.cfg.cache.set(key, wei, GasQuote.QUOTE_TTL)
+    if (recent !== null) this.cfg.cache.set(`${key}_recent`, wei, recent)
+    if (retry !== null) this.cfg.cache.set(GasQuote.RETRY_KEY, '', 1)
     return wei
   }
 
-  async ethOf(units, fresh = false) {
-    const wei = await this.weiPerGas(fresh)
+  missed(retry) {
+    const now = this.cfg.nowMs()
+    const since = retry?.since ?? now
+    const left = since + GasQuote.RETRY_SECS * 1000 - now
+    if (left <= 0) return this.cfg.cache.set(GasQuote.RETRY_KEY, '', 1)
+    const wait = retry === null ? GasQuote.RETRY_FIRST_MS : Math.min(retry.wait * 2, GasQuote.RETRY_MOST_MS)
+    this.cfg.cache.set(GasQuote.RETRY_KEY, `${since}:${now + wait}:${wait}`, Math.ceil(left / 1000))
+  }
+
+  static retryOf(v) {
+    const m = typeof v === 'string' ? /^(\d+):(\d+):(\d+)$/.exec(v) : null
+    return m ? { since: Number(m[1]), due: Number(m[2]), wait: Number(m[3]) } : null
+  }
+
+  async ethOf(units, fresh = false, recent = null) {
+    const wei = await this.weiPerGas(fresh, recent)
     const eth = wei === null ? null : await this.ethUSD()
     if (wei === null || eth === null || big(wei) <= 0n) return null
     return [Number(big(wei) * BigInt(units)) / 1e18, eth, wei]
   }
 
-  async microUSD(units) {
-    const q = await this.ethOf(Math.round(units))
+  async microUSD(units, recent = null) {
+    const q = await this.ethOf(Math.round(units), false, recent)
     return q === null ? null : Math.ceil(q[0] * q[1] * 1e6)
   }
 
@@ -236,7 +263,7 @@ export class GasQuote {
     const wei = await this.weiPerGas(fresh)
     const eth = wei === null ? null : await this.ethUSD()
     if (wei === null || eth === null || big(wei) <= 0n) return null
-    return { cover: this.priced(g.deposit + g.refund + (claimRides ? g.refundClaim : 0) + alreadyPaid, wei, eth), pay: this.priced(g.refund + (claimRides ? g.paidClaim : 0) + g.gasPayment, wei, eth, g.paidL1 + (claimRides ? g.paidClaimL1 : 0)) }
+    return { cover: this.priced(g.deposit + g.refund + (claimRides ? g.refundClaim : 0) + alreadyPaid, wei, eth), pay: this.priced(g.paidRefundLeg + (claimRides ? g.paidClaim : 0) + g.gasPayment, wei, eth, g.paidL1 + (claimRides ? g.paidClaimL1 : 0)) }
   }
 
   async relayQuote(call) {

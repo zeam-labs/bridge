@@ -376,7 +376,7 @@ final class Mpp
 
     public static function problemOf(\Throwable $e)
     {
-        return $e instanceof MppException ? self::problem($e->type, $e->detail) : self::problem('verification-failed', \ZeamPass\message($e));
+        return $e instanceof MppException ? array_merge(self::problem($e->type, $e->detail), $e->more) : self::problem('verification-failed', \ZeamPass\message($e));
     }
 
     public static function evmRequest($amount, $currency, $recipient, $chainId, $decimals = null, $description = null, $externalId = null)
